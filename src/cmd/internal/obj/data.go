@@ -33,6 +33,7 @@ package obj
 
 import (
 	"cmd/internal/objabi"
+	"cmd/internal/sys"
 	"log"
 	"math"
 )
@@ -63,9 +64,13 @@ func (s *LSym) GrowCap(c int64) {
 	s.P = b
 }
 
+// MaxDataOffset is the exclusive upper bound on the starting offset of a
+// write into an LSym.
+const MaxDataOffset = 1 << 30
+
 // prepwrite prepares to write data of size siz into s at offset off.
 func (s *LSym) prepwrite(ctxt *Link, off int64, siz int) {
-	if off < 0 || siz < 0 || off >= 1<<30 {
+	if off < 0 || siz < 0 || off >= MaxDataOffset {
 		ctxt.Diag("prepwrite: bad off=%d siz=%d s=%v", off, siz, s)
 	}
 	switch s.Type {
@@ -76,6 +81,7 @@ func (s *LSym) prepwrite(ctxt *Link, off int64, siz int) {
 	case objabi.STLSBSS:
 		ctxt.Diag("cannot supply data for %v var %v", s.Type, s.Name)
 	}
+	s.setFIPSType(ctxt)
 	l := off + int64(siz)
 	s.Grow(l)
 	if l > s.Size {
@@ -118,15 +124,16 @@ func (s *LSym) writeAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64,
 		ctxt.Diag("WriteAddr: bad address size %d in %s", siz, s.Name)
 	}
 	s.prepwrite(ctxt, off, siz)
-	r := Addrel(s)
-	r.Off = int32(off)
-	if int64(r.Off) != off {
+	if int64(int32(off)) != off {
 		ctxt.Diag("WriteAddr: off overflow %d in %s", off, s.Name)
 	}
-	r.Siz = uint8(siz)
-	r.Sym = rsym
-	r.Type = rtype
-	r.Add = roff
+	s.AddRel(ctxt, Reloc{
+		Type: rtype,
+		Off:  int32(off),
+		Siz:  uint8(siz),
+		Sym:  rsym,
+		Add:  roff,
+	})
 }
 
 // WriteAddr writes an address of size siz into s at offset off.
@@ -142,6 +149,24 @@ func (s *LSym) WriteWeakAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff in
 	s.writeAddr(ctxt, off, siz, rsym, roff, objabi.R_WEAKADDR)
 }
 
+// WriteFuncPtr writes the code word stored in a function value.
+func (s *LSym) WriteFuncPtr(ctxt *Link, off int64, rsym *LSym) {
+	rtype := objabi.R_ADDR
+	if ctxt.Arch.Family == sys.Wasm && ctxt.Arch.PtrSize == 4 {
+		rtype = objabi.R_WASMFCALL
+	}
+	s.writeAddr(ctxt, off, ctxt.Arch.PtrSize, rsym, 0, rtype)
+}
+
+// WriteWeakFuncPtr writes a weak code word stored in a function value or itab.
+func (s *LSym) WriteWeakFuncPtr(ctxt *Link, off int64, rsym *LSym) {
+	rtype := objabi.R_WEAKADDR
+	if ctxt.Arch.Family == sys.Wasm && ctxt.Arch.PtrSize == 4 {
+		rtype = objabi.R_WEAK | objabi.R_WASMFCALL
+	}
+	s.writeAddr(ctxt, off, ctxt.Arch.PtrSize, rsym, 0, rtype)
+}
+
 // WriteCURelativeAddr writes a pointer-sized address into s at offset off.
 // rsym and roff specify the relocation for the address which will be
 // resolved by the linker to an offset from the DW_AT_low_pc attribute of
@@ -155,15 +180,16 @@ func (s *LSym) WriteCURelativeAddr(ctxt *Link, off int64, rsym *LSym, roff int64
 // rsym+roff-(start of section that s is in).
 func (s *LSym) WriteOff(ctxt *Link, off int64, rsym *LSym, roff int64) {
 	s.prepwrite(ctxt, off, 4)
-	r := Addrel(s)
-	r.Off = int32(off)
-	if int64(r.Off) != off {
+	if int64(int32(off)) != off {
 		ctxt.Diag("WriteOff: off overflow %d in %s", off, s.Name)
 	}
-	r.Siz = 4
-	r.Sym = rsym
-	r.Type = objabi.R_ADDROFF
-	r.Add = roff
+	s.AddRel(ctxt, Reloc{
+		Type: objabi.R_ADDROFF,
+		Off:  int32(off),
+		Siz:  4,
+		Sym:  rsym,
+		Add:  roff,
+	})
 }
 
 // WriteWeakOff writes a weak 4 byte offset to rsym+roff into s at offset off.
@@ -171,15 +197,16 @@ func (s *LSym) WriteOff(ctxt *Link, off int64, rsym *LSym, roff int64) {
 // rsym+roff-(start of section that s is in).
 func (s *LSym) WriteWeakOff(ctxt *Link, off int64, rsym *LSym, roff int64) {
 	s.prepwrite(ctxt, off, 4)
-	r := Addrel(s)
-	r.Off = int32(off)
-	if int64(r.Off) != off {
-		ctxt.Diag("WriteOff: off overflow %d in %s", off, s.Name)
+	if int64(int32(off)) != off {
+		ctxt.Diag("WriteWeakOff: off overflow %d in %s", off, s.Name)
 	}
-	r.Siz = 4
-	r.Sym = rsym
-	r.Type = objabi.R_WEAKADDROFF
-	r.Add = roff
+	s.AddRel(ctxt, Reloc{
+		Type: objabi.R_WEAKADDROFF,
+		Off:  int32(off),
+		Siz:  4,
+		Sym:  rsym,
+		Add:  roff,
+	})
 }
 
 // WriteString writes a string of size siz into s at offset off.
@@ -198,10 +225,29 @@ func (s *LSym) WriteBytes(ctxt *Link, off int64, b []byte) int64 {
 	return off + int64(len(b))
 }
 
-func Addrel(s *LSym) *Reloc {
-	if s.R == nil {
-		s.R = make([]Reloc, 0, 4)
+// AddRel adds the relocation rel to s.
+func (s *LSym) AddRel(ctxt *Link, rel Reloc) {
+	if s.Type.IsFIPS() {
+		s.checkFIPSReloc(ctxt, rel)
 	}
-	s.R = append(s.R, Reloc{})
-	return &s.R[len(s.R)-1]
+	s.R = append(s.R, rel)
+}
+
+// WriteDwTxtAddrx appends a zero blob of the proper size to s at off
+// and attaches one of the various R_DWTXTADDR_U* relocations to the
+// symbol. Here size is dependent on the total number of functions in
+// the package (for more on why this is needed, consult the
+// .debug_addr generation code in the linker).
+func (s *LSym) WriteDwTxtAddrx(ctxt *Link, off int64, rsym *LSym, maxFuncs int) {
+	rtype, sz := objabi.FuncCountToDwTxtAddrFlavor(maxFuncs)
+	s.prepwrite(ctxt, off, sz)
+	if int64(int32(off)) != off {
+		ctxt.Diag("WriteDwTxtAddrx: off overflow %d in %s", off, s.Name)
+	}
+	s.AddRel(ctxt, Reloc{
+		Type: rtype,
+		Off:  int32(off),
+		Siz:  uint8(sz),
+		Sym:  rsym,
+	})
 }

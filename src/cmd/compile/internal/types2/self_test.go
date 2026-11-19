@@ -75,7 +75,7 @@ func runbench(b *testing.B, path string, ignoreFuncBodies, writeInfo bool) {
 
 	b.ResetTimer()
 	start := time.Now()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		conf := Config{
 			IgnoreFuncBodies: ignoreFuncBodies,
 			Importer:         defaultImporter(),
@@ -100,7 +100,7 @@ func runbench(b *testing.B, path string, ignoreFuncBodies, writeInfo bool) {
 }
 
 func pkgFiles(path string) ([]*syntax.File, error) {
-	filenames, err := pkgFilenames(path) // from stdlib_test.go
+	filenames, err := pkgFilenames(path, true) // from stdlib_test.go
 	if err != nil {
 		return nil, err
 	}

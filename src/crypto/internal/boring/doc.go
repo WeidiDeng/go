@@ -10,10 +10,28 @@ package boring
 // Enabled reports whether BoringCrypto is available.
 // When enabled is false, all functions in this package panic.
 //
-// BoringCrypto is only available on linux/amd64 systems.
+// BoringCrypto is only available on linux/amd64 and linux/arm64 systems.
 const Enabled = available
 
 // A BigInt is the raw words from a BigInt.
 // This definition allows us to avoid importing math/big.
 // Conversion between BigInt and *big.Int is in crypto/internal/boring/bbig.
 type BigInt []uint
+
+// Block and AEAD are structurally identical to [crypto/cipher.Block] and
+// [crypto/cipher.AEAD]. Redeclaring them here avoids importing crypto/cipher,
+// which would pull the AES and GCM implementations into every package that
+// checks Enabled. Values are assignable to the crypto/cipher types.
+
+type Block interface {
+	BlockSize() int
+	Encrypt(dst, src []byte)
+	Decrypt(dst, src []byte)
+}
+
+type AEAD interface {
+	NonceSize() int
+	Overhead() int
+	Seal(dst, nonce, plaintext, additionalData []byte) []byte
+	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+}

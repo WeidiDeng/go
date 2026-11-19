@@ -7,16 +7,25 @@
 package types
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
 
 // A MethodSet is an ordered set of concrete or abstract (interface) methods;
-// a method is a MethodVal selection, and they are ordered by ascending m.Obj().Id().
+// a method is a [MethodVal] selection, and they are ordered by ascending m.Obj().Id().
 // The zero value for a MethodSet is a ready-to-use empty method set.
 type MethodSet struct {
-	list []*Selection
+	list []methodSetEntry
+}
+
+// A methodSetEntry is a method of a MethodSet, along with its Id,
+// so that sorting and searching need not recompute it.
+type methodSetEntry struct {
+	id  string // = sel.Obj().Id()
+	sel *Selection
 }
 
 func (s *MethodSet) String() string {
@@ -26,8 +35,8 @@ func (s *MethodSet) String() string {
 
 	var buf strings.Builder
 	fmt.Fprintln(&buf, "MethodSet {")
-	for _, f := range s.list {
-		fmt.Fprintf(&buf, "\t%s\n", f)
+	for _, e := range s.list {
+		fmt.Fprintf(&buf, "\t%s\n", e.sel)
 	}
 	fmt.Fprintln(&buf, "}")
 	return buf.String()
@@ -37,7 +46,7 @@ func (s *MethodSet) String() string {
 func (s *MethodSet) Len() int { return len(s.list) }
 
 // At returns the i'th method in s for 0 <= i < s.Len().
-func (s *MethodSet) At(i int) *Selection { return s.list[i] }
+func (s *MethodSet) At(i int) *Selection { return s.list[i].sel }
 
 // Lookup returns the method with matching package and name, or nil if not found.
 func (s *MethodSet) Lookup(pkg *Package, name string) *Selection {
@@ -45,18 +54,36 @@ func (s *MethodSet) Lookup(pkg *Package, name string) *Selection {
 		return nil
 	}
 
-	key := Id(pkg, name)
+	// Search for Id(pkg, name) without constructing it,
+	// as it must allocate for unexported names.
+	path := idPath(pkg, name)
 	i := sort.Search(len(s.list), func(i int) bool {
-		m := s.list[i]
-		return m.obj.Id() >= key
+		return compareId(s.list[i].id, path, name) >= 0
 	})
-	if i < len(s.list) {
-		m := s.list[i]
-		if m.obj.Id() == key {
-			return m
-		}
+	if i < len(s.list) && compareId(s.list[i].id, path, name) == 0 {
+		return s.list[i].sel
 	}
 	return nil
+}
+
+// compareId returns strings.Compare(id, key) without allocating, where
+// key is path + "." + name if path is non-empty, or name otherwise.
+func compareId(id, path, name string) int {
+	if path == "" {
+		return strings.Compare(id, name)
+	}
+	n := min(len(id), len(path))
+	if c := strings.Compare(id[:n], path[:n]); c != 0 {
+		return c
+	}
+	if len(id) == n {
+		return -1 // id is a prefix of path, and so of key
+	}
+	// id has the prefix path.
+	if id[n] != '.' {
+		return cmp.Compare(id[n], '.')
+	}
+	return strings.Compare(id[n+1:], name)
 }
 
 // Shared empty method set.
@@ -75,6 +102,14 @@ func NewMethodSet(T Type) *MethodSet {
 
 	// TODO(rfindley) confirm that this code is in sync with lookupFieldOrMethod
 	//                with respect to type params.
+
+	// Methods cannot be associated with a named pointer type.
+	// (spec: "The type denoted by T is called the receiver base type;
+	// it must not be a pointer or interface type and it must be declared
+	// in the same package as the method.").
+	if t := asNamed(T); t != nil && isPointer(t) {
+		return &emptyMethodSet
+	}
 
 	// method set up to the current depth, allocated lazily
 	var base methodSet
@@ -109,7 +144,7 @@ func NewMethodSet(T Type) *MethodSet {
 
 			// If we have a named type, we may have associated methods.
 			// Look for those first.
-			if named, _ := typ.(*Named); named != nil {
+			if named := asNamed(typ); named != nil {
 				if alt := seen.lookup(named); alt != nil {
 					// We have seen this type before, at a more shallow depth
 					// (note that multiples of this type at the current depth
@@ -125,7 +160,7 @@ func NewMethodSet(T Type) *MethodSet {
 				}
 			}
 
-			switch t := under(typ).(type) {
+			switch t := typ.Underlying().(type) {
 			case *Struct:
 				for i, f := range t.fields {
 					if fset == nil {
@@ -184,17 +219,16 @@ func NewMethodSet(T Type) *MethodSet {
 		return &emptyMethodSet
 	}
 
-	// collect methods
-	var list []*Selection
-	for _, m := range base {
+	// collect methods, sorted by unique name
+	var list []methodSetEntry
+	for id, m := range base {
 		if m != nil {
 			m.recv = T
-			list = append(list, m)
+			list = append(list, methodSetEntry{id, m})
 		}
 	}
-	// sort by unique name
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].obj.Id() < list[j].obj.Id()
+	slices.SortFunc(list, func(x, y methodSetEntry) int {
+		return strings.Compare(x.id, y.id)
 	})
 	return &MethodSet{list}
 }
@@ -229,7 +263,7 @@ func (s methodSet) addOne(f *Func, index []int, indirect bool, multiples bool) m
 		// set and may not collide with the first one, thus leading to a false positive.
 		// Is that possible? Investigate.
 		if _, found := s[key]; !found && (indirect || !f.hasPtrRecv()) {
-			s[key] = &Selection{MethodVal, nil, f, index, indirect}
+			s[key] = &Selection{int8(MethodVal), indirect, nil, f, index}
 			return s
 		}
 	}

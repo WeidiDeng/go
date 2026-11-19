@@ -239,7 +239,7 @@ func plan9Arg(inst *Inst, pc uint64, symname func(uint64) (string, uint64), arg 
 		return buf.String()
 
 	case RegShift:
-		return fmt.Sprintf("R%d%s$%d", int(a.Reg), plan9Shift[a.Shift], int(a.Count))
+		return fmt.Sprintf("R%d%s%d", int(a.Reg), plan9Shift[a.Shift], int(a.Count))
 
 	case RegShiftReg:
 		return fmt.Sprintf("R%d%sR%d", int(a.Reg), plan9Shift[a.Shift], int(a.RegCount))
@@ -253,10 +253,13 @@ func plan9Arg(inst *Inst, pc uint64, symname func(uint64) (string, uint64), arg 
 // [r2, r0, ror #1] -> (R2)(R0@>1)
 // inst [r2, -r0, ror #1] -> INST.U (R2)(R0@>1)
 // input:
-//   a memory operand
+//
+//	a memory operand
+//
 // return values:
-//   corresponding memory operand in Plan 9 syntax
-//   .W/.P/.U suffix
+//
+//	corresponding memory operand in Plan 9 syntax
+//	.W/.P/.U suffix
 func memOpTrans(mem Mem) (string, string) {
 	suffix := ""
 	switch mem.Mode {

@@ -4,7 +4,7 @@
 
 // This file implements Float-to-string conversion functions.
 // It is closely following the corresponding implementation
-// in strconv/ftoa.go, but modified and simplified for Float.
+// in internal/strconv/ftoa.go, but modified and simplified for Float.
 
 package big
 
@@ -44,6 +44,10 @@ import (
 // the smallest number of decimal digits necessary to identify the value x uniquely
 // using x.Prec() mantissa bits.
 // The prec value is ignored for the 'b' and 'p' formats.
+//
+// Note that Text may return a different result than strconv.FormatFloat for
+// corresponding arguments if the matching float32 or float64 number provided
+// to strconv.FormatFloat is a denormalized number.
 func (x *Float) Text(format byte, prec int) string {
 	cap := 10 // TODO(gri) determine a good/better value here
 	if prec > 0 {
@@ -53,7 +57,7 @@ func (x *Float) Text(format byte, prec int) string {
 }
 
 // String formats x like x.Text('g', 10).
-// (String must be called explicitly, Float.Format does not support %s verb.)
+// (String must be called explicitly, [Float.Format] does not support %s verb.)
 func (x *Float) String() string {
 	return x.Text('g', 10)
 }
@@ -177,9 +181,6 @@ func roundShortest(d *decimal, x *Float) {
 	// Compute the lower and upper bound in decimal form and find the
 	// shortest decimal number d such that lower <= d <= upper.
 
-	// TODO(gri) strconv/ftoa.do describes a shortcut in some cases.
-	// See if we can use it (in adjusted form) here as well.
-
 	// 1) Compute normalized mantissa mant and exponent exp for x such
 	// that the lsb of mant corresponds to 1/2 ulp for the precision of
 	// x (i.e., for mant we want x.prec + 1 bits).
@@ -188,9 +189,9 @@ func roundShortest(d *decimal, x *Float) {
 	s := mant.bitLen() - int(x.prec+1)
 	switch {
 	case s < 0:
-		mant = mant.shl(mant, uint(-s))
+		mant = mant.lsh(mant, uint(-s))
 	case s > 0:
-		mant = mant.shr(mant, uint(+s))
+		mant = mant.rsh(mant, uint(+s))
 	}
 	exp += s
 	// x = mant * 2**exp with lsb(mant) == 1/2 ulp of x.prec
@@ -222,7 +223,12 @@ func roundShortest(d *decimal, x *Float) {
 
 		// Okay to round up if upper has a different digit and either upper
 		// is inclusive or upper is bigger than the result of rounding up.
-		okup := m != u && (inclusive || m+1 < u || i+1 < len(upper.mant))
+		// The last clause handles digits past upper's trimmed mantissa:
+		// upper.at(i) returns '0' there, but the true upper bound was
+		// determined by earlier digits, so rounding up is valid unless
+		// m == '9' (which would carry onto the exclusive upper bound).
+		// See also go.dev/issue/80206.
+		okup := m != u && (inclusive || m+1 < u || i+1 < len(upper.mant) || i >= len(upper.mant) && m < '9')
 
 		// If it's okay to do either, then round to the nearest one.
 		// If it's okay to do only one, do it.
@@ -309,7 +315,7 @@ func fmtF(buf []byte, prec int, d decimal) []byte {
 }
 
 // fmtB appends the string of x in the format mantissa "p" exponent
-// with a decimal mantissa and a binary exponent, or 0" if x is zero,
+// with a decimal mantissa and a binary exponent, or "0" if x is zero,
 // and returns the extended buffer.
 // The mantissa is normalized such that is uses x.Prec() bits in binary
 // representation.
@@ -329,9 +335,9 @@ func (x *Float) fmtB(buf []byte) []byte {
 	m := x.mant
 	switch w := uint32(len(x.mant)) * _W; {
 	case w < x.prec:
-		m = nat(nil).shl(m, uint(x.prec-w))
+		m = nat(nil).lsh(m, uint(x.prec-w))
 	case w > x.prec:
-		m = nat(nil).shr(m, uint(w-x.prec))
+		m = nat(nil).rsh(m, uint(w-x.prec))
 	}
 
 	buf = append(buf, m.utoa(10)...)
@@ -380,9 +386,9 @@ func (x *Float) fmtX(buf []byte, prec int) []byte {
 	m := x.mant
 	switch w := uint(len(x.mant)) * _W; {
 	case w < n:
-		m = nat(nil).shl(m, n-w)
+		m = nat(nil).lsh(m, n-w)
 	case w > n:
-		m = nat(nil).shr(m, w-n)
+		m = nat(nil).rsh(m, w-n)
 	}
 	exp64 := int64(x.exp) - 1 // avoid wrap-around
 
@@ -444,16 +450,9 @@ func (x *Float) fmtP(buf []byte) []byte {
 	return strconv.AppendInt(buf, int64(x.exp), 10)
 }
 
-func min(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
-
 var _ fmt.Formatter = &floatZero // *Float must implement fmt.Formatter
 
-// Format implements fmt.Formatter. It accepts all the regular
+// Format implements [fmt.Formatter]. It accepts all the regular
 // formats for floating-point numbers ('b', 'e', 'E', 'f', 'F',
 // 'g', 'G', 'x') as well as 'p' and 'v'. See (*Float).Text for the
 // interpretation of 'p'. The 'v' format is handled like 'g'.

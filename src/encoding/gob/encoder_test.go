@@ -6,14 +6,18 @@ package gob
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Test basic operations in a safe manner.
@@ -57,6 +61,24 @@ func TestBasicEncoderDecoder(t *testing.T) {
 	}
 }
 
+func TestEncodeNilInterfaceReusesEncoderState(t *testing.T) {
+	var value any
+	iv := reflect.ValueOf(&value).Elem()
+	enc := NewEncoder(io.Discard)
+	b := new(encBuffer)
+
+	enc.encodeInterface(b, iv)
+	state := enc.freeList
+	if state == nil {
+		t.Fatal("nil interface encoding did not return encoderState to free list")
+	}
+
+	enc.encodeInterface(b, iv)
+	if enc.freeList != state {
+		t.Fatal("nil interface encoding did not reuse encoderState")
+	}
+}
+
 func TestEncodeIntSlice(t *testing.T) {
 
 	s8 := []int8{1, 5, 12, 22, 35, 51, 70, 92, 117}
@@ -73,7 +95,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int8, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s8, res) {
+		if !slices.Equal(s8, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s8, res)
 		}
 	})
@@ -87,7 +109,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int16, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s16, res) {
+		if !slices.Equal(s16, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s16, res)
 		}
 	})
@@ -101,7 +123,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int32, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s32, res) {
+		if !slices.Equal(s32, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s32, res)
 		}
 	})
@@ -115,7 +137,7 @@ func TestEncodeIntSlice(t *testing.T) {
 		res := make([]int64, 9)
 		dec.Decode(&res)
 
-		if !reflect.DeepEqual(s64, res) {
+		if !slices.Equal(s64, res) {
 			t.Fatalf("EncodeIntSlice: expected %v, got %v", s64, res)
 		}
 	})
@@ -688,7 +710,7 @@ func TestMapBug1(t *testing.T) {
 	if err != nil {
 		t.Fatal("decode:", err)
 	}
-	if !reflect.DeepEqual(in, out) {
+	if !maps.Equal(in, out) {
 		t.Errorf("mismatch: %v %v", in, out)
 	}
 }
@@ -762,7 +784,7 @@ func TestSliceReusesMemory(t *testing.T) {
 		if err != nil {
 			t.Fatal("ints: decode:", err)
 		}
-		if !reflect.DeepEqual(x, y) {
+		if !slices.Equal(x, y) {
 			t.Errorf("ints: expected %q got %q\n", x, y)
 		}
 		if addr != &y[0] {
@@ -1017,7 +1039,7 @@ type Bug4Secret struct {
 
 // Test that a failed compilation doesn't leave around an executable encoder.
 // Issue 3723.
-func TestMutipleEncodingsOfBadType(t *testing.T) {
+func TestMultipleEncodingsOfBadType(t *testing.T) {
 	x := Bug4Public{
 		Name:   "name",
 		Secret: Bug4Secret{1},
@@ -1034,6 +1056,39 @@ func TestMutipleEncodingsOfBadType(t *testing.T) {
 	if err == nil {
 		t.Fatal("second encoding: expected error")
 	}
+	if !strings.Contains(err.Error(), "no exported fields") {
+		t.Errorf("expected error about no exported fields; got %v", err)
+	}
+}
+
+type Bug4CycleA struct {
+	B      *Bug4CycleB
+	Secret Bug4Secret
+}
+
+type Bug4CycleB struct {
+	A *Bug4CycleA
+}
+
+func TestCyclicalEncodingOfBadType(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic encoding cyclical bad type: %v", r)
+		}
+	}()
+	err := NewEncoder(io.Discard).Encode(Bug4CycleA{})
+	if err == nil {
+		t.Fatal("first cyclical encoding: expected error")
+	}
+	if !strings.Contains(err.Error(), "no exported fields") {
+		t.Errorf("expected error about no exported fields; got %v", err)
+	}
+
+	err = NewEncoder(io.Discard).Encode(Bug4CycleB{A: &Bug4CycleA{}})
+	if err == nil {
+		t.Fatal("second cyclical encoding: expected error")
+	}
+
 	if !strings.Contains(err.Error(), "no exported fields") {
 		t.Errorf("expected error about no exported fields; got %v", err)
 	}
@@ -1186,19 +1241,19 @@ func TestMarshalFloatMap(t *testing.T) {
 		for k, v := range m {
 			entries = append(entries, mapEntry{math.Float64bits(k), v})
 		}
-		sort.Slice(entries, func(i, j int) bool {
-			ei, ej := entries[i], entries[j]
-			if ei.keyBits != ej.keyBits {
-				return ei.keyBits < ej.keyBits
+		slices.SortFunc(entries, func(a, b mapEntry) int {
+			r := cmp.Compare(a.keyBits, b.keyBits)
+			if r != 0 {
+				return r
 			}
-			return ei.value < ej.value
+			return cmp.Compare(a.value, b.value)
 		})
 		return entries
 	}
 
 	got := readMap(out)
 	want := readMap(in)
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Fatalf("\nEncode: %v\nDecode: %v", want, got)
 	}
 }
@@ -1272,9 +1327,116 @@ func TestDecoderOverflow(t *testing.T) {
 		0x12, 0xff, 0xff, 0x2, 0x2, 0x20, 0x0, 0xf8, 0x7f, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x20, 0x20, 0x20, 0x20, 0x20,
 	}))
-	var r interface{}
+	var r any
 	err := dec.Decode(r)
 	if err == nil {
 		t.Fatalf("expected an error")
+	}
+}
+
+// Issue 79756.
+func TestLargeMap(t *testing.T) {
+	t.Parallel()
+	type array [8192]byte
+	const entries = 2500 // enough to allocate a smaller map
+	m := make(map[int16]array, entries)
+	for i := range entries {
+		m[int16(i)] = array{}
+	}
+	var b bytes.Buffer
+	enc := NewEncoder(&b)
+	if err := enc.Encode(m); err != nil {
+		t.Fatal(err)
+	}
+	dec := NewDecoder(&b)
+	m = nil
+	if err := dec.Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != entries {
+		t.Errorf("got %d entries, want %d", len(m), entries)
+	}
+}
+
+// Issue 82740.
+type (
+	t82740_00 struct{ Next *t82740_01 }
+	t82740_01 struct{ Next *t82740_02 }
+	t82740_02 struct{ Next *t82740_03 }
+	t82740_03 struct{ Next *t82740_04 }
+	t82740_04 struct{ Next *t82740_05 }
+	t82740_05 struct{ Next *t82740_06 }
+	t82740_06 struct{ Next *t82740_07 }
+	t82740_07 struct{ Next *t82740_08 }
+	t82740_08 struct{ Next *t82740_09 }
+	t82740_09 struct{ Next *t82740_10 }
+	t82740_10 struct{ Next *t82740_11 }
+	t82740_11 struct{ Next *t82740_12 }
+	t82740_12 struct{ Next *t82740_13 }
+	t82740_13 struct{ Next *t82740_14 }
+	t82740_14 struct{ Next *t82740_15 }
+	t82740_15 struct{ Next *t82740_16 }
+	t82740_16 struct{ Next *t82740_17 }
+	t82740_17 struct{ Next *t82740_18 }
+	t82740_18 struct{ Next *t82740_19 }
+	t82740_19 struct{ Next *t82740_20 }
+	t82740_20 struct{ Next *t82740_21 }
+	t82740_21 struct{ Next *t82740_22 }
+	t82740_22 struct{ Next *t82740_23 }
+	t82740_23 struct{ Next *t82740_24 }
+	t82740_24 struct{ Next *t82740_25 }
+	t82740_25 struct{ Next *t82740_26 }
+	t82740_26 struct{ Next *t82740_27 }
+	t82740_27 struct{ Next *t82740_28 }
+	t82740_28 struct{ Next *t82740_29 }
+	t82740_29 struct{ Next *t82740_30 }
+	t82740_30 struct{ Next *t82740_31 }
+	t82740_31 struct{ Next *t82740_00 }
+)
+
+func TestConcurrentEncodeCyclicalTypes(t *testing.T) {
+	allTypes := []any{
+		t82740_00{}, t82740_01{}, t82740_02{}, t82740_03{}, t82740_04{}, t82740_05{}, t82740_06{}, t82740_07{},
+		t82740_08{}, t82740_09{}, t82740_10{}, t82740_11{}, t82740_12{}, t82740_13{}, t82740_14{}, t82740_15{},
+		t82740_16{}, t82740_17{}, t82740_18{}, t82740_19{}, t82740_20{}, t82740_21{}, t82740_22{}, t82740_23{},
+		t82740_24{}, t82740_25{}, t82740_26{}, t82740_27{}, t82740_28{}, t82740_29{}, t82740_30{}, t82740_31{},
+	}
+	roots := []any{t82740_00{}, t82740_16{}}
+
+	for range 10 {
+		for _, v := range allTypes {
+			if info := lookupTypeInfo(reflect.TypeOf(v)); info != nil {
+				info.encoder.Store(nil)
+			}
+		}
+
+		start := make(chan struct{})
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, v := range roots {
+			wg.Add(1)
+			go func(v any) {
+				defer wg.Done()
+				<-start
+				if err := NewEncoder(io.Discard).Encode(v); err != nil {
+					t.Errorf("Encode(%T) failed: %v", v, err)
+				}
+			}(v)
+		}
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		close(start)
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for concurrent Encode of cyclical types (deadlock)")
+		}
+
+		if err := NewEncoder(io.Discard).Encode(t82740_00{Next: &t82740_01{}}); err != nil {
+			t.Fatalf("Encode non-nil cyclical value failed: %v", err)
+		}
 	}
 }

@@ -9,9 +9,9 @@ package types_test
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"internal/testenv"
 	"strings"
 	"testing"
@@ -57,20 +57,23 @@ func testEval(t *testing.T, fset *token.FileSet, pkg *Package, pos token.Pos, ex
 }
 
 func TestEvalBasic(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	for _, typ := range Typ[Bool : String+1] {
-		testEval(t, fset, nil, token.NoPos, typ.Name(), typ, "", "")
+		testEval(t, fset, nil, nopos, typ.Name(), typ, "", "")
 	}
 }
 
 func TestEvalComposite(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	for _, test := range independentTestTypes {
-		testEval(t, fset, nil, token.NoPos, test.src, nil, test.str, "")
+		testEval(t, fset, nil, nopos, test.src, nil, test.str, "")
 	}
 }
 
 func TestEvalArith(t *testing.T) {
+	t.Parallel()
 	var tests = []string{
 		`true`,
 		`false == false`,
@@ -83,12 +86,13 @@ func TestEvalArith(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	for _, test := range tests {
-		testEval(t, fset, nil, token.NoPos, test, Typ[UntypedBool], "", "true")
+		testEval(t, fset, nil, nopos, test, Typ[UntypedBool], "", "true")
 	}
 }
 
 func TestEvalPos(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
+	t.Parallel()
 
 	// The contents of /*-style comments are of the form
 	//	expr => value, type
@@ -139,7 +143,7 @@ func TestEvalPos(t *testing.T) {
 				/* c => , struct{c int} */
 				_ = c
 			}
-			_ = func(a, b, c int) /* c => , string */ {
+			_ = func(a, b, c int /* c => , string */) /* c => , int */ {
 				/* c => , int */
 			}
 			_ = c
@@ -168,14 +172,19 @@ func TestEvalPos(t *testing.T) {
 	fset := token.NewFileSet()
 	var files []*ast.File
 	for i, src := range sources {
-		file, err := parser.ParseFile(fset, "p", src, parser.ParseComments)
+		file, err := parser.ParseFile(fset, "p", src, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("could not parse file %d: %s", i, err)
 		}
+
+		if strings.Contains(src, "interface{R}.Read") {
+			continue
+		}
+
 		files = append(files, file)
 	}
 
-	conf := Config{Importer: importer.Default()}
+	conf := Config{Importer: defaultImporter(fset)}
 	pkg, err := conf.Check("p", fset, files, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +212,7 @@ func split(s, sep string) (string, string) {
 
 func TestCheckExpr(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
+	t.Parallel()
 
 	// Each comment has the form /* expr => object */:
 	// expr is an identifier or selector expression that is passed
@@ -236,12 +246,9 @@ func f(a int, s string) S {
 }`
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "p", src, parser.ParseComments)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := mustParse(fset, src)
 
-	conf := Config{Importer: importer.Default()}
+	conf := Config{Importer: defaultImporter(fset)}
 	pkg, err := conf.Check("p", fset, []*ast.File{f}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -291,6 +298,36 @@ func f(a int, s string) S {
 					t.Errorf("%s: checkExpr(%s) = %s, want %v",
 						fset.Position(pos), expr, obj, wantObj)
 				}
+			}
+		}
+	}
+}
+
+func TestIssue65898(t *testing.T) {
+	t.Parallel()
+	const src = `
+package p
+func _[A any](A) {}
+`
+
+	fset := token.NewFileSet()
+	f := mustParse(fset, src)
+
+	var conf types.Config
+	pkg, err := conf.Check(pkgName(src), fset, []*ast.File{f}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range f.Decls {
+		if fun, _ := d.(*ast.FuncDecl); fun != nil {
+			// type parameter A is not found at the start of the function type
+			if err := types.CheckExpr(fset, pkg, fun.Type.Pos(), fun.Type, nil); err == nil || !strings.Contains(err.Error(), "undefined") {
+				t.Fatalf("got %s, want undefined error", err)
+			}
+			// type parameter A must be found at the end of the function type
+			if err := types.CheckExpr(fset, pkg, fun.Type.End(), fun.Type, nil); err != nil {
+				t.Fatal(err)
 			}
 		}
 	}

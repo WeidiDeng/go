@@ -7,13 +7,14 @@ package x509
 import (
 	"bytes"
 	"errors"
+	"slices"
+	"strings"
 	"syscall"
 	"unsafe"
 )
 
-func loadSystemRoots() (*CertPool, error) {
-	return &CertPool{systemPool: true}, nil
-}
+// Windows has no default SSL_CERT_{FILE,DIR} paths.
+var certFiles, certDirectories []string
 
 // Creates a new *syscall.CertContext representing the leaf certificate in an in-memory
 // certificate store containing itself and all of the intermediate certificates specified
@@ -44,7 +45,7 @@ func createStoreContext(leaf *Certificate, opts *VerifyOptions) (*syscall.CertCo
 
 	if opts.Intermediates != nil {
 		for i := 0; i < opts.Intermediates.len(); i++ {
-			intermediate, err := opts.Intermediates.cert(i)
+			intermediate, _, err := opts.Intermediates.cert(i)
 			if err != nil {
 				return nil, err
 			}
@@ -109,7 +110,7 @@ func checkChainTrustStatus(c *Certificate, chainCtx *syscall.CertChainContext) e
 // checkChainSSLServerPolicy checks that the certificate chain in chainCtx is valid for
 // use as a certificate chain for a SSL/TLS server.
 func checkChainSSLServerPolicy(c *Certificate, chainCtx *syscall.CertChainContext, opts *VerifyOptions) error {
-	servernamep, err := syscall.UTF16PtrFromString(opts.DNSName)
+	servernamep, err := syscall.UTF16PtrFromString(strings.TrimSuffix(opts.DNSName, "."))
 	if err != nil {
 		return err
 	}
@@ -267,7 +268,12 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 		}
 	}
 
+	chains = slices.DeleteFunc(chains, containsDistrustedSPKIHash)
+
 	if len(chains) == 0 {
+		if topErr == nil {
+			return nil, CertificateInvalidError{c, NoValidChains, ""}
+		}
 		// Return the error from the highest quality context.
 		return nil, topErr
 	}

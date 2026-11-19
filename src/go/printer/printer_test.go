@@ -44,7 +44,7 @@ const (
 // if any.
 func format(src []byte, mode checkMode) ([]byte, error) {
 	// parse src
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, fmt.Errorf("parse: %s\n%s", err, src)
 	}
@@ -72,7 +72,7 @@ func format(src []byte, mode checkMode) ([]byte, error) {
 
 	// make sure formatted output is syntactically correct
 	res := buf.Bytes()
-	if _, err := parser.ParseFile(fset, "", res, parser.ParseComments); err != nil {
+	if _, err := parser.ParseFile(fset, "", res, parser.ParseComments|parser.SkipObjectResolution); err != nil {
 		return nil, fmt.Errorf("re-parse: %s\n%s", err, buf.Bytes())
 	}
 
@@ -125,7 +125,7 @@ func runcheck(t *testing.T, source, golden string, mode checkMode) {
 	}
 
 	// formatted source and golden must be the same
-	if err := checkEqual(source, golden, res, gld); err != nil {
+	if err := checkEqual(fmt.Sprintf("format(%v)", source), golden, res, gld); err != nil {
 		t.Error(err)
 		return
 	}
@@ -220,7 +220,7 @@ func TestLineComments(t *testing.T) {
 	`
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		panic(err) // error in test
 	}
@@ -261,7 +261,7 @@ func init() {
 func TestBadNodes(t *testing.T) {
 	const src = "package p\n("
 	const res = "package p\nBadDecl\n"
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err == nil {
 		t.Error("expected illegal program") // error in test
 	}
@@ -284,7 +284,7 @@ func testComment(t *testing.T, f *ast.File, srclen int, comment *ast.Comment) {
 		if err := Fprint(&buf, fset, f); err != nil {
 			t.Error(err)
 		}
-		if _, err := parser.ParseFile(fset, "", buf.Bytes(), 0); err != nil {
+		if _, err := parser.ParseFile(fset, "", buf.Bytes(), parser.SkipObjectResolution); err != nil {
 			t.Fatalf("incorrect program for pos = %d:\n%s", comment.Slash, buf.String())
 		}
 		// Position information is just an offset.
@@ -315,7 +315,7 @@ func fibo(n int) {
 }
 `
 
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Error(err) // error in test
 	}
@@ -378,7 +378,7 @@ func (t *t) foo(a, b, c int) int {
 `
 
 	// parse original
-	f1, err := parser.ParseFile(fset, "src", src, parser.ParseComments)
+	f1, err := parser.ParseFile(fset, "src", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +392,7 @@ func (t *t) foo(a, b, c int) int {
 
 	// parse pretty printed original
 	// (//line directives must be interpreted even w/o parser.ParseComments set)
-	f2, err := parser.ParseFile(fset, "", buf.Bytes(), 0)
+	f2, err := parser.ParseFile(fset, "", buf.Bytes(), parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatalf("%s\n%s", err, buf.Bytes())
 	}
@@ -460,7 +460,7 @@ func g() {
 `
 
 	// parse original
-	f1, err := parser.ParseFile(fset, "src.go", orig, 0)
+	f1, err := parser.ParseFile(fset, "src.go", orig, parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,6 +479,46 @@ func g() {
 	}
 }
 
+func TestIssue52605(t *testing.T) {
+	const orig = `
+package p
+
+// Doc
+//
+type T struct {
+// This is not
+//	a doc comment.
+X int
+}
+`
+
+	const want = `package p
+
+// Doc
+type T struct {
+	// This is not
+	//	a doc comment.
+	X int
+}
+`
+
+	f, err := parser.ParseFile(fset, "src.go", orig, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	err = Fprint(&buf, fset, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := buf.String()
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s\n", got, want)
+	}
+}
+
 var decls = []string{
 	`import "fmt"`,
 	"const pi = 3.1415\nconst e = 2.71828\n\nvar x = pi",
@@ -487,7 +527,7 @@ var decls = []string{
 
 func TestDeclLists(t *testing.T) {
 	for _, src := range decls {
-		file, err := parser.ParseFile(fset, "", "package p;"+src, parser.ParseComments)
+		file, err := parser.ParseFile(fset, "", "package p;"+src, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			panic(err) // error in test
 		}
@@ -513,7 +553,7 @@ var stmts = []string{
 
 func TestStmtLists(t *testing.T) {
 	for _, src := range stmts {
-		file, err := parser.ParseFile(fset, "", "package p; func _() {"+src+"}", parser.ParseComments)
+		file, err := parser.ParseFile(fset, "", "package p; func _() {"+src+"}", parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			panic(err) // error in test
 		}
@@ -542,13 +582,12 @@ func TestBaseIndent(t *testing.T) {
 		panic(err) // error in test
 	}
 
-	file, err := parser.ParseFile(fset, filename, src, 0)
+	file, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
 	if err != nil {
 		panic(err) // error in test
 	}
 
 	for indent := 0; indent < 4; indent++ {
-		indent := indent
 		t.Run(fmt.Sprint(indent), func(t *testing.T) {
 			t.Parallel()
 			var buf bytes.Buffer
@@ -604,6 +643,29 @@ func f()
 	}
 }
 
+// TestChanType tests that the tree for <-(<-chan int), without
+// ParenExpr, is correctly formatted with parens.
+// Test case for issue #63362.
+func TestChanType(t *testing.T) {
+	expr := &ast.UnaryExpr{
+		Op: token.ARROW,
+		X: &ast.CallExpr{
+			Fun: &ast.ChanType{
+				Dir:   ast.RECV,
+				Value: &ast.Ident{Name: "int"},
+			},
+			Args: []ast.Expr{&ast.Ident{Name: "nil"}},
+		},
+	}
+	var buf bytes.Buffer
+	if err := Fprint(&buf, fset, expr); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), `<-(<-chan int)(nil)`; got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s\n", got, want)
+	}
+}
+
 type limitWriter struct {
 	remaining int
 	errCount  int
@@ -628,7 +690,7 @@ func TestWriteErrors(t *testing.T) {
 	if err != nil {
 		panic(err) // error in test
 	}
-	file, err := parser.ParseFile(fset, filename, src, 0)
+	file, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
 	if err != nil {
 		panic(err) // error in test
 	}
@@ -645,7 +707,7 @@ func TestWriteErrors(t *testing.T) {
 	}
 }
 
-// TextX is a skeleton test that can be filled in for debugging one-off cases.
+// TestX is a skeleton test that can be filled in for debugging one-off cases.
 // Do not remove.
 func TestX(t *testing.T) {
 	const src = `
@@ -681,7 +743,7 @@ type bar int	// comment2
 	)
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "input.go", input, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "input.go", input, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,7 +774,7 @@ type bar int	// comment2
 func TestIssue11151(t *testing.T) {
 	const src = "package p\t/*\r/1\r*\r/2*\r\r\r\r/3*\r\r+\r\r/4*/\n"
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +788,7 @@ func TestIssue11151(t *testing.T) {
 	}
 
 	// the resulting program must be valid
-	_, err = parser.ParseFile(fset, "", got, 0)
+	_, err = parser.ParseFile(fset, "", got, parser.SkipObjectResolution)
 	if err != nil {
 		t.Errorf("%v\norig: %q\ngot : %q", err, src, got)
 	}
@@ -738,7 +800,7 @@ func TestParenthesizedDecl(t *testing.T) {
 	// a package with multiple specs in a single declaration
 	const src = "package p; var ( a float64; b int )"
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", src, 0)
+	f, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,6 +829,95 @@ func TestParenthesizedDecl(t *testing.T) {
 	}
 }
 
+// A composite literal that starts with a type name must be parenthesized
+// in a control clause, even if the AST doesn't contain the parentheses.
+func TestCompositeLitInControlClause(t *testing.T) { // issue 43598
+	stmts := []struct {
+		format string
+		stmt   func(x ast.Expr) ast.Stmt
+	}{
+		{"if %s {\n}", func(x ast.Expr) ast.Stmt {
+			return &ast.IfStmt{Cond: x, Body: &ast.BlockStmt{}}
+		}},
+		{"if _ = %s; ok {\n}", func(x ast.Expr) ast.Stmt {
+			init := &ast.AssignStmt{Lhs: []ast.Expr{ast.NewIdent("_")}, Tok: token.ASSIGN, Rhs: []ast.Expr{x}}
+			return &ast.IfStmt{Init: init, Cond: ast.NewIdent("ok"), Body: &ast.BlockStmt{}}
+		}},
+		{"for %s {\n}", func(x ast.Expr) ast.Stmt {
+			return &ast.ForStmt{Cond: x, Body: &ast.BlockStmt{}}
+		}},
+		{"for range %s {\n}", func(x ast.Expr) ast.Stmt {
+			return &ast.RangeStmt{X: x, Body: &ast.BlockStmt{}}
+		}},
+		{"switch %s {\n}", func(x ast.Expr) ast.Stmt {
+			return &ast.SwitchStmt{Tag: x, Body: &ast.BlockStmt{}}
+		}},
+		{"switch _ = %s; ok.(type) {\n}", func(x ast.Expr) ast.Stmt {
+			init := &ast.AssignStmt{Lhs: []ast.Expr{ast.NewIdent("_")}, Tok: token.ASSIGN, Rhs: []ast.Expr{x}}
+			assign := &ast.ExprStmt{X: &ast.TypeAssertExpr{X: ast.NewIdent("ok")}}
+			return &ast.TypeSwitchStmt{Init: init, Assign: assign, Body: &ast.BlockStmt{}}
+		}},
+	}
+
+	for _, test := range []struct {
+		expr string // expression in a context that doesn't require parentheses
+		want string // expression as printed in a control clause
+	}{
+		// parentheses required
+		{"T{}", "(T{})"},
+		{"x == T{}", "x == (T{})"},
+		{"x == p.T{}", "x == (p.T{})"},
+		{"x == T[int]{}", "x == (T[int]{})"},
+		{"x == p.T[int, string]{}", "x == (p.T[int, string]{})"},
+		{"&T{} == x", "&(T{}) == x"},
+		{"T{}.m()", "(T{}).m()"},
+		{"T{1, 2}[i]", "(T{1, 2})[i]"},
+
+		// parentheses required: the parser accepts these invalid
+		// composite literal types and so must the printer
+		{"f().T{}", "(f().T{})"},
+		{"x == f().T{}", "x == (f().T{})"},
+		{"x == a[i].T[int]{}", "x == (a[i].T[int]{})"},
+		{"T{}.U{}", "(T{}.U{})"},
+		{"T{}.U[V{}]{}", "(T{}.U[V{}]{})"},
+
+		// no parentheses required
+		{"(T{})", "(T{})"},
+		{"(x == T{})", "(x == T{})"},
+		{"x == []T{T{}}", "x == []T{T{}}"},
+		{"x == struct{}{}", "x == struct{}{}"},
+		{"x == map[T]T{T{}: T{}}[T{}]", "x == map[T]T{T{}: T{}}[T{}]"},
+		{"f(T{})", "f(T{})"},
+		{"a[T{}.i:]", "a[T{}.i:]"},
+		{"x == [len(T{})]int{}", "x == [len(T{})]int{}"},
+		{"func() bool { return x == T{} }()", "func() bool { return x == T{} }()"},
+	} {
+		for _, s := range stmts {
+			fset := token.NewFileSet()
+			x, err := parser.ParseExprFrom(fset, "", test.expr, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var buf bytes.Buffer
+			if err := Fprint(&buf, fset, s.stmt(x)); err != nil {
+				t.Fatal(err)
+			}
+			got := buf.String()
+
+			if want := fmt.Sprintf(s.format, test.want); got != want {
+				t.Errorf("%s: got %q, want %q", test.expr, got, want)
+			}
+
+			// The result must be valid Go code.
+			src := "package p; func _() { " + got + " }"
+			if _, err := parser.ParseFile(token.NewFileSet(), "", src, parser.SkipObjectResolution); err != nil {
+				t.Errorf("%s: %q does not parse: %v", test.expr, got, err)
+			}
+		}
+	}
+}
+
 // Verify that we don't print a newline between "return" and its results, as
 // that would incorrectly cause a naked return.
 func TestIssue32854(t *testing.T) {
@@ -778,7 +929,7 @@ func f() {
         }
 }`
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "", src, 0)
+	file, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
 	if err != nil {
 		panic(err)
 	}
@@ -795,5 +946,84 @@ func f() {
 	want := "return call()"
 	if got := buf.String(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSourcePosNewline(t *testing.T) {
+	// We don't provide a syntax for escaping or unescaping characters in line
+	// directives (see https://go.dev/issue/24183#issuecomment-372449628).
+	// As a result, we cannot write a line directive with the correct path for a
+	// filename containing newlines. We should return an error rather than
+	// silently dropping or mangling it.
+
+	fname := "foo\nbar/bar.go"
+	src := `package bar`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, fname, src, parser.ParseComments|parser.AllErrors|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Mode:     SourcePos, // emit line comments
+		Tabwidth: 8,
+	}
+	var buf bytes.Buffer
+	if err := cfg.Fprint(&buf, fset, f); err == nil {
+		t.Errorf("Fprint did not error for source file path containing newline")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected Fprint output:\n%s", buf.Bytes())
+	}
+}
+
+// TestEmptyDecl tests that empty decls for const, var, import are printed with
+// valid syntax e.g "var ()" instead of just "var", which is invalid and cannot
+// be parsed.
+func TestEmptyDecl(t *testing.T) { // issue 63566
+	for _, tok := range []token.Token{token.IMPORT, token.CONST, token.TYPE, token.VAR} {
+		var buf bytes.Buffer
+		Fprint(&buf, token.NewFileSet(), &ast.GenDecl{Tok: tok})
+		got := buf.String()
+		want := tok.String() + " ()"
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+}
+
+// TestIssue7195 checks that go/printer does not add an extra level of indentation
+// when printing a return statement with multiple multi-line composite literals.
+func TestIssue7195(t *testing.T) {
+	const src = `package p
+type T struct{ x int }
+func _() (T, *T) {
+	return T{
+			x: 1,
+		}, &T{
+			x: 2,
+		}
+}
+`
+
+	const want = `package p
+
+type T struct{ x int }
+
+func _() (T, *T) {
+	return T{
+		x: 1,
+	}, &T{
+		x: 2,
+	}
+}
+`
+
+	got, err := format([]byte(src), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(got); got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s\n", got, want)
 	}
 }

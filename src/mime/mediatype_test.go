@@ -5,7 +5,7 @@
 package mime
 
 import (
-	"reflect"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -96,7 +96,9 @@ type mediaTypeTest struct {
 	p  map[string]string
 }
 
-func TestParseMediaType(t *testing.T) {
+var parseMediaTypeTests []mediaTypeTest
+
+func init() {
 	// Convenience map initializer
 	m := func(s ...string) map[string]string {
 		sm := make(map[string]string)
@@ -107,7 +109,7 @@ func TestParseMediaType(t *testing.T) {
 	}
 
 	nameFoo := map[string]string{"name": "foo"}
-	tests := []mediaTypeTest{
+	parseMediaTypeTests = []mediaTypeTest{
 		{`form-data; name="foo"`, "form-data", nameFoo},
 		{` form-data ; name=foo`, "form-data", nameFoo},
 		{`FORM-DATA;name="foo"`, "form-data", nameFoo},
@@ -411,8 +413,23 @@ func TestParseMediaType(t *testing.T) {
 		// Issue #48866: duplicate parameters containing equal values should be allowed
 		{`text; charset=utf-8; charset=utf-8; format=fixed`, "text", m("charset", "utf-8", "format", "fixed")},
 		{`text; charset=utf-8; format=flowed; charset=utf-8`, "text", m("charset", "utf-8", "format", "flowed")},
+
+		// Issue #76236: '{' and '}' are token chars.
+		{"attachment; filename={file}.png", "attachment", m("filename", "{file}.png")},
+
+		// Issue #82343: Don't allow *-encoded parameters in weird places.
+		{`multipart/form-data; boundary=a; boundary*=utf-8''b`, "multipart/form-data", m("boundary", "a")},
+		{`multipart/form-data; boundary=a; boundary*0="b"`, "multipart/form-data", m("boundary", "a")},
+		{`multipart/form-data; boundary*0="b"`, "multipart/form-data", m()},
+		{`text; charset=utf-8; charset*=utf-8''utf-7`, "text", m("charset", "utf-8")},
+		{`text; charset=utf-8; charset*0="utf-7"`, "text", m("charset", "utf-8")},
+		{`text; charset*0="utf-7"`, "text", m()},
+		{`text; boundary=a; boundary*0="b"`, "text", m("boundary", "a")},
 	}
-	for _, test := range tests {
+}
+
+func TestParseMediaType(t *testing.T) {
+	for _, test := range parseMediaTypeTests {
 		mt, params, err := ParseMediaType(test.in)
 		if err != nil {
 			if test.t != "" {
@@ -429,11 +446,19 @@ func TestParseMediaType(t *testing.T) {
 		if len(params) == 0 && len(test.p) == 0 {
 			continue
 		}
-		if !reflect.DeepEqual(params, test.p) {
+		if !maps.Equal(params, test.p) {
 			t.Errorf("for input %#q, wrong params.\n"+
 				"expected: %#v\n"+
 				"     got: %#v",
 				test.in, test.p, params)
+		}
+	}
+}
+
+func BenchmarkParseMediaType(b *testing.B) {
+	for range b.N {
+		for _, test := range parseMediaTypeTests {
+			ParseMediaType(test.in)
 		}
 	}
 }
@@ -486,6 +511,14 @@ func TestParseMediaTypeBogus(t *testing.T) {
 	}
 }
 
+func BenchmarkParseMediaTypeBogus(b *testing.B) {
+	for range b.N {
+		for _, test := range badMediaTypeTests {
+			ParseMediaType(test.in)
+		}
+	}
+}
+
 type formatTest struct {
 	typ    string
 	params map[string]string
@@ -507,6 +540,7 @@ var formatTests = []formatTest{
 	{"foo/BAR", map[string]string{"both": `With \backslash and "quote`}, `foo/bar; both="With \\backslash and \"quote"`},
 	{"foo/BAR", map[string]string{"": "empty attribute"}, ""},
 	{"foo/BAR", map[string]string{"bad attribute": "baz"}, ""},
+	{"foo/BAR", map[string]string{"Name": "foo", "name": "bar"}, ""},
 	{"foo/BAR", map[string]string{"nonascii": "not an ascii character: ä"}, "foo/bar; nonascii*=utf-8''not%20an%20ascii%20character%3A%20%C3%A4"},
 	{"foo/BAR", map[string]string{"ctl": "newline: \n nil: \000"}, "foo/bar; ctl*=utf-8''newline%3A%20%0A%20nil%3A%20%00"},
 	{"foo/bar", map[string]string{"a": "av", "b": "bv", "c": "cv"}, "foo/bar; a=av; b=bv; c=cv"},

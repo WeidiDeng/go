@@ -82,10 +82,10 @@ func _f() {
 		z
 	return func() {}
 	return func() {
-			_ = 0
-		}, T{
-			1, 2,
-		}
+		_ = 0
+	}, T{
+		1, 2,
+	}
 	return func() {
 		_ = 0
 	}
@@ -426,6 +426,29 @@ func _() {
 	}
 
 	for _ = range (T1{T{42}}) {
+	}
+
+	if (T[int]{}) {
+	}
+	if (x == p.T[int, string]{}) {
+	}
+	for (T[int]{}) {
+	}
+	switch (T[int]{}) {
+	}
+	for _ = range (T[int]{}) {
+	}
+
+	// leave parentheses - invalid composite literals accepted by the parser
+	if (f().T{}) {
+	}
+	if (x == a[i].T{}) {
+	}
+	for (f().T[int]{}) {
+	}
+	switch (f().T{}) {
+	}
+	for _ = range (f().T{}) {
 	}
 
 	if x == (T{42}[0]) {

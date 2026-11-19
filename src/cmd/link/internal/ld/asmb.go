@@ -42,23 +42,34 @@ func asmb(ctxt *Link) {
 		offset := sect.Vaddr - Segtext.Vaddr + Segtext.Fileoff
 		// Handle text sections with Codeblk
 		if sect.Name == ".text" {
-			writeParallel(&wg, f, ctxt, offset, sect.Vaddr, sect.Length)
+			writeParallel(&wg, f, ctxt, ctxt.Out, offset, sect.Vaddr, sect.Length)
 		} else {
-			writeParallel(&wg, datblk, ctxt, offset, sect.Vaddr, sect.Length)
+			writeParallel(&wg, datblk, ctxt, ctxt.Out, offset, sect.Vaddr, sect.Length)
 		}
 	}
 
 	if Segrodata.Filelen > 0 {
-		writeParallel(&wg, datblk, ctxt, Segrodata.Fileoff, Segrodata.Vaddr, Segrodata.Filelen)
+		writeParallel(&wg, datblk, ctxt, ctxt.Out, Segrodata.Fileoff, Segrodata.Vaddr, Segrodata.Filelen)
 	}
 
 	if Segrelrodata.Filelen > 0 {
-		writeParallel(&wg, datblk, ctxt, Segrelrodata.Fileoff, Segrelrodata.Vaddr, Segrelrodata.Filelen)
+		writeParallel(&wg, datblk, ctxt, ctxt.Out, Segrelrodata.Fileoff, Segrelrodata.Vaddr, Segrelrodata.Filelen)
 	}
 
-	writeParallel(&wg, datblk, ctxt, Segdata.Fileoff, Segdata.Vaddr, Segdata.Filelen)
+	writeParallel(&wg, datblk, ctxt, ctxt.Out, Segdata.Fileoff, Segdata.Vaddr, Segdata.Filelen)
 
-	writeParallel(&wg, dwarfblk, ctxt, Segdwarf.Fileoff, Segdwarf.Vaddr, Segdwarf.Filelen)
+	outDWARF := ctxt.Out
+	if *FlagSplitDWARF && ctxt.IsInternal() {
+		outDWARF = ctxt.OutDWARF
+	}
+	writeParallel(&wg, dwarfblk, ctxt, outDWARF, Segdwarf.Fileoff, Segdwarf.Vaddr, Segdwarf.Filelen)
+
+	if Segpdata.Filelen > 0 {
+		writeParallel(&wg, pdatablk, ctxt, ctxt.Out, Segpdata.Fileoff, Segpdata.Vaddr, Segpdata.Filelen)
+	}
+	if Segxdata.Filelen > 0 {
+		writeParallel(&wg, xdatablk, ctxt, ctxt.Out, Segxdata.Fileoff, Segxdata.Vaddr, Segxdata.Filelen)
+	}
 
 	wg.Wait()
 }
@@ -188,10 +199,7 @@ func relocSectFn(ctxt *Link, relocSect func(*Link, *OutBuf, *sym.Section, []load
 		fn = func(ctxt *Link, sect *sym.Section, syms []loader.Sym) {
 			wg.Add(1)
 			sem <- 1
-			out, err := ctxt.Out.View(sect.Reloff)
-			if err != nil {
-				panic(err)
-			}
+			out := ctxt.Out.View(sect.Reloff)
 			go func() {
 				relocSect(ctxt, out, sect, syms)
 				wg.Done()

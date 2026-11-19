@@ -20,14 +20,13 @@ import (
 	"compress/zlib"
 	"debug/dwarf"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"internal/saferio"
 	"io"
 	"os"
 	"strings"
 )
-
-// Avoid use of post-Go 1.4 io features, to make safe for toolchain bootstrap.
-const seekStart = 0
 
 // A File represents an open PE file.
 type File struct {
@@ -41,7 +40,7 @@ type File struct {
 	closer io.Closer
 }
 
-// Open opens the named file using os.Open and prepares it for use as a PE binary.
+// Open opens the named file using [os.Open] and prepares it for use as a PE binary.
 func Open(name string) (*File, error) {
 	f, err := os.Open(name)
 	if err != nil {
@@ -56,8 +55,8 @@ func Open(name string) (*File, error) {
 	return ff, nil
 }
 
-// Close closes the File.
-// If the File was created using NewFile directly instead of Open,
+// Close closes the [File].
+// If the [File] was created using [NewFile] directly instead of [Open],
 // Close has no effect.
 func (f *File) Close() error {
 	var err error
@@ -70,7 +69,7 @@ func (f *File) Close() error {
 
 // TODO(brainman): add Load function, as a replacement for NewFile, that does not call removeAuxSymbols (for performance)
 
-// NewFile creates a new File for accessing a PE binary in an underlying reader.
+// NewFile creates a new [File] for accessing a PE binary in an underlying reader.
 func NewFile(r io.ReaderAt) (*File, error) {
 	f := new(File)
 	sr := io.NewSectionReader(r, 0, 1<<63-1)
@@ -83,7 +82,9 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	if dosheader[0] == 'M' && dosheader[1] == 'Z' {
 		signoff := int64(binary.LittleEndian.Uint32(dosheader[0x3c:]))
 		var sign [4]byte
-		r.ReadAt(sign[:], signoff)
+		if _, err := r.ReadAt(sign[:], signoff); err != nil {
+			return nil, err
+		}
 		if !(sign[0] == 'P' && sign[1] == 'E' && sign[2] == 0 && sign[3] == 0) {
 			return nil, fmt.Errorf("invalid PE file signature: % x", sign)
 		}
@@ -91,7 +92,7 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	} else {
 		base = int64(0)
 	}
-	sr.Seek(base, seekStart)
+	sr.Seek(base, io.SeekStart)
 	if err := binary.Read(sr, binary.LittleEndian, &f.FileHeader); err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	}
 
 	// Seek past file header.
-	_, err = sr.Seek(base+int64(binary.Size(f.FileHeader)), seekStart)
+	_, err = sr.Seek(base+int64(binary.Size(f.FileHeader)), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +166,7 @@ func NewFile(r io.ReaderAt) (*File, error) {
 		}
 		r2 := r
 		if sh.PointerToRawData == 0 { // .bss must have all 0s
-			r2 = zeroReaderAt{}
+			r2 = &nobitsSectionReader{}
 		}
 		s.sr = io.NewSectionReader(r2, int64(s.SectionHeader.Offset), int64(s.SectionHeader.Size))
 		s.ReaderAt = s.sr
@@ -182,15 +183,10 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	return f, nil
 }
 
-// zeroReaderAt is ReaderAt that reads 0s.
-type zeroReaderAt struct{}
+type nobitsSectionReader struct{}
 
-// ReadAt writes len(p) 0s into p.
-func (w zeroReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
-	for i := range p {
-		p[i] = 0
-	}
-	return len(p), nil
+func (*nobitsSectionReader) ReadAt(p []byte, off int64) (n int, err error) {
+	return 0, errors.New("unexpected read from section with uninitialized data")
 }
 
 // getString extracts a string from symbol string table.
@@ -244,12 +240,12 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 
 		if len(b) >= 12 && string(b[:4]) == "ZLIB" {
 			dlen := binary.BigEndian.Uint64(b[4:12])
-			dbuf := make([]byte, dlen)
 			r, err := zlib.NewReader(bytes.NewBuffer(b[12:]))
 			if err != nil {
 				return nil, err
 			}
-			if _, err := io.ReadFull(r, dbuf); err != nil {
+			dbuf, err := saferio.ReadData(r, dlen)
+			if err != nil {
 				return nil, err
 			}
 			if err := r.Close(); err != nil {
@@ -314,8 +310,9 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 	return d, nil
 }
 
-// TODO(brainman): document ImportDirectory once we decide what to do with it.
-
+// ImportDirectory represents an entry in a PE file's import directory table.
+//
+// Deprecated: ImportDirectory is an internal detail and should not be used directly.
 type ImportDirectory struct {
 	OriginalFirstThunk uint32
 	TimeDateStamp      uint32
@@ -363,6 +360,9 @@ func (f *File) ImportedSymbols() ([]string, error) {
 	var ds *Section
 	ds = nil
 	for _, s := range f.Sections {
+		if s.Offset == 0 {
+			continue
+		}
 		// We are using distance between s.VirtualAddress and idd.VirtualAddress
 		// to avoid potential overflow of uint32 caused by addition of s.VirtualSize
 		// to s.VirtualAddress.
@@ -383,7 +383,11 @@ func (f *File) ImportedSymbols() ([]string, error) {
 	}
 
 	// seek to the virtual address specified in the import data directory
-	d = d[idd.VirtualAddress-ds.VirtualAddress:]
+	seek := idd.VirtualAddress - ds.VirtualAddress
+	if seek >= uint32(len(d)) {
+		return nil, errors.New("optional header data directory virtual size doesn't fit within data seek")
+	}
+	d = d[seek:]
 
 	// start decoding the import directory
 	var ida []ImportDirectory
@@ -412,9 +416,16 @@ func (f *File) ImportedSymbols() ([]string, error) {
 		dt.dll, _ = getString(names, int(dt.Name-ds.VirtualAddress))
 		d, _ = ds.Data()
 		// seek to OriginalFirstThunk
-		d = d[dt.OriginalFirstThunk-ds.VirtualAddress:]
+		seek := dt.OriginalFirstThunk - ds.VirtualAddress
+		if seek >= uint32(len(d)) {
+			return nil, errors.New("import directory original first thunk doesn't fit within data seek")
+		}
+		d = d[seek:]
 		for len(d) > 0 {
 			if pe64 { // 64bit
+				if len(d) < 8 {
+					return nil, errors.New("thunk parsing needs at least 8-bytes")
+				}
 				va := binary.LittleEndian.Uint64(d[0:8])
 				d = d[8:]
 				if va == 0 {
@@ -427,6 +438,9 @@ func (f *File) ImportedSymbols() ([]string, error) {
 					all = append(all, fn+":"+dt.dll)
 				}
 			} else { // 32bit
+				if len(d) < 4 {
+					return nil, errors.New("thunk parsing needs at least 4 bytes")
+				}
 				va := binary.LittleEndian.Uint32(d[0:4])
 				d = d[4:]
 				if va == 0 {
@@ -464,7 +478,7 @@ func (e *FormatError) Error() string {
 	return "unknown error"
 }
 
-// readOptionalHeader accepts a io.ReadSeeker pointing to optional header in the PE file
+// readOptionalHeader accepts an io.ReadSeeker pointing to optional header in the PE file
 // and its size as seen in the file header.
 // It parses the given size of bytes and returns optional header. It infers whether the
 // bytes being parsed refer to 32 bit or 64 bit version of optional header.
@@ -487,7 +501,7 @@ func readOptionalHeader(r io.ReadSeeker, sz uint16) (any, error) {
 		return nil, fmt.Errorf("optional header size is less than optional header magic size")
 	}
 
-	// read reads from io.ReadSeeke, r, into data.
+	// read reads from io.ReadSeeker, r, into data.
 	var err error
 	read := func(data any) bool {
 		err = binary.Read(r, binary.LittleEndian, data)
@@ -612,7 +626,7 @@ func readOptionalHeader(r io.ReadSeeker, sz uint16) (any, error) {
 	}
 }
 
-// readDataDirectories accepts a io.ReadSeeker pointing to data directories in the PE file,
+// readDataDirectories accepts an io.ReadSeeker pointing to data directories in the PE file,
 // its size and number of data directories as seen in optional header.
 // It parses the given size of bytes and returns given number of data directories.
 func readDataDirectories(r io.ReadSeeker, sz uint16, n uint32) ([]DataDirectory, error) {

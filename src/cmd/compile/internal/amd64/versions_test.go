@@ -72,13 +72,14 @@ func TestGoAMD64v1(t *testing.T) {
 	}
 
 	// Run the resulting binary.
-	cmd := exec.Command(dst.Name())
+	cmd := testenv.Command(t, dst.Name())
 	testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "TESTGOAMD64V1=yes")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("GODEBUG=%s", strings.Join(features, ",")))
+	// Disable FIPS 140-3 mode, since it would detect the modified binary.
+	cmd.Env = append(cmd.Env, fmt.Sprintf("GODEBUG=%s,fips140=off", strings.Join(features, ",")))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("couldn't execute test: %s", err)
+		t.Fatalf("couldn't execute test: %s\n%s", err, out)
 	}
 	// Expect to see output of the form "PASS\n", unless the test binary
 	// was compiled for coverage (in which case there will be an extra line).
@@ -104,7 +105,7 @@ func clobber(t *testing.T, src string, dst *os.File, opcodes map[string]bool) {
 	if false {
 		// TODO: go tool objdump doesn't disassemble the bmi1 instructions
 		// in question correctly. See issue 48584.
-		cmd := exec.Command("go", "tool", "objdump", src)
+		cmd := testenv.Command(t, "go", "tool", "objdump", src)
 		var err error
 		disasm, err = cmd.StdoutPipe()
 		if err != nil {
@@ -113,11 +114,16 @@ func clobber(t *testing.T, src string, dst *os.File, opcodes map[string]bool) {
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			if err := cmd.Wait(); err != nil {
+				t.Error(err)
+			}
+		})
 		re = regexp.MustCompile(`^[^:]*:[-\d]+\s+0x([\da-f]+)\s+([\da-f]+)\s+([A-Z]+)`)
 	} else {
 		// TODO: we're depending on platform-native objdump here. Hence the Skipf
 		// below if it doesn't run for some reason.
-		cmd := exec.Command("objdump", "-d", src)
+		cmd := testenv.Command(t, "objdump", "-d", src)
 		var err error
 		disasm, err = cmd.StdoutPipe()
 		if err != nil {
@@ -129,6 +135,11 @@ func clobber(t *testing.T, src string, dst *os.File, opcodes map[string]bool) {
 			}
 			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			if err := cmd.Wait(); err != nil {
+				t.Error(err)
+			}
+		})
 		re = regexp.MustCompile(`^\s*([\da-f]+):\s*((?:[\da-f][\da-f] )+)\s*([a-z\d]+)`)
 	}
 
@@ -156,6 +167,9 @@ func clobber(t *testing.T, src string, dst *os.File, opcodes map[string]bool) {
 			// as well make all the bytes faulting.
 			virtualEdits[addr+uint64(i)] = true
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanning objdump output: %v", err)
 	}
 
 	// Figure out where in the binary the edits must be done.
@@ -236,6 +250,7 @@ func setOf(keys ...string) map[string]bool {
 var runtimeFeatures = setOf(
 	"adx", "aes", "avx", "avx2", "bmi1", "bmi2", "erms", "fma",
 	"pclmulqdq", "popcnt", "rdtscp", "sse3", "sse41", "sse42", "ssse3",
+	"avx512f", "avx512dq",
 )
 
 var featureToOpcodes = map[string][]string{
@@ -268,6 +283,7 @@ var featureToOpcodes = map[string][]string{
 	"fma":   {"vfmadd231sd"},
 	"movbe": {"movbeqq", "movbeq", "movbell", "movbel", "movbe"},
 	"lzcnt": {"lzcntq", "lzcntl", "lzcnt"},
+	"avx2":  {"vmovsd", "vpbroadcastq", "vmulpd", "vpextrq"}, // not a complete list
 }
 
 // Test to use POPCNT instruction, if available
@@ -420,4 +436,22 @@ func TestFMA(t *testing.T) {
 			t.Errorf("FMA(%f,%f,%f) = %f, want %f", tt.x, tt.y, tt.z, got, tt.want)
 		}
 	}
+}
+
+func TestLoop(t *testing.T) {
+	// Make sure non-v1 ops are not lifted out of loops (and
+	// hence, out of the cpu feature test that guards them).
+	// See issue 78997.
+	testLoop1(6, 7)
+	testLoop2(6, 7) // in versions_(no)simd_test.go
+	testLoop3(6, 7) // in versions_(no)simd_test.go
+}
+
+//go:noinline
+func testLoop1(n int, x uint64) int {
+	var r int
+	for range n {
+		r += bits.OnesCount64(x)
+	}
+	return r
 }

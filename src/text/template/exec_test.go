@@ -10,10 +10,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"iter"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 var debug = flag.Bool("debug", false, "show the errors produced by the tests")
@@ -41,7 +43,8 @@ type T struct {
 	SIEmpty []int
 	SB      []bool
 	// Arrays
-	AI [3]int
+	AI  [3]int
+	PAI *[3]int // pointer to array
 	// Maps
 	MSI      map[string]int
 	MSIone   map[string]int // one element, for deterministic output
@@ -70,17 +73,22 @@ type T struct {
 	Str fmt.Stringer
 	Err error
 	// Pointers
-	PI  *int
-	PS  *string
-	PSI *[]int
-	NIL *int
+	PI       *int
+	PS       *string
+	PSI      *[]int
+	NIL      *int
+	UPI      unsafe.Pointer
+	EmptyUPI unsafe.Pointer
 	// Function (not method)
-	BinaryFunc      func(string, string) string
-	VariadicFunc    func(...string) string
-	VariadicFuncInt func(int, ...string) string
-	NilOKFunc       func(*int) bool
-	ErrFunc         func() (string, error)
-	PanicFunc       func() string
+	BinaryFunc             func(string, string) string
+	VariadicFunc           func(...string) string
+	VariadicFuncInt        func(int, ...string) string
+	NilOKFunc              func(*int) bool
+	ErrFunc                func() (string, error)
+	PanicFunc              func() string
+	TooFewReturnCountFunc  func()
+	TooManyReturnCountFunc func() (string, error, int)
+	InvalidReturnTypeFunc  func() (string, bool)
 	// Template to test evaluation of templates.
 	Tmpl *Template
 	// Unexported field; cannot be accessed by template.
@@ -135,6 +143,7 @@ var tVal = &T{
 	SI:     []int{3, 4, 5},
 	SICap:  make([]int, 5, 10),
 	AI:     [3]int{3, 4, 5},
+	PAI:    &[3]int{3, 4, 5},
 	SB:     []bool{true, false},
 	MSI:    map[string]int{"one": 1, "two": 2, "three": 3},
 	MSIone: map[string]int{"one": 1},
@@ -162,12 +171,16 @@ var tVal = &T{
 	PI:                        newInt(23),
 	PS:                        newString("a string"),
 	PSI:                       newIntSlice(21, 22, 23),
+	UPI:                       newUnsafePointer(23),
 	BinaryFunc:                func(a, b string) string { return fmt.Sprintf("[%s=%s]", a, b) },
 	VariadicFunc:              func(s ...string) string { return fmt.Sprint("<", strings.Join(s, "+"), ">") },
 	VariadicFuncInt:           func(a int, s ...string) string { return fmt.Sprint(a, "=<", strings.Join(s, "+"), ">") },
 	NilOKFunc:                 func(s *int) bool { return s == nil },
 	ErrFunc:                   func() (string, error) { return "bla", nil },
 	PanicFunc:                 func() string { panic("test panic") },
+	TooFewReturnCountFunc:     func() {},
+	TooManyReturnCountFunc:    func() (string, error, int) { return "", nil, 0 },
+	InvalidReturnTypeFunc:     func() (string, bool) { return "", false },
 	Tmpl:                      Must(New("x").Parse("test template")), // "x" is the value of .X
 }
 
@@ -183,6 +196,10 @@ var iVal I = tVal
 // Helpers for creation.
 func newInt(n int) *int {
 	return &n
+}
+
+func newUnsafePointer(n int) unsafe.Pointer {
+	return unsafe.Pointer(&n)
 }
 
 func newString(s string) *string {
@@ -265,8 +282,8 @@ type execTest struct {
 // of the max int boundary.
 // We do it this way so the test doesn't depend on ints being 32 bits.
 var (
-	bigInt  = fmt.Sprintf("0x%x", int(1<<uint(reflect.TypeOf(0).Bits()-1)-1))
-	bigUint = fmt.Sprintf("0x%x", uint(1<<uint(reflect.TypeOf(0).Bits()-1)))
+	bigInt  = fmt.Sprintf("0x%x", int(1<<uint(reflect.TypeFor[int]().Bits()-1)-1))
+	bigUint = fmt.Sprintf("0x%x", uint(1<<uint(reflect.TypeFor[int]().Bits()-1)))
 )
 
 var execTests = []execTest{
@@ -393,6 +410,9 @@ var execTests = []execTest{
 	{"Interface Call", `{{stringer .S}}`, "foozle", map[string]any{"S": bytes.NewBufferString("foozle")}, true},
 	{".ErrFunc", "{{call .ErrFunc}}", "bla", tVal, true},
 	{"call nil", "{{call nil}}", "", tVal, false},
+	{"empty call", "{{call}}", "", tVal, false},
+	{"empty call after pipe valid", "{{.ErrFunc | call}}", "bla", tVal, true},
+	{"empty call after pipe invalid", "{{1 | call}}", "", tVal, false},
 
 	// Erroneous function calls (check args).
 	{".BinaryFuncTooFew", "{{call .BinaryFunc `1`}}", "", tVal, false},
@@ -433,6 +453,10 @@ var execTests = []execTest{
 	{"if 0.0", "{{if .FloatZero}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
 	{"if 1.5i", "{{if 1.5i}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
 	{"if 0.0i", "{{if .ComplexZero}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
+	{"if nonNilPointer", "{{if .PI}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
+	{"if nilPointer", "{{if .NIL}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
+	{"if UPI", "{{if .UPI}}NON-ZERO{{else}}ZERO{{end}}", "NON-ZERO", tVal, true},
+	{"if EmptyUPI", "{{if .EmptyUPI}}NON-ZERO{{else}}ZERO{{end}}", "ZERO", tVal, true},
 	{"if emptystring", "{{if ``}}NON-EMPTY{{else}}EMPTY{{end}}", "EMPTY", tVal, true},
 	{"if string", "{{if `notempty`}}NON-EMPTY{{else}}EMPTY{{end}}", "NON-EMPTY", tVal, true},
 	{"if emptyslice", "{{if .SIEmpty}}NON-EMPTY{{else}}EMPTY{{end}}", "EMPTY", tVal, true},
@@ -534,6 +558,9 @@ var execTests = []execTest{
 	{"array[:]", "{{slice .AI}}", "[3 4 5]", tVal, true},
 	{"array[1:]", "{{slice .AI 1}}", "[4 5]", tVal, true},
 	{"array[1:2]", "{{slice .AI 1 2}}", "[4]", tVal, true},
+	{"pointer to array[:]", "{{slice .PAI}}", "[3 4 5]", tVal, true},
+	{"pointer to array[1:]", "{{slice .PAI 1}}", "[4 5]", tVal, true},
+	{"pointer to array[1:2]", "{{slice .PAI 1 2}}", "[4]", tVal, true},
 	{"string[:]", "{{slice .S}}", "xyz", tVal, true},
 	{"string[0:1]", "{{slice .S 0 1}}", "x", tVal, true},
 	{"string[1:]", "{{slice .S 1}}", "yz", tVal, true},
@@ -569,6 +596,8 @@ var execTests = []execTest{
 	{"with $x struct.U.V", "{{with $x := $}}{{$x.U.V}}{{end}}", "v", tVal, true},
 	{"with variable and action", "{{with $x := $}}{{$y := $.U.V}}{{$y}}{{end}}", "v", tVal, true},
 	{"with on typed nil interface value", "{{with .NonEmptyInterfaceTypedNil}}TRUE{{ end }}", "", tVal, true},
+	{"with else with", "{{with 0}}{{.}}{{else with true}}{{.}}{{end}}", "true", tVal, true},
+	{"with else with chain", "{{with 0}}{{.}}{{else with false}}{{.}}{{else with `notempty`}}{{.}}{{end}}", "notempty", tVal, true},
 
 	// Range.
 	{"range []int", "{{range .SI}}-{{.}}-{{end}}", "-3--4--5-", tVal, true},
@@ -593,6 +622,30 @@ var execTests = []execTest{
 	{"declare in range", "{{range $x := .PSI}}<{{$foo:=$x}}{{$x}}>{{end}}", "<21><22><23>", tVal, true},
 	{"range count", `{{range $i, $x := count 5}}[{{$i}}]{{$x}}{{end}}`, "[0]a[1]b[2]c[3]d[4]e", tVal, true},
 	{"range nil count", `{{range $i, $x := count 0}}{{else}}empty{{end}}`, "empty", tVal, true},
+	{"range iter.Seq[int]", `{{range $i := .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"i = range iter.Seq[int]", `{{$i := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"range iter.Seq[int] over two var", `{{range $i, $c := .}}{{$c}}{{end}}`, "", fVal1(2), false},
+	{"i, c := range iter.Seq2[int,int]", `{{range $i, $c := .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i, c = range iter.Seq2[int,int]", `{{$i := 0}}{{$c := 0}}{{range $i, $c = .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i = range iter.Seq2[int,int]", `{{$i := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal2(2), true},
+	{"i := range iter.Seq2[int,int]", `{{range $i := .}}{{$i}}{{end}}`, "01", fVal2(2), true},
+	{"i,c,x range iter.Seq2[int,int]", `{{$i := 0}}{{$c := 0}}{{$x := 0}}{{range $i, $c = .}}{{$i}}{{$c}}{{end}}`, "0112", fVal2(2), true},
+	{"i,x range iter.Seq[int]", `{{$i := 0}}{{$x := 0}}{{range $i = .}}{{$i}}{{end}}`, "01", fVal1(2), true},
+	{"range iter.Seq[int] else", `{{range $i := .}}{{$i}}{{else}}empty{{end}}`, "empty", fVal1(0), true},
+	{"range iter.Seq2[int,int] else", `{{range $i := .}}{{$i}}{{else}}empty{{end}}`, "empty", fVal2(0), true},
+	{"range int8", rangeTestInt, rangeTestData[int8](), int8(5), true},
+	{"range int16", rangeTestInt, rangeTestData[int16](), int16(5), true},
+	{"range int32", rangeTestInt, rangeTestData[int32](), int32(5), true},
+	{"range int64", rangeTestInt, rangeTestData[int64](), int64(5), true},
+	{"range int", rangeTestInt, rangeTestData[int](), int(5), true},
+	{"range uint8", rangeTestInt, rangeTestData[uint8](), uint8(5), true},
+	{"range uint16", rangeTestInt, rangeTestData[uint16](), uint16(5), true},
+	{"range uint32", rangeTestInt, rangeTestData[uint32](), uint32(5), true},
+	{"range uint64", rangeTestInt, rangeTestData[uint64](), uint64(5), true},
+	{"range uint", rangeTestInt, rangeTestData[uint](), uint(5), true},
+	{"range uintptr", rangeTestInt, rangeTestData[uintptr](), uintptr(5), true},
+	{"range uintptr(0)", `{{range $v := .}}{{print $v}}{{else}}empty{{end}}`, "empty", uintptr(0), true},
+	{"range 5", `{{range $v := 5}}{{printf "%T%d" $v $v}}{{end}}`, rangeTestData[int](), nil, true},
 
 	// Cute examples.
 	{"or as if true", `{{or .SI "slice is empty"}}`, "[3 4 5]", tVal, true},
@@ -692,6 +745,40 @@ var execTests = []execTest{
 	{"bug18a", "{{eq . '.'}}", "true", '.', true},
 	{"bug18b", "{{eq . 'e'}}", "true", 'e', true},
 	{"bug18c", "{{eq . 'P'}}", "true", 'P', true},
+
+	{"issue56490", "{{$i := 0}}{{$x := 0}}{{range $i = .AI}}{{end}}{{$i}}", "5", tVal, true},
+	{"issue60801", "{{$k := 0}}{{$v := 0}}{{range $k, $v = .AI}}{{$k}}={{$v}} {{end}}", "0=3 1=4 2=5 ", tVal, true},
+}
+
+func fVal1(i int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for v := range i {
+			if !yield(v) {
+				break
+			}
+		}
+	}
+}
+
+func fVal2(i int) iter.Seq2[int, int] {
+	return func(yield func(int, int) bool) {
+		for v := range i {
+			if !yield(v, v+1) {
+				break
+			}
+		}
+	}
+}
+
+const rangeTestInt = `{{range $v := .}}{{printf "%T%d" $v $v}}{{end}}`
+
+func rangeTestData[T int | int8 | int16 | int32 | int64 | uint | uint8 | uint16 | uint32 | uint64 | uintptr]() string {
+	I := T(5)
+	var buf strings.Builder
+	for i := T(0); i < I; i++ {
+		fmt.Fprintf(&buf, "%T%d", i, i)
+	}
+	return buf.String()
 }
 
 func zeroArgs() string {
@@ -840,7 +927,6 @@ func TestDelims(t *testing.T) {
 	const hello = "Hello, world"
 	var value = struct{ Str string }{hello}
 	for i := 0; i < len(delimPairs); i += 2 {
-		text := ".Str"
 		left := delimPairs[i+0]
 		trueLeft := left
 		right := delimPairs[i+1]
@@ -851,15 +937,21 @@ func TestDelims(t *testing.T) {
 		if right == "" { // default case
 			trueRight = "}}"
 		}
-		text = trueLeft + text + trueRight
-		// Now add a comment
-		text += trueLeft + "/*comment*/" + trueRight
-		// Now add  an action containing a string.
-		text += trueLeft + `"` + trueLeft + `"` + trueRight
+		action := trueLeft + ".Str" + trueRight
+		// A comment, which is not preserved in the parse tree.
+		comment := trueLeft + "/*comment*/" + trueRight
+		// An action containing a string that looks like the left delimiter.
+		strAction := trueLeft + `"` + trueLeft + `"` + trueRight
+		text := action + comment + strAction
 		// At this point text looks like `{{.Str}}{{/*comment*/}}{{"{{"}}`.
 		tmpl, err := New("delims").Delims(left, right).Parse(text)
 		if err != nil {
 			t.Fatalf("delim %q text %q parse err %s", left, text, err)
+		}
+		// The parse tree's String form should roundtrip back to the input,
+		// using the custom delimiters, modulo the dropped comment.
+		if got, want := tmpl.Root.String(), action+strAction; got != want {
+			t.Errorf("delim %q: String() = %q, want %q", left, got, want)
 		}
 		var b = new(strings.Builder)
 		err = tmpl.Execute(b, value)
@@ -917,6 +1009,19 @@ func TestExecError(t *testing.T) {
 	}
 }
 
+// Issue 80718: format verbs in template name should not consume errorf format args.
+func TestIssue80718(t *testing.T) {
+	tmpl := Must(New("%s.tmpl").Option("missingkey=error").Parse("{{ .MissingKey }}"))
+	err := tmpl.Execute(io.Discard, map[string]string{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	const want = `template: %s.tmpl:1:3: executing "%s.tmpl" at <.MissingKey>: map has no entry for key "MissingKey"`
+	if got := err.Error(); got != want {
+		t.Errorf("expected\n%q\ngot\n%q", want, got)
+	}
+}
+
 type CustomError struct{}
 
 func (*CustomError) Error() string { return "heyo !" }
@@ -933,8 +1038,7 @@ func TestExecError_CustomError(t *testing.T) {
 	var b bytes.Buffer
 	err := tmpl.Execute(&b, nil)
 
-	var e *CustomError
-	if !errors.As(err, &e) {
+	if _, ok := errors.AsType[*CustomError](err); !ok {
 		t.Fatalf("expected custom error; got %s", err)
 	}
 }
@@ -947,7 +1051,7 @@ func TestJSEscaping(t *testing.T) {
 		{`'foo`, `\'foo`},
 		{`Go "jump" \`, `Go \"jump\" \\`},
 		{`Yukihiro says "今日は世界"`, `Yukihiro says \"今日は世界\"`},
-		{"unprintable \uFDFF", `unprintable \uFDFF`},
+		{"unprintable \uFFFE", `unprintable \uFFFE`},
 		{`<html>`, `\u003Chtml\u003E`},
 		{`no = in attributes`, `no \u003D in attributes`},
 		{`&#x27; does not become HTML entity`, `\u0026#x27; does not become HTML entity`},
@@ -1356,6 +1460,37 @@ func (e ErrorWriter) Write(p []byte) (int, error) {
 	return 0, alwaysError
 }
 
+// writeOnlyWriter hides the WriteString method of the embedded writer.
+type writeOnlyWriter struct {
+	io.Writer
+}
+
+type errorStringWriter struct {
+	ErrorWriter
+}
+
+func (e errorStringWriter) WriteString(s string) (int, error) {
+	return 0, alwaysError
+}
+
+func TestPrintString(t *testing.T) {
+	tmpl := Must(New("X").Parse("<{{.}}>"))
+
+	var b strings.Builder
+	if err := tmpl.Execute(writeOnlyWriter{&b}, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b.String(), "<hello>"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	tmpl = Must(New("X").Parse("{{.}}"))
+	err := tmpl.Execute(errorStringWriter{}, "hello")
+	if err == nil || err.Error() != alwaysErrorText {
+		t.Errorf("expected %q error; got %v", alwaysErrorText, err)
+	}
+}
+
 func TestExecuteGivesExecError(t *testing.T) {
 	// First, a non-execution error shouldn't be an ExecError.
 	tmpl, err := New("X").Parse("hello")
@@ -1420,6 +1555,44 @@ func TestBadFuncNames(t *testing.T) {
 	}
 	for _, name := range names {
 		testBadFuncName(name, t)
+	}
+}
+
+func TestIsTrue(t *testing.T) {
+	var nil_ptr *int
+	var nil_chan chan int
+	tests := []struct {
+		v    any
+		want bool
+	}{
+		{1, true},
+		{0, false},
+		{uint8(1), true},
+		{uint8(0), false},
+		{float64(1.0), true},
+		{float64(0.0), false},
+		{complex64(1.0), true},
+		{complex64(0.0), false},
+		{true, true},
+		{false, false},
+		{[2]int{1, 2}, true},
+		{[0]int{}, false},
+		{[]byte("abc"), true},
+		{[]byte(""), false},
+		{map[string]int{"a": 1, "b": 2}, true},
+		{map[string]int{}, false},
+		{make(chan int), true},
+		{nil_chan, false},
+		{new(int), true},
+		{nil_ptr, false},
+		{unsafe.Pointer(new(int)), true},
+		{unsafe.Pointer(nil_ptr), false},
+	}
+	for _, test_case := range tests {
+		got, _ := IsTrue(test_case.v)
+		if got != test_case.want {
+			t.Fatalf("expect result %v, got %v", test_case.want, got)
+		}
 	}
 }
 
@@ -1650,6 +1823,15 @@ func TestExecutePanicDuringCall(t *testing.T) {
 		"doPanic": func() string {
 			panic("custom panic string")
 		},
+		"doPanicVariadic": func(...any) string {
+			panic("custom panic string")
+		},
+		"doPanicCompare": func(reflect.Value, reflect.Value) (bool, error) {
+			panic("custom panic string")
+		},
+		"doPanicFormat": func(string, ...any) string {
+			panic("custom panic string")
+		},
 	}
 	tests := []struct {
 		name    string
@@ -1666,6 +1848,26 @@ func TestExecutePanicDuringCall(t *testing.T) {
 			"indirect func call panics",
 			"{{call doPanic}}", (*T)(nil),
 			`template: t:1:7: executing "t" at <doPanic>: error calling doPanic: custom panic string`,
+		},
+		{
+			"variadic func call panics",
+			"{{doPanicVariadic 1}}", (*T)(nil),
+			`template: t:1:2: executing "t" at <doPanicVariadic 1>: error calling doPanicVariadic: custom panic string`,
+		},
+		{
+			"piped variadic func call panics",
+			"{{1 | doPanicVariadic}}", (*T)(nil),
+			`template: t:1:6: executing "t" at <doPanicVariadic>: error calling doPanicVariadic: custom panic string`,
+		},
+		{
+			"compare-like func call panics",
+			"{{doPanicCompare 1 2}}", (*T)(nil),
+			`template: t:1:2: executing "t" at <doPanicCompare 1 2>: error calling doPanicCompare: custom panic string`,
+		},
+		{
+			"printf-like func call panics",
+			`{{2 | doPanicFormat "%d"}}`, (*T)(nil),
+			`template: t:1:6: executing "t" at <doPanicFormat "%d">: error calling doPanicFormat: custom panic string`,
 		},
 		{
 			"direct method call panics",
@@ -1706,6 +1908,80 @@ func TestExecutePanicDuringCall(t *testing.T) {
 	}
 }
 
+func TestFunctionCheckDuringCall(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		data    any
+		wantErr string
+	}{{
+		name:    "call nothing",
+		input:   `{{call}}`,
+		data:    tVal,
+		wantErr: "wrong number of args for call: want at least 1 got 0",
+	},
+		{
+			name:    "call non-function",
+			input:   "{{call .True}}",
+			data:    tVal,
+			wantErr: "error calling call: non-function .True of type bool",
+		},
+		{
+			name:    "call func with wrong argument",
+			input:   "{{call .BinaryFunc 1}}",
+			data:    tVal,
+			wantErr: "error calling call: wrong number of args for .BinaryFunc: got 1 want 2",
+		},
+		{
+			name:    "call variadic func with wrong argument",
+			input:   `{{call .VariadicFuncInt}}`,
+			data:    tVal,
+			wantErr: "error calling call: wrong number of args for .VariadicFuncInt: got 0 want at least 1",
+		},
+		{
+			name:    "call too few return number func",
+			input:   `{{call .TooFewReturnCountFunc}}`,
+			data:    tVal,
+			wantErr: "error calling call: function .TooFewReturnCountFunc has 0 return values; should be 1 or 2",
+		},
+		{
+			name:    "call too many return number func",
+			input:   `{{call .TooManyReturnCountFunc}}`,
+			data:    tVal,
+			wantErr: "error calling call: function .TooManyReturnCountFunc has 3 return values; should be 1 or 2",
+		},
+		{
+			name:    "call invalid return type func",
+			input:   `{{call .InvalidReturnTypeFunc}}`,
+			data:    tVal,
+			wantErr: "error calling call: invalid function signature for .InvalidReturnTypeFunc: second return value should be error; is bool",
+		},
+		{
+			name:    "call pipeline",
+			input:   `{{call (len "test")}}`,
+			data:    nil,
+			wantErr: "error calling call: non-function len \"test\" of type int",
+		},
+	}
+
+	for _, tc := range tests {
+		b := new(bytes.Buffer)
+		tmpl, err := New("t").Parse(tc.input)
+		if err != nil {
+			t.Fatalf("parse error: %s", err)
+		}
+		err = tmpl.Execute(b, tc.data)
+		if err == nil {
+			t.Errorf("%s: expected error; got none", tc.name)
+		} else if tc.wantErr == "" || !strings.Contains(err.Error(), tc.wantErr) {
+			if *debug {
+				fmt.Printf("%s: test execute error: %s\n", tc.name, err)
+			}
+			t.Errorf("%s: expected error:\n%s\ngot:\n%s", tc.name, tc.wantErr, err)
+		}
+	}
+}
+
 // Issue 31810. Check that a parenthesized first argument behaves properly.
 func TestIssue31810(t *testing.T) {
 	// A simple value with no arguments is fine.
@@ -1734,6 +2010,9 @@ func TestIssue31810(t *testing.T) {
 	// Works if the function is explicitly called.
 	const textCall = "{{ (call .)  }}"
 	tmpl, err = New("").Parse(textCall)
+	if err != nil {
+		t.Fatal(err)
+	}
 	b.Reset()
 	err = tmpl.Execute(&b, f)
 	if err != nil {
@@ -1814,5 +2093,123 @@ func TestIssue48215(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reflect: indirection through nil pointer to embedded struct field A") {
 		t.Fatal(err)
+	}
+}
+
+func BenchmarkExecuteVariadicFunc(b *testing.B) {
+	funcs := FuncMap{"join": func(args ...any) string { return fmt.Sprint(args...) }}
+	tmpl := Must(New("t").Funcs(funcs).Parse(`{{join "a" 1}}{{. | join}}{{join .}}`))
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := tmpl.Execute(io.Discard, "b"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkExecuteBuiltins(b *testing.B) {
+	data := map[string]any{
+		"S": "active",
+		"N": 3,
+		"L": []int{1, 2, 3},
+		"M": map[string]string{"k": "v"},
+	}
+	tmpls := []struct{ name, text string }{
+		{"eq", `{{if eq .S "active"}}y{{end}}`},
+		{"eqMulti", `{{if eq .S "a" "b" "active"}}y{{end}}`},
+		{"lt", `{{if lt .N 5}}y{{end}}`},
+		{"not", `{{if not .S}}y{{end}}`},
+		{"printf", `{{printf "%s-%d" .S .N}}`},
+		{"userFunc", `{{double .N}}`},
+	}
+	for _, tt := range tmpls {
+		tmpl := Must(New("t").Funcs(FuncMap{"double": func(n int) int { return 2 * n }}).Parse(tt.text))
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := tmpl.Execute(io.Discard, data); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestExecuteBuiltinSignatureFuncs(t *testing.T) {
+	funcs := FuncMap{
+		"same": func(a, b reflect.Value) (bool, error) {
+			if a.Kind() != b.Kind() {
+				return false, fmt.Errorf("kinds differ: %s, %s", a.Kind(), b.Kind())
+			}
+			return a.Interface() == b.Interface(), nil
+		},
+		"anyOf": func(x reflect.Value, ys ...reflect.Value) (bool, error) {
+			for _, y := range ys {
+				if x.Interface() == y.Interface() {
+					return true, nil
+				}
+			}
+			return false, nil
+		},
+		"isStr": func(x reflect.Value) bool { return x.Kind() == reflect.String },
+		"fmt":   func(format string, args ...any) string { return fmt.Sprintf(format, args...) },
+	}
+	tests := []struct {
+		input, want, wantErr string
+	}{
+		{`{{same 1 1}} {{same "a" "b"}} {{1 | same 1}}`, "true false true", ""},
+		{`{{same 1 "a"}}`, "", "error calling same: kinds differ: int, string"},
+		{`{{anyOf 3 1 2 3}} {{anyOf 3}} {{3 | anyOf 1 2}}`, "true false false", ""},
+		{`{{isStr "a"}} {{isStr 1}} {{"a" | isStr}}`, "true false true", ""},
+		{`{{same .RV "s"}} {{isStr .RV}}`, "true true", ""},
+		{`{{eq nil nil}} {{not nil}}`, "true true", ""},
+		{`{{fmt "%s=%d" "a" 1}} {{1 | fmt "%d"}} {{"%%" | fmt}}`, "a=1 1 %", ""},
+	}
+	for _, tt := range tests {
+		tmpl := Must(New("t").Funcs(funcs).Parse(tt.input))
+		var b strings.Builder
+		err := tmpl.Execute(&b, struct{ RV reflect.Value }{reflect.ValueOf("s")})
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("%s: got error %v, want %q", tt.input, err, tt.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tt.input, err)
+		} else if b.String() != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.input, b.String(), tt.want)
+		}
+	}
+}
+
+func BenchmarkExecutePrintString(b *testing.B) {
+	type item struct{ Name, Value string }
+	data := []item{{"a", "1"}, {"b", "2"}, {"c", "3"}}
+	tmpl := Must(New("t").Parse(`{{range .}}{{.Name}}={{.Value}} {{end}}`))
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := tmpl.Execute(io.Discard, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+type benchLocale interface {
+	Tr(key string, args ...any) string
+}
+
+type benchLocaleImpl struct{}
+
+func (*benchLocaleImpl) Tr(key string, args ...any) string { return key }
+
+func BenchmarkExecuteMethodCall(b *testing.B) {
+	tmpl := Must(New("t").Parse(strings.Repeat(`<span>{{.Locale.Tr "key"}}</span>`, 20)))
+	data := &struct{ Locale benchLocale }{&benchLocaleImpl{}}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := tmpl.Execute(io.Discard, data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"internal/testenv"
 	"os"
-	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -17,10 +17,15 @@ import (
 // See also $GOROOT/test/nosplit.go for multi-platform edge case tests.
 
 func TestStackCheckOutput(t *testing.T) {
+	// Don't build library for non-standard target in short mode.
+	if testing.Short() && (runtime.GOOS != "linux" || runtime.GOARCH != "amd64") {
+		t.Skipf("skipping on %s/%s in short mode", runtime.GOOS, runtime.GOARCH)
+	}
+
 	testenv.MustHaveGoBuild(t)
 	t.Parallel()
 
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-o", os.DevNull, "./testdata/stackcheck")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", os.DevNull, "./testdata/stackcheck")
 	// The rules for computing frame sizes on all of the
 	// architectures are complicated, so just do this on amd64.
 	cmd.Env = append(os.Environ(), "GOARCH=amd64", "GOOS=linux")

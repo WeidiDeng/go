@@ -46,7 +46,7 @@ func envMap(env []string) map[string]string {
 	return m
 }
 
-// RequestFromMap creates an http.Request from CGI variables.
+// RequestFromMap creates an [http.Request] from CGI variables.
 // The returned Request's Body field is not populated.
 func RequestFromMap(params map[string]string) (*http.Request, error) {
 	r := new(http.Request)
@@ -57,8 +57,11 @@ func RequestFromMap(params map[string]string) (*http.Request, error) {
 
 	r.Proto = params["SERVER_PROTOCOL"]
 	var ok bool
-	r.ProtoMajor, r.ProtoMinor, ok = http.ParseHTTPVersion(r.Proto)
-	if !ok {
+	if r.Proto == "INCLUDED" {
+		// SSI (Server Side Include) use case
+		// CGI Specification RFC 3875 - section 4.1.16
+		r.ProtoMajor, r.ProtoMinor = 1, 0
+	} else if r.ProtoMajor, r.ProtoMinor, ok = http.ParseHTTPVersion(r.Proto); !ok {
 		return nil, errors.New("cgi: invalid SERVER_PROTOCOL version")
 	}
 
@@ -94,6 +97,9 @@ func RequestFromMap(params map[string]string) (*http.Request, error) {
 	if uriStr == "" {
 		// Fallback to SCRIPT_NAME, PATH_INFO and QUERY_STRING.
 		uriStr = params["SCRIPT_NAME"] + params["PATH_INFO"]
+		if uriStr == "" {
+			uriStr = "/"
+		}
 		s := params["QUERY_STRING"]
 		if s != "" {
 			uriStr += "?" + s
@@ -106,28 +112,21 @@ func RequestFromMap(params map[string]string) (*http.Request, error) {
 		r.TLS = &tls.ConnectionState{HandshakeComplete: true}
 	}
 
-	if r.Host != "" {
-		// Hostname is provided, so we can reasonably construct a URL.
-		rawurl := r.Host + uriStr
-		if r.TLS == nil {
-			rawurl = "http://" + rawurl
-		} else {
-			rawurl = "https://" + rawurl
-		}
-		url, err := url.Parse(rawurl)
-		if err != nil {
-			return nil, errors.New("cgi: failed to parse host and REQUEST_URI into a URL: " + rawurl)
-		}
-		r.URL = url
+	var err error
+	r.URL, err = url.ParseRequestURI(uriStr)
+	if err != nil {
+		return nil, errors.New("cgi: failed to parse REQUEST_URI into a URL: " + uriStr)
 	}
-	// Fallback logic if we don't have a Host header or the URL
-	// failed to parse
-	if r.URL == nil {
-		url, err := url.Parse(uriStr)
-		if err != nil {
-			return nil, errors.New("cgi: failed to parse REQUEST_URI into a URL: " + uriStr)
+	if r.Host != "" {
+		// Historical behavior: Scheme is only set if there is a host.
+		// (We could probably change this.)
+		if r.TLS == nil {
+			r.URL.Scheme = "http"
+		} else {
+			r.URL.Scheme = "https"
 		}
-		r.URL = url
+		r.URL.Host = r.Host
+		r.URL.User = nil
 	}
 
 	// Request.RemoteAddr has its port set by Go's standard http
@@ -138,10 +137,10 @@ func RequestFromMap(params map[string]string) (*http.Request, error) {
 	return r, nil
 }
 
-// Serve executes the provided Handler on the currently active CGI
+// Serve executes the provided [Handler] on the currently active CGI
 // request, if any. If there's no current CGI environment
 // an error is returned. The provided handler may be nil to use
-// http.DefaultServeMux.
+// [http.DefaultServeMux].
 func Serve(handler http.Handler) error {
 	req, err := Request()
 	if err != nil {

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !windows && !plan9 && !js
+//go:build !windows && !plan9 && !js && !wasip1
 
 package syslog
 
@@ -145,7 +145,6 @@ func TestWithSimulated(t *testing.T) {
 			continue
 		}
 
-		tr := tr
 		t.Run(tr, func(t *testing.T) {
 			t.Parallel()
 
@@ -250,11 +249,11 @@ func TestDial(t *testing.T) {
 		t.Skip("skipping syslog test during -short")
 	}
 	f, err := Dial("", "", (LOG_LOCAL7|LOG_DEBUG)+1, "syslog_test")
-	if f != nil {
+	if f != nil || err == nil {
 		t.Fatalf("Should have trapped bad priority")
 	}
 	f, err = Dial("", "", -1, "syslog_test")
-	if f != nil {
+	if f != nil || err == nil {
 		t.Fatalf("Should have trapped bad priority")
 	}
 	l, err := Dial("", "", LOG_USER|LOG_ERR, "syslog_test")
@@ -270,7 +269,7 @@ func TestDial(t *testing.T) {
 func check(t *testing.T, in, out, transport string) {
 	hostname, err := os.Hostname()
 	if err != nil {
-		t.Error("Error retrieving hostname")
+		t.Errorf("Error retrieving hostname: %v", err)
 		return
 	}
 
@@ -290,8 +289,11 @@ func check(t *testing.T, in, out, transport string) {
 	var pid int
 	tmpl := fmt.Sprintf("<%d>%%s %%s syslog_test[%%d]: %s\n", LOG_USER+LOG_INFO, in)
 	n, err := fmt.Sscanf(out, tmpl, &timestamp, &parsedHostname, &pid)
-	if n != 3 || err != nil || hostname != parsedHostname {
+	if n != 3 || err != nil {
 		t.Errorf("Got %q, does not match template %q (%d %s)", out, tmpl, n, err)
+	}
+	if hostname != parsedHostname {
+		t.Errorf("Hostname got %q want %q in %q", parsedHostname, hostname, out)
 	}
 }
 

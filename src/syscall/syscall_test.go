@@ -12,6 +12,9 @@ import (
 	"testing"
 )
 
+// Errno must implement error on all platforms, including plan9.
+var _ error = syscall.Errno(0)
+
 func testSetGetenv(t *testing.T, key, value string) {
 	err := syscall.Setenv(key, value)
 	if err != nil {
@@ -55,4 +58,24 @@ func TestGettimeofday(t *testing.T) {
 	if tv.Sec == 0 && tv.Usec == 0 {
 		t.Fatal("Sec and Usec both zero")
 	}
+}
+
+func TestByteSliceFromStringAlloc(t *testing.T) {
+	allocsPerRun := func(want int, f func()) {
+		t.Helper()
+		got := int(testing.AllocsPerRun(5, f))
+		if got != want {
+			t.Errorf("got %d allocs, want %d", got, want)
+		}
+	}
+	want := 0
+	if testenv.OptimizationOff() {
+		want = 1
+	}
+	allocsPerRun(want, func() {
+		syscall.ByteSliceFromString("abc")
+	})
+	allocsPerRun(want, func() {
+		syscall.BytePtrFromString("abc")
+	})
 }

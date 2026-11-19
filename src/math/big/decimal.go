@@ -9,12 +9,12 @@
 // decimal and rounding.
 //
 // The key observation and some code (shr) is borrowed from
-// strconv/decimal.go: conversion of binary fractional values can be done
+// internal/strconv/decimal.go: conversion of binary fractional values can be done
 // precisely in multi-precision decimal because 2 divides 10 (required for
 // >> of mantissa); but conversion of decimal floating-point values cannot
 // be done precisely in binary representation.
 //
-// In contrast to strconv/decimal.go, only right shift is implemented in
+// In contrast to internal/strconv/decimal.go, only right shift is implemented in
 // decimal format - left shift can be done precisely in binary format.
 
 package big
@@ -69,13 +69,13 @@ func (x *decimal) init(m nat, shift int) {
 		if s >= ntz {
 			s = ntz // shift at most ntz bits
 		}
-		m = nat(nil).shr(m, s)
+		m = nat(nil).rsh(m, s)
 		shift += int(s)
 	}
 
 	// Do any shift left in binary representation.
 	if shift > 0 {
-		m = nat(nil).shl(m, uint(shift))
+		m = nat(nil).lsh(m, uint(shift))
 		shift = 0
 	}
 
@@ -93,15 +93,15 @@ func (x *decimal) init(m nat, shift int) {
 	// Do any (remaining) shift right in decimal representation.
 	if shift < 0 {
 		for shift < -maxShift {
-			shr(x, maxShift)
+			rsh(x, maxShift)
 			shift += maxShift
 		}
-		shr(x, uint(-shift))
+		rsh(x, uint(-shift))
 	}
 }
 
-// shr implements x >> s, for s <= maxShift.
-func shr(x *decimal, s uint) {
+// rsh implements x >> s, for s <= maxShift.
+func rsh(x *decimal, s uint) {
 	// Division by 1<<s using shift-and-subtract algorithm.
 
 	// pick up enough leading digits to cover first shift

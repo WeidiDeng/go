@@ -1,5 +1,5 @@
-# github.com/google/pprof v0.0.0-20220729232143-a41b82acbcb1
-## explicit; go 1.17
+# github.com/google/pprof v0.0.0-20260507013755-92041b743c96
+## explicit; go 1.24.0
 github.com/google/pprof/driver
 github.com/google/pprof/internal/binutils
 github.com/google/pprof/internal/driver
@@ -12,22 +12,24 @@ github.com/google/pprof/internal/symbolizer
 github.com/google/pprof/internal/symbolz
 github.com/google/pprof/internal/transport
 github.com/google/pprof/profile
-github.com/google/pprof/third_party/d3flamegraph
 github.com/google/pprof/third_party/svgpan
-# github.com/ianlancetaylor/demangle v0.0.0-20220319035150-800ac71e25c2
-## explicit; go 1.12
+# github.com/ianlancetaylor/demangle v0.0.0-20250417193237-f615e6bd150b
+## explicit; go 1.13
 github.com/ianlancetaylor/demangle
-# golang.org/x/arch v0.0.0-20220722155209-00200b7164a7
-## explicit; go 1.17
+# golang.org/x/arch v0.32.1-0.20261105033918-6a31474cd4d8
+## explicit; go 1.26.0
 golang.org/x/arch/arm/armasm
 golang.org/x/arch/arm64/arm64asm
+golang.org/x/arch/loong64/loong64asm
 golang.org/x/arch/ppc64/ppc64asm
+golang.org/x/arch/riscv64/riscv64asm
+golang.org/x/arch/s390x/s390xasm
 golang.org/x/arch/x86/x86asm
-# golang.org/x/crypto v0.1.0
-## explicit; go 1.17
-golang.org/x/crypto/ed25519
-# golang.org/x/mod v0.6.0
-## explicit; go 1.17
+# golang.org/x/build v0.0.0-20260715183034-a43f90886f2e
+## explicit; go 1.25.0
+golang.org/x/build/relnote
+# golang.org/x/mod v0.43.0
+## explicit; go 1.26.0
 golang.org/x/mod/internal/lazyregexp
 golang.org/x/mod/modfile
 golang.org/x/mod/module
@@ -37,59 +39,48 @@ golang.org/x/mod/sumdb/dirhash
 golang.org/x/mod/sumdb/note
 golang.org/x/mod/sumdb/tlog
 golang.org/x/mod/zip
-# golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
-## explicit
+# golang.org/x/sync v0.25.0
+## explicit; go 1.26.0
+golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
-# golang.org/x/sys v0.1.0
-## explicit; go 1.17
-golang.org/x/sys/internal/unsafeheader
+# golang.org/x/sys v0.50.0
+## explicit; go 1.26.0
 golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/term v0.1.0
-## explicit; go 1.17
+# golang.org/x/telemetry v0.0.0-20261116191925-e77a43154acb
+## explicit; go 1.26.0
+golang.org/x/telemetry
+golang.org/x/telemetry/counter
+golang.org/x/telemetry/counter/countertest
+golang.org/x/telemetry/internal/config
+golang.org/x/telemetry/internal/configstore
+golang.org/x/telemetry/internal/counter
+golang.org/x/telemetry/internal/crashmonitor
+golang.org/x/telemetry/internal/mmap
+golang.org/x/telemetry/internal/telemetry
+golang.org/x/telemetry/internal/upload
+# golang.org/x/term v0.45.0
+## explicit; go 1.25.0
 golang.org/x/term
-# golang.org/x/tools v0.2.1-0.20221024034430-8166dca1cec9
-## explicit; go 1.18
+# golang.org/x/text v0.44.0
+## explicit; go 1.26.0
+golang.org/x/text/cases
+golang.org/x/text/internal
+golang.org/x/text/internal/language
+golang.org/x/text/internal/language/compact
+golang.org/x/text/internal/tag
+golang.org/x/text/language
+golang.org/x/text/transform
+golang.org/x/text/unicode/norm
+# golang.org/x/tools v0.53.1-0.20261118210005-f23c95674a26
+## explicit; go 1.26.0
+golang.org/x/tools/cmd/bisect
 golang.org/x/tools/cover
-golang.org/x/tools/go/analysis
-golang.org/x/tools/go/analysis/internal/analysisflags
-golang.org/x/tools/go/analysis/internal/facts
-golang.org/x/tools/go/analysis/passes/asmdecl
-golang.org/x/tools/go/analysis/passes/assign
-golang.org/x/tools/go/analysis/passes/atomic
-golang.org/x/tools/go/analysis/passes/bools
-golang.org/x/tools/go/analysis/passes/buildtag
-golang.org/x/tools/go/analysis/passes/cgocall
-golang.org/x/tools/go/analysis/passes/composite
-golang.org/x/tools/go/analysis/passes/copylock
-golang.org/x/tools/go/analysis/passes/ctrlflow
-golang.org/x/tools/go/analysis/passes/errorsas
-golang.org/x/tools/go/analysis/passes/framepointer
-golang.org/x/tools/go/analysis/passes/httpresponse
-golang.org/x/tools/go/analysis/passes/ifaceassert
-golang.org/x/tools/go/analysis/passes/inspect
-golang.org/x/tools/go/analysis/passes/internal/analysisutil
-golang.org/x/tools/go/analysis/passes/loopclosure
-golang.org/x/tools/go/analysis/passes/lostcancel
-golang.org/x/tools/go/analysis/passes/nilfunc
-golang.org/x/tools/go/analysis/passes/printf
-golang.org/x/tools/go/analysis/passes/shift
-golang.org/x/tools/go/analysis/passes/sigchanyzer
-golang.org/x/tools/go/analysis/passes/stdmethods
-golang.org/x/tools/go/analysis/passes/stringintconv
-golang.org/x/tools/go/analysis/passes/structtag
-golang.org/x/tools/go/analysis/passes/testinggoroutine
-golang.org/x/tools/go/analysis/passes/tests
-golang.org/x/tools/go/analysis/passes/unmarshal
-golang.org/x/tools/go/analysis/passes/unreachable
-golang.org/x/tools/go/analysis/passes/unsafeptr
-golang.org/x/tools/go/analysis/passes/unusedresult
-golang.org/x/tools/go/analysis/unitchecker
-golang.org/x/tools/go/ast/astutil
-golang.org/x/tools/go/ast/inspector
-golang.org/x/tools/go/cfg
-golang.org/x/tools/go/types/objectpath
-golang.org/x/tools/go/types/typeutil
-golang.org/x/tools/internal/analysisinternal
-golang.org/x/tools/internal/typeparams
+golang.org/x/tools/go/gcexportdata
+golang.org/x/tools/internal/bisect
+golang.org/x/tools/internal/gcimporter
+golang.org/x/tools/internal/pkgbits
+# rsc.io/markdown v0.0.0-20240306144322-0bf8f97ee8ef
+## explicit; go 1.20
+rsc.io/markdown

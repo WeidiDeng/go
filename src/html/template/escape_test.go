@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"internal/testenv"
 	"os"
 	"strings"
 	"testing"
@@ -30,14 +31,14 @@ func (x *goodMarshaler) MarshalJSON() ([]byte, error) {
 
 func TestEscape(t *testing.T) {
 	data := struct {
-		F, T    bool
-		C, G, H string
-		A, E    []string
-		B, M    json.Marshaler
-		N       int
-		U       any  // untyped nil
-		Z       *int // typed nil
-		W       HTML
+		F, T       bool
+		C, G, H, I string
+		A, E       []string
+		B, M       json.Marshaler
+		N          int
+		U          any  // untyped nil
+		Z          *int // typed nil
+		W          HTML
 	}{
 		F: false,
 		T: true,
@@ -52,6 +53,7 @@ func TestEscape(t *testing.T) {
 		U: nil,
 		Z: nil,
 		W: HTML(`&iexcl;<b class="foo">Hello</b>, <textarea>O'World</textarea>!`),
+		I: "${ asd `` }",
 	}
 	pdata := &data
 
@@ -229,6 +231,21 @@ func TestEscape(t *testing.T) {
 			"jsObjValueScript",
 			"<script>alert({{.A}})</script>",
 			`<script>alert(["\u003ca\u003e","\u003cb\u003e"])</script>`,
+		},
+		{
+			"scriptTypeSpace",
+			"<script type=\" \">{{.H}}</script>",
+			"<script type=\" \">\"\\u003cHello\\u003e\"</script>",
+		},
+		{
+			"scriptTypeTab",
+			"<script type=\"\t\">{{.H}}</script>",
+			"<script type=\"\t\">\"\\u003cHello\\u003e\"</script>",
+		},
+		{
+			"scriptTypeEmpty",
+			"<script type=\"\">{{.H}}</script>",
+			"<script type=\"\">\"\\u003cHello\\u003e\"</script>",
 		},
 		{
 			"jsObjValueNotOverEscaped",
@@ -504,6 +521,31 @@ func TestEscape(t *testing.T) {
 			"<script>var a \nd</script>",
 		},
 		{
+			"JS HTML-like comments",
+			"<script>before <!-- beep\nbetween\nbefore-->boop\n</script>",
+			"<script>before \nbetween\nbefore\n</script>",
+		},
+		{
+			"JS hashbang comment",
+			"<script>#! beep\n</script>",
+			"<script>\n</script>",
+		},
+		{
+			"Special tags in <script> string literals",
+			`<script>var a = "asd < 123 <!-- 456 < fgh <script jkl < 789 </script"</script>`,
+			`<script>var a = "asd < 123 \x3C!-- 456 < fgh \x3Cscript jkl < 789 \x3C/script"</script>`,
+		},
+		{
+			"Special tags in <script> string literals (mixed case)",
+			`<script>var a = "<!-- <ScripT </ScripT"</script>`,
+			`<script>var a = "\x3C!-- \x3CScripT \x3C/ScripT"</script>`,
+		},
+		{
+			"Special tags in <script> regex literals (mixed case)",
+			`<script>var a = /<!-- <ScripT </ScripT/</script>`,
+			`<script>var a = /\x3C!-- \x3CScripT \x3C/ScripT/</script>`,
+		},
+		{
 			"CSS comments",
 			"<style>p// paragraph\n" +
 				`{border: 1px/* color */{{"#00f"}}}</style>`,
@@ -678,38 +720,94 @@ func TestEscape(t *testing.T) {
 			`<img srcset={{",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"}}>`,
 			`<img srcset=,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,>`,
 		},
+		{
+			"unquoted empty attribute value (plaintext)",
+			"<p name={{.U}}>",
+			"<p name=ZgotmplZ>",
+		},
+		{
+			"unquoted empty attribute value (url)",
+			"<p href={{.U}}>",
+			"<p href=ZgotmplZ>",
+		},
+		{
+			"quoted empty attribute value",
+			"<p name=\"{{.U}}\">",
+			"<p name=\"\">",
+		},
+		{
+			"JS template lit special characters",
+			"<script>var a = `{{.I}}`</script>",
+			"<script>var a = `\\u0024\\u007b asd \\u0060\\u0060 \\u007d`</script>",
+		},
+		{
+			"JS template lit special characters, nested lit",
+			"<script>var a = `${ `{{.I}}` }`</script>",
+			"<script>var a = `${ `\\u0024\\u007b asd \\u0060\\u0060 \\u007d` }`</script>",
+		},
+		{
+			"JS template lit, nested JS",
+			"<script>var a = `${ var a = \"{{\"a \\\" d\"}}\" }`</script>",
+			"<script>var a = `${ var a = \"a \\u0022 d\" }`</script>",
+		},
+		{
+			"meta content attribute url",
+			`<meta http-equiv="refresh" content="asd; url={{"javascript:alert(1)"}}; asd; url={{"vbscript:alert(1)"}}; asd">`,
+			`<meta http-equiv="refresh" content="asd; url=#ZgotmplZ; asd; url=#ZgotmplZ; asd">`,
+		},
+		{
+			"meta content string",
+			`<meta http-equiv="refresh" content="{{"asd: 123"}}">`,
+			`<meta http-equiv="refresh" content="asd: 123">`,
+		},
+		{
+			"meta content url with whitespace before equals",
+			`<meta http-equiv="refresh" content="0;url ={{"javascript:alert(1)"}}">`,
+			`<meta http-equiv="refresh" content="0;url =#ZgotmplZ">`,
+		},
+		{
+			"meta content url with tab before equals",
+			"<meta http-equiv=\"refresh\" content=\"0;url\t={{\"javascript:alert(1)\"}}\">",
+			"<meta http-equiv=\"refresh\" content=\"0;url\t=#ZgotmplZ\">",
+		},
+		{
+			"meta content url with space after equals",
+			`<meta http-equiv="refresh" content="0;url= {{"javascript:alert(1)"}}">`,
+			`<meta http-equiv="refresh" content="0;url= #ZgotmplZ">`,
+		},
+		{
+			"meta content url with whitespace both sides of equals",
+			"<meta http-equiv=\"refresh\" content=\"0;url \t= {{\"javascript:alert(1)\"}}\">",
+			"<meta http-equiv=\"refresh\" content=\"0;url \t= #ZgotmplZ\">",
+		},
 	}
 
 	for _, test := range tests {
-		tmpl := New(test.name)
-		tmpl = Must(tmpl.Parse(test.input))
-		// Check for bug 6459: Tree field was not set in Parse.
-		if tmpl.Tree != tmpl.text.Tree {
-			t.Errorf("%s: tree not set properly", test.name)
-			continue
-		}
-		b := new(strings.Builder)
-		if err := tmpl.Execute(b, data); err != nil {
-			t.Errorf("%s: template execution failed: %s", test.name, err)
-			continue
-		}
-		if w, g := test.output, b.String(); w != g {
-			t.Errorf("%s: escaped output: want\n\t%q\ngot\n\t%q", test.name, w, g)
-			continue
-		}
-		b.Reset()
-		if err := tmpl.Execute(b, pdata); err != nil {
-			t.Errorf("%s: template execution failed for pointer: %s", test.name, err)
-			continue
-		}
-		if w, g := test.output, b.String(); w != g {
-			t.Errorf("%s: escaped output for pointer: want\n\t%q\ngot\n\t%q", test.name, w, g)
-			continue
-		}
-		if tmpl.Tree != tmpl.text.Tree {
-			t.Errorf("%s: tree mismatch", test.name)
-			continue
-		}
+		t.Run(test.name, func(t *testing.T) {
+			tmpl := New(test.name)
+			tmpl = Must(tmpl.Parse(test.input))
+			// Check for bug 6459: Tree field was not set in Parse.
+			if tmpl.Tree != tmpl.text.Tree {
+				t.Fatalf("%s: tree not set properly", test.name)
+			}
+			b := new(strings.Builder)
+			if err := tmpl.Execute(b, data); err != nil {
+				t.Fatalf("%s: template execution failed: %s", test.name, err)
+			}
+			if w, g := test.output, b.String(); w != g {
+				t.Fatalf("%s: escaped output: want\n\t%q\ngot\n\t%q", test.name, w, g)
+			}
+			b.Reset()
+			if err := tmpl.Execute(b, pdata); err != nil {
+				t.Fatalf("%s: template execution failed for pointer: %s", test.name, err)
+			}
+			if w, g := test.output, b.String(); w != g {
+				t.Fatalf("%s: escaped output for pointer: want\n\t%q\ngot\n\t%q", test.name, w, g)
+			}
+			if tmpl.Tree != tmpl.text.Tree {
+				t.Fatalf("%s: tree mismatch", test.name)
+			}
+		})
 	}
 }
 
@@ -836,6 +934,30 @@ func TestEscapeSet(t *testing.T) {
 			},
 			`<script>var x= 126 /"42";</script>`,
 		},
+		// Multiple calls to a non-recursive template that ends in a different context.
+		{
+			map[string]string{
+				"main": `<a href="{{template "q"}}{{"a&b"}}">1</a><a href="{{template "q"}}{{"a&b"}}">2</a>`,
+				"q":    `/search?q=`,
+			},
+			`<a href="/search?q=a%26b">1</a><a href="/search?q=a%26b">2</a>`,
+		},
+		{
+			map[string]string{
+				"main":   `<script>var x={{template "helper"}}/{{"42"}}; var y={{template "helper"}}/{{"42"}};</script>`,
+				"helper": "{{126}}",
+			},
+			`<script>var x= 126 /"42"; var y= 126 /"42";</script>`,
+		},
+		{
+			map[string]string{
+				"main": `{{template "t1"}}{{template "t2"}}`,
+				"t1":   `<a href="{{template "q"}}{{"a&b"}}">1</a>`,
+				"t2":   `<a href="{{template "q"}}{{"a&b"}}">2</a>`,
+				"q":    `/search?q=`,
+			},
+			`<a href="/search?q=a%26b">1</a><a href="/search?q=a%26b">2</a>`,
+		},
 		// A recursive template that ends in a similar context.
 		{
 			map[string]string{
@@ -887,7 +1009,6 @@ func TestEscapeSet(t *testing.T) {
 			t.Errorf("want\n\t%q\ngot\n\t%q", test.want, got)
 		}
 	}
-
 }
 
 func TestErrors(t *testing.T) {
@@ -936,6 +1057,43 @@ func TestErrors(t *testing.T) {
 			"{{range .Items}}<a{{if .X}}{{end}}>{{if .X}}{{break}}{{end}}{{end}}",
 			"",
 		},
+		{
+			"<script>var a = `${a+b}`</script>`",
+			"",
+		},
+		{
+			"<script>var tmpl = `asd`;</script>",
+			``,
+		},
+		{
+			"<script>var tmpl = `${1}`;</script>",
+			``,
+		},
+		{
+			"<script>var tmpl = `${return ``}`;</script>",
+			``,
+		},
+		{
+			"<script>var tmpl = `${return {{.}} }`;</script>",
+			``,
+		},
+		{
+			"<script>var tmpl = `${ let a = {1:1} {{.}} }`;</script>",
+			``,
+		},
+		{
+			"<script>var tmpl = `asd ${return \"{\"}`;</script>",
+			``,
+		},
+		{
+			`{{if eq "" ""}}<meta>{{end}}`,
+			``,
+		},
+		{
+			`{{if eq "" ""}}<meta content="url={{"asd"}}">{{end}}`,
+			``,
+		},
+
 		// Error cases.
 		{
 			"{{if .Cond}}<a{{end}}",
@@ -978,6 +1136,10 @@ func TestErrors(t *testing.T) {
 		{
 			"{{range .Items}}<a{{if .X}}{{continue}}{{end}}>{{end}}",
 			"z:1:29: at range loop continue: {{range}} branches end in different contexts",
+		},
+		{
+			"{{range .Items}}{{if .X}}{{break}}{{end}}<a{{if .Y}}{{continue}}{{end}}>{{if .Z}}{{continue}}{{end}}{{end}}",
+			"z:1:54: at range loop continue: {{range}} branches end in different contexts",
 		},
 		{
 			"<a b=1 c={{.H}}",
@@ -1082,6 +1244,18 @@ func TestErrors(t *testing.T) {
 			// html is allowed since it is the last command in the pipeline, but urlquery is not.
 			`predefined escaper "urlquery" disallowed in template`,
 		},
+		{
+			"<script>var a = `{{if .X}}`{{end}}",
+			`{{if}} branches end in different contexts`,
+		},
+		{
+			"<script>var a = `{{if .X}}a{{else}}`{{end}}",
+			`{{if}} branches end in different contexts`,
+		},
+		{
+			"<script>var a = `{{if .X}}a{{else}}b{{end}}`</script>",
+			``,
+		},
 	}
 	for _, test := range tests {
 		buf := new(bytes.Buffer)
@@ -1108,7 +1282,6 @@ func TestErrors(t *testing.T) {
 		// Check that we get the same error if we call Execute again.
 		if err := tmpl.Execute(buf, nil); err == nil || err.Error() != got {
 			t.Errorf("input=%q: unexpected error on second call %q", test.input, err)
-
 		}
 	}
 }
@@ -1302,6 +1475,10 @@ func TestEscapeText(t *testing.T) {
 		{
 			`<a onclick="'foo&quot;`,
 			context{state: stateJSSqStr, delim: delimDoubleQuote, attr: attrScript},
+		},
+		{
+			"<a onclick=\"`foo",
+			context{state: stateJSTmplLit, delim: delimDoubleQuote, attr: attrScript},
 		},
 		{
 			`<A ONCLICK="'`,
@@ -1500,8 +1677,38 @@ func TestEscapeText(t *testing.T) {
 			context{state: stateJS, element: elementScript},
 		},
 		{
+			// <script and </script tags are escaped, so </script> should not
+			// cause us to exit the JS state.
 			`<script>document.write("<script>alert(1)</script>");`,
-			context{state: stateText},
+			context{state: stateJS, element: elementScript},
+		},
+		{
+			`<script>document.write("<script>`,
+			context{state: stateJSDqStr, element: elementScript},
+		},
+		{
+			`<script>document.write("<script>alert(1)</script>`,
+			context{state: stateJSDqStr, element: elementScript},
+		},
+		{
+			`<script>document.write("<script>alert(1)<!--`,
+			context{state: stateJSDqStr, element: elementScript},
+		},
+		{
+			`<script>document.write("<script>alert(1)</Script>");`,
+			context{state: stateJS, element: elementScript},
+		},
+		{
+			`<script>document.write("<!--");`,
+			context{state: stateJS, element: elementScript},
+		},
+		{
+			`<script>let a = /</script`,
+			context{state: stateJSRegexp, element: elementScript},
+		},
+		{
+			`<script>let a = /</script/`,
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxDivOp},
 		},
 		{
 			`<script type="text/template">`,
@@ -1612,6 +1819,102 @@ func TestEscapeText(t *testing.T) {
 		{
 			`<svg:a svg:onclick="x()">`,
 			context{},
+		},
+		{
+			"<script>var a = `",
+			context{state: stateJSTmplLit, element: elementScript},
+		},
+		{
+			"<script>var a = `${",
+			context{state: stateJS, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${}",
+			context{state: stateJSTmplLit, element: elementScript},
+		},
+		{
+			"<script>var a = `${`",
+			context{state: stateJSTmplLit, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${var a = \"",
+			context{state: stateJSDqStr, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${var a = \"`",
+			context{state: stateJSDqStr, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${var a = \"}",
+			context{state: stateJSDqStr, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${``",
+			context{state: stateJS, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${`}",
+			context{state: stateJSTmplLit, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${ {} } asd`</script><script>`${ {} }",
+			context{state: stateJSTmplLit, element: elementScript},
+		},
+		{
+			"<script>var foo = `${ (_ => { return \"x\" })() + \"${",
+			context{state: stateJSDqStr, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var a = `${ {</script><script>var b = `${ x }",
+			context{state: stateJSTmplLit, element: elementScript, jsCtx: jsCtxDivOp},
+		},
+		{
+			"<script>var foo = `x` + \"${",
+			context{state: stateJSDqStr, element: elementScript},
+		},
+		{
+			"<script>function f() { var a = `${}`; }",
+			context{state: stateJS, element: elementScript},
+		},
+		{
+			"<script>{`${}`}",
+			context{state: stateJS, element: elementScript},
+		},
+		{
+			"<script>`${ function f() { return `${1}` }() }`",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxDivOp},
+		},
+		{
+			"<script>function f() {`${ function f() { `${1}` } }`}",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp},
+		},
+		{
+			"<script>`${ { `` }",
+			context{state: stateJS, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${ { }`",
+			context{state: stateJSTmplLit, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>var foo = `${ foo({ a: { c: `${",
+			context{state: stateJS, element: elementScript, jsBraceDepth: []int{2, 0}},
+		},
+		{
+			"<script>var foo = `${ foo({ a: { c: `${ {{.}} }` }, b: ",
+			context{state: stateJS, element: elementScript, jsBraceDepth: []int{1}},
+		},
+		{
+			"<script>`${ `}",
+			context{state: stateJSTmplLit, element: elementScript, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${1}${",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp, jsBraceDepth: []int{0}},
+		},
+		{
+			"<script>`${`${1}${",
+			context{state: stateJS, element: elementScript, jsCtx: jsCtxRegexp, jsBraceDepth: []int{0, 0}},
 		},
 	}
 
@@ -1942,6 +2245,47 @@ func BenchmarkEscapedExecute(b *testing.B) {
 	}
 }
 
+func BenchmarkEscapedExecuteBuiltinsPage(b *testing.B) {
+	type item struct {
+		Name   string
+		Status string
+		Tags   []string
+	}
+	items := make([]item, 20)
+	for i := range items {
+		items[i] = item{Name: "Item", Status: "active", Tags: []string{"new", "sale"}}
+	}
+	tmpl := Must(New("t").Parse(`<ul>{{range .}}<li{{if eq .Status "active"}} class="on"{{end}}>` +
+		`{{.Name}}{{if not .Tags}}-{{else}} ({{printf "%d tags" 2}}){{end}}</li>{{end}}</ul>`))
+	var buf bytes.Buffer
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := tmpl.Execute(&buf, items); err != nil {
+			b.Fatal(err)
+		}
+		buf.Reset()
+	}
+}
+
+func BenchmarkEscapedExecutePage(b *testing.B) {
+	var src strings.Builder
+	src.WriteString(`<h1>{{.Title}}</h1><ul>`)
+	for range 20 {
+		src.WriteString(`<li><a href="/items/{{.ID}}" title="{{.Title}}">{{.Name}}</a></li>`)
+	}
+	src.WriteString(`</ul>`)
+	tmpl := Must(New("t").Parse(src.String()))
+	data := map[string]any{"Title": "Home", "ID": 42, "Name": "Ladies & Gentlemen"}
+	var buf bytes.Buffer
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := tmpl.Execute(&buf, data); err != nil {
+			b.Fatal(err)
+		}
+		buf.Reset()
+	}
+}
+
 // Covers issue 22780.
 func TestOrphanedTemplate(t *testing.T) {
 	t1 := Must(New("foo").Parse(`<a href="{{.}}">link1</a>`))
@@ -1989,5 +2333,207 @@ func TestAliasedParseTreeDoesNotOverescape(t *testing.T) {
 	}
 	if got1 != got2 {
 		t.Fatalf(`Template "foo" and "bar" rendered %q and %q respectively, expected equal values`, got1, got2)
+	}
+}
+
+func TestMetaContentEscapeGODEBUG(t *testing.T) {
+	testenv.SetGODEBUG(t, "htmlmetacontenturlescape=0")
+	tmpl := Must(New("").Parse(`<meta http-equiv="refresh" content="asd; url={{"javascript:alert(1)"}}; asd; url={{"vbscript:alert(1)"}}; asd">`))
+	var b strings.Builder
+	if err := tmpl.Execute(&b, nil); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	want := `<meta http-equiv="refresh" content="asd; url=javascript:alert(1); asd; url=vbscript:alert(1); asd">`
+	if got := b.String(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestIssue81821(t *testing.T) {
+	tmpl := Must(New("test").Parse("<script>const s = `${1}${/{{.}}/g}`</script>"))
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, `x/.exec(alert(1))}`); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	want := "<script>const s = `${1}${/x\\/\\.exec\\(alert\\(1\\)\\)\\}/g}`</script>"
+	if got := buf.String(); got != want {
+		t.Errorf("got:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestCVE202656858(t *testing.T) {
+	tests := []struct {
+		name  string
+		tmpl  string
+		input string
+		want  string
+	}{
+		{
+			name:  "regexp after open brace in if block",
+			tmpl:  `<script>if(true){/{{.}}/g.test("x")}</script>`,
+			input: "a.b",
+			want:  `<script>if(true){/a\.b/g.test("x")}</script>`,
+		},
+		{
+			name:  "regexp after close brace",
+			tmpl:  `<script>if(true){x=1}/{{.}}/g.test("x")</script>`,
+			input: "a.b",
+			want:  `<script>if(true){x=1}/a\.b/g.test("x")</script>`,
+		},
+		{
+			name:  "regexp pathological attacker input",
+			tmpl:  `<script>if(true){/{{.}}/g.test("x")}</script>`,
+			input: `./;alert(1);var q=/.`,
+			want:  `<script>if(true){/\.\/;alert\(1\);var q=\/\./g.test("x")}</script>`,
+		},
+		{
+			name:  "regexp after open brace in template literal",
+			tmpl:  "<script>`${ (function(){/{{.}}/g.test(x)}) }`</script>",
+			input: "a.b",
+			want:  "<script>`${ (function(){/a\\.b/g.test(x)}) }`</script>",
+		},
+		{
+			name:  "regexp after close brace in template literal",
+			tmpl:  "<script>`${ (function(){}/{{.}}/g.test(x)) }`</script>",
+			input: "a.b",
+			want:  "<script>`${ (function(){}/a\\.b/g.test(x)) }`</script>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl := Must(New("test").Parse(tt.tmpl))
+			var buf bytes.Buffer
+			if err := tmpl.Execute(&buf, tt.input); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("got:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIssue81823(t *testing.T) {
+	tests := []struct {
+		name  string
+		tmpl  string
+		input string
+		want  string
+	}{
+		{
+			name:  "yield",
+			tmpl:  `<script>function* rules(){yield /{{.}}/g}</script>`,
+			input: `/;alert(1)//`,
+			want:  `<script>function* rules(){yield /\/;alert\(1\)\/\//g}</script>`,
+		},
+		{
+			name:  "property yield",
+			tmpl:  "<script>const pct = bond.yield / 100;\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>const pct = bond.yield / 100;\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+		{
+			name:  "private yield",
+			tmpl:  "<script>class Bond { #yield = 4; pct() { return this.#yield / 100; } }\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>class Bond { #yield = 4; pct() { return this.#yield / 100; } }\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+		{
+			name:  "property in",
+			tmpl:  "<script>const kb = traffic.in / 1024;\nconst user = {{.}}; // state\n</script>",
+			input: `1;pwned=1;0`,
+			want:  "<script>const kb = traffic.in / 1024;\nconst user = \"1;pwned=1;0\"; \n</script>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl := Must(New("test").Parse(tt.tmpl))
+			var buf strings.Builder
+			if err := tmpl.Execute(&buf, tt.input); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("got:  %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubtemplateEndContext(t *testing.T) {
+	// Subtemplate "q" ends in urlPartQueryOrFrag, different from its urlPartNone start context.
+	// Executing "t1" and then "t2" in the same template set should both see the urlPartQueryOrFrag context.
+	const src = `{{define "q"}}/search?q={{end}}` +
+		`{{define "t1"}}<a href="{{template "q"}}{{.}}">1</a>{{end}}` +
+		`{{define "t2"}}<a href="{{template "q"}}{{.}}">2</a>{{end}}`
+	tmpl := Must(New("").Parse(src))
+	for _, name := range []string{"t1", "t2"} {
+		var buf strings.Builder
+		if err := tmpl.ExecuteTemplate(&buf, name, "a&b"); err != nil {
+			t.Fatalf("ExecuteTemplate(%s): %v", name, err)
+		}
+		want := `<a href="/search?q=a%26b">` + string(name[1]) + `</a>`
+		if got := buf.String(); got != want {
+			t.Errorf("template %s: got %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestExecuteFailedSubtemplate(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "ErrOutputContext/stateText",
+			src: `{{define "t"}}{{if .Tail}}{{template "t" .Tail}}{{end}}<a title="{{.Head}}{{end}}` +
+				`{{define "caller"}}{{if false}}{{template "t" .}}">{{end}}ok{{end}}`,
+		},
+		{
+			name: "ErrOutputContext/stateURL",
+			src: `{{define "t"}}{{if .Tail}}{{template "t" .Tail}}{{end}}<a title="{{.Head}}{{end}}` +
+				`{{define "caller"}}<a href="{{if false}}{{template "t" .}}{{end}}">ok</a>{{end}}`,
+		},
+		{
+			name: "ErrEndContext",
+			src: `{{define "t"}}<a title="{{end}}` +
+				`{{define "caller"}}{{if false}}{{template "t" .}}">{{end}}ok{{end}}`,
+		},
+		{
+			name: "ErrBranchEnd",
+			src: `{{define "t"}}{{if .}}<a title="{{end}}{{end}}` +
+				`{{define "caller"}}{{if false}}{{template "t" .}}{{end}}ok{{end}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl := Must(New("").Parse(tt.src))
+			var buf strings.Builder
+			if err := tmpl.ExecuteTemplate(&buf, "t", nil); err == nil {
+				t.Fatal(`ExecuteTemplate("t") succeeded, want error`)
+			}
+			err := tmpl.ExecuteTemplate(&buf, "caller", nil)
+			if err == nil {
+				t.Fatal(`ExecuteTemplate("caller") succeeded, want error`)
+			}
+			const want = `"t" is an incomplete or empty template`
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf(`ExecuteTemplate("caller") = %q, want substring %q`, err, want)
+			}
+		})
+	}
+}
+
+func TestEscapeErrorMemoization(t *testing.T) {
+	// Deeply nested calls to a failing template should not take exponential time.
+	var src strings.Builder
+	const depth = 30
+	for i := range depth {
+		fmt.Fprintf(&src, `{{define "t%d"}}{{template "t%d"}}{{template "t%d"}}{{end}}`, i, i+1, i+1)
+	}
+	fmt.Fprintf(&src, `{{define "t%d"}}{{if .}}<a href="{{end}}{{end}}`, depth)
+	tmpl := Must(New("").Parse(src.String()))
+	var buf strings.Builder
+	if err := tmpl.ExecuteTemplate(&buf, "t0", nil); err == nil {
+		t.Fatal("ExecuteTemplate succeeded, want error")
 	}
 }

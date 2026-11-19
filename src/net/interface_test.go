@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js
-
 package net
 
 import (
@@ -50,6 +48,43 @@ func ipv6LinkLocalUnicastAddr(ifi *Interface) string {
 	return ""
 }
 
+// TestInterfaceLookupErrorNamesInterface checks that the error of a
+// failed lookup says which interface was asked for, as the Addr of
+// its OpError, by name or by index as an IPv6 zone would, with the
+// error itself left as it was.
+func TestInterfaceLookupErrorNamesInterface(t *testing.T) {
+	for _, tc := range []struct {
+		call     string
+		err      error
+		wantAddr string
+		wantErr  error
+	}{
+		{"InterfaceByName(gotest-no-such)", func() error { _, err := InterfaceByName("gotest-no-such"); return err }(), "gotest-no-such", errNoSuchInterface},
+		{"InterfaceByIndex(1<<30)", func() error { _, err := InterfaceByIndex(1 << 30); return err }(), "1073741824", nil},
+		{"InterfaceByIndex(0)", func() error { _, err := InterfaceByIndex(0); return err }(), "0", errInvalidInterfaceIndex},
+		{"InterfaceByIndex(-5)", func() error { _, err := InterfaceByIndex(-5); return err }(), "-5", errInvalidInterfaceIndex},
+	} {
+		opErr, ok := tc.err.(*OpError)
+		if !ok {
+			t.Errorf("%s: got %T %v, want *OpError", tc.call, tc.err, tc.err)
+			continue
+		}
+		if opErr.Addr == nil || opErr.Addr.String() != tc.wantAddr || opErr.Addr.Network() != "ip+net" {
+			t.Errorf("%s: Addr = %v, want %q on network ip+net", tc.call, opErr.Addr, tc.wantAddr)
+		}
+		if tc.wantErr != nil && opErr.Err != tc.wantErr {
+			t.Errorf("%s: Err = %v, want %v", tc.call, opErr.Err, tc.wantErr)
+		}
+		if want := "route ip+net " + tc.wantAddr + ": " + opErr.Err.Error(); tc.err.Error() != want {
+			t.Errorf("%s: error %q, want %q", tc.call, tc.err, want)
+		}
+	}
+	// There is nothing to name when no name was given.
+	if _, err := InterfaceByName(""); err == nil || err.Error() != "route ip+net: invalid network interface name" {
+		t.Errorf(`InterfaceByName(""): got %v`, err)
+	}
+}
+
 func TestInterfaces(t *testing.T) {
 	ift, err := Interfaces()
 	if err != nil {
@@ -70,12 +105,14 @@ func TestInterfaces(t *testing.T) {
 				t.Errorf("got %v; want %v", ifxi, ifi)
 			}
 		}
-		ifxn, err := InterfaceByName(ifi.Name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(ifxn, &ifi) {
-			t.Errorf("got %v; want %v", ifxn, ifi)
+		if ifi.Name != "" {
+			ifxn, err := InterfaceByName(ifi.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(ifxn, &ifi) {
+				t.Errorf("got %v; want %v", ifxn, ifi)
+			}
 		}
 		t.Logf("%s: flags=%v index=%d mtu=%d hwaddr=%v", ifi.Name, ifi.Flags, ifi.Index, ifi.MTU, ifi.HardwareAddr)
 	}
@@ -300,6 +337,7 @@ func checkMulticastStats(ifStats *ifStats, uniStats, multiStats *routeStats) err
 }
 
 func BenchmarkInterfaces(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	for i := 0; i < b.N; i++ {
@@ -310,6 +348,7 @@ func BenchmarkInterfaces(b *testing.B) {
 }
 
 func BenchmarkInterfaceByIndex(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	ifi := loopbackInterface()
@@ -324,6 +363,7 @@ func BenchmarkInterfaceByIndex(b *testing.B) {
 }
 
 func BenchmarkInterfaceByName(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	ifi := loopbackInterface()
@@ -338,6 +378,7 @@ func BenchmarkInterfaceByName(b *testing.B) {
 }
 
 func BenchmarkInterfaceAddrs(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	for i := 0; i < b.N; i++ {
@@ -348,6 +389,7 @@ func BenchmarkInterfaceAddrs(b *testing.B) {
 }
 
 func BenchmarkInterfacesAndAddrs(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	ifi := loopbackInterface()
@@ -362,6 +404,7 @@ func BenchmarkInterfacesAndAddrs(b *testing.B) {
 }
 
 func BenchmarkInterfacesAndMulticastAddrs(b *testing.B) {
+	b.ReportAllocs()
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	ifi := loopbackInterface()

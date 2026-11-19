@@ -1,0 +1,2363 @@
+// Copyright 2020 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+//go:build goexperiment.jsonv2
+
+package json
+
+import (
+	"bytes"
+	"cmp"
+	"encoding"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+
+	"encoding/json/internal"
+	"encoding/json/internal/jsonflags"
+	"encoding/json/internal/jsonopts"
+	"encoding/json/internal/jsonwire"
+	"encoding/json/jsontext"
+)
+
+// optimizeCommon specifies whether to use optimizations targeted for certain
+// common patterns, rather than using the slower, but more general logic.
+// All tests should pass regardless of whether this is true or not.
+const optimizeCommon = true
+
+var (
+	// Most natural Go types that correspond with each JSON type.
+	anyType          = reflect.TypeFor[any]()            // JSON value
+	boolType         = reflect.TypeFor[bool]()           // JSON bool
+	stringType       = reflect.TypeFor[string]()         // JSON string
+	float64Type      = reflect.TypeFor[float64]()        // JSON number
+	mapStringAnyType = reflect.TypeFor[map[string]any]() // JSON object
+	sliceAnyType     = reflect.TypeFor[[]any]()          // JSON array
+
+	bytesType       = reflect.TypeFor[[]byte]()
+	emptyStructType = reflect.TypeFor[struct{}]()
+)
+
+const startDetectingCyclesAfter = 1000
+
+type seenPointers = map[any]struct{}
+
+type typedPointer struct {
+	typ reflect.Type
+	ptr any // always stores unsafe.Pointer, but avoids depending on unsafe
+	len int // remember slice length to avoid false positives
+}
+
+// visitPointer visits pointer p of type t, reporting an error if seen before.
+// If successfully visited, then the caller must eventually call leave.
+func visitPointer(m *seenPointers, v reflect.Value, mo *jsonopts.Struct) error {
+	p := typedPointer{v.Type(), v.UnsafePointer(), sliceLen(v)}
+	if _, ok := (*m)[p]; ok {
+		if mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+			return &internal.ValueError{Val: v.Interface(), Err: internal.ErrCycle}
+		}
+		return internal.ErrCycle
+	}
+	if *m == nil {
+		*m = make(seenPointers)
+	}
+	(*m)[p] = struct{}{}
+	return nil
+}
+func leavePointer(m *seenPointers, v reflect.Value) {
+	p := typedPointer{v.Type(), v.UnsafePointer(), sliceLen(v)}
+	delete(*m, p)
+}
+
+func sliceLen(v reflect.Value) int {
+	if v.Kind() == reflect.Slice {
+		return v.Len()
+	}
+	return 0
+}
+
+func len64[Bytes ~[]byte | ~string](in Bytes) int64 {
+	return int64(len(in))
+}
+
+func makeDefaultMarshaler(t reflect.Type) *marshaler {
+	switch t.Kind() {
+	case reflect.Bool:
+		return makeBoolMarshaler(t)
+	case reflect.String:
+		return makeStringMarshaler(t)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return makeIntMarshaler(t)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return makeUintMarshaler(t)
+	case reflect.Float32, reflect.Float64:
+		return makeFloatMarshaler(t)
+	case reflect.Map:
+		return makeMapMarshaler(t)
+	case reflect.Struct:
+		return makeStructMarshaler(t)
+	case reflect.Slice:
+		fnc := makeSliceMarshaler(t)
+		if t.Elem().Kind() == reflect.Uint8 {
+			return makeBytesMarshaler(t, fnc)
+		}
+		return fnc
+	case reflect.Array:
+		fnc := makeArrayMarshaler(t)
+		if t.Elem().Kind() == reflect.Uint8 {
+			return makeBytesMarshaler(t, fnc)
+		}
+		return fnc
+	case reflect.Pointer:
+		return makePointerMarshaler(t)
+	case reflect.Interface:
+		return makeInterfaceMarshaler(t)
+	default:
+		return makeInvalidMarshaler(t)
+	}
+}
+
+func makeDefaultUnmarshaler(t reflect.Type) *unmarshaler {
+	switch t.Kind() {
+	case reflect.Bool:
+		return makeBoolUnmarshaler(t)
+	case reflect.String:
+		return makeStringUnmarshaler(t)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return makeIntUnmarshaler(t)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return makeUintUnmarshaler(t)
+	case reflect.Float32, reflect.Float64:
+		return makeFloatUnmarshaler(t)
+	case reflect.Map:
+		return makeMapUnmarshaler(t)
+	case reflect.Struct:
+		return makeStructUnmarshaler(t)
+	case reflect.Slice:
+		fnc := makeSliceUnmarshaler(t)
+		if t.Elem().Kind() == reflect.Uint8 {
+			return makeBytesUnmarshaler(t, fnc)
+		}
+		return fnc
+	case reflect.Array:
+		fnc := makeArrayUnmarshaler(t)
+		if t.Elem().Kind() == reflect.Uint8 {
+			return makeBytesUnmarshaler(t, fnc)
+		}
+		return fnc
+	case reflect.Pointer:
+		return makePointerUnmarshaler(t)
+	case reflect.Interface:
+		return makeInterfaceUnmarshaler(t)
+	default:
+		return makeInvalidUnmarshaler(t)
+	}
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeBoolMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		var stringify bool // always false except `string` tag with StringifyWithLegacySemantics
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			stringify = mo.Flags.Get(jsonflags.StringTag) && mo.Flags.Get(jsonflags.StringifyWithLegacySemantics)
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.StringifyWithLegacySemantics|jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+
+		// Optimize for marshaling without preceding whitespace.
+		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify && !xe.Tokens.Last.NeedObjectName() {
+			xe.CommitBuffer(strconv.AppendBool(xe.Tokens.MayAppendDelim(xe.Buf, 't'), vm.Bool()))
+			xe.Tokens.Last.Increment()
+			if xe.NeedFlush() {
+				return xe.Flush()
+			}
+			return nil
+		}
+
+		if stringify {
+			if vm.Bool() {
+				return enc.WriteToken(jsontext.String("true"))
+			} else {
+				return enc.WriteToken(jsontext.String("false"))
+			}
+		}
+		return enc.WriteToken(jsontext.Bool(vm.Bool()))
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeBoolUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		var stringify bool // always false except `string` tag with StringifyWithLegacySemantics
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			stringify = uo.Flags.Get(jsonflags.StringTag) && uo.Flags.Get(jsonflags.StringifyWithLegacySemantics)
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.StringifyWithLegacySemantics|jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		k := tok.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetBool(false)
+			}
+			return nil
+		case 't', 'f':
+			if !stringify {
+				va.SetBool(tok.Bool())
+				return nil
+			}
+		case '"':
+			if stringify {
+				switch tok.String() {
+				case "true":
+					va.SetBool(true)
+				case "false":
+					va.SetBool(false)
+				default:
+					if uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) && tok.String() == "null" {
+						if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+							va.SetBool(false)
+						}
+						return nil
+					}
+					return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrSyntax)
+				}
+				return nil
+			}
+		}
+		return newUnmarshalErrorAfterWithSkipping(dec, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeStringMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		var stringify bool // always false except `string` tag with StringifyWithLegacySemantics
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			stringify = mo.Flags.Get(jsonflags.StringTag) && mo.Flags.Get(jsonflags.StringifyWithLegacySemantics)
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.StringifyWithLegacySemantics|jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+
+		// Optimize for marshaling without preceding whitespace.
+		s := vm.String()
+		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify && !xe.Tokens.Last.NeedObjectName() {
+			b := xe.Buf
+			b = xe.Tokens.MayAppendDelim(b, '"')
+			b, err := jsonwire.AppendQuote(b, []byte(s), &mo.Flags)
+			if err == nil {
+				xe.CommitBuffer(b)
+				xe.Tokens.Last.Increment()
+				if xe.NeedFlush() {
+					return xe.Flush()
+				}
+				return nil
+			}
+			// Otherwise, the string contains invalid UTF-8,
+			// so let the logic below construct the proper error.
+		}
+
+		if stringify {
+			b, err := jsonwire.AppendQuote(nil, []byte(s), &mo.Flags)
+			if err != nil {
+				return newMarshalErrorBefore(enc, t, &jsontext.SyntacticError{Err: err})
+			}
+			q, err := jsontext.AppendQuote(nil, b)
+			if err != nil {
+				panic("BUG: second AppendQuote should never fail: " + err.Error())
+			}
+			return enc.WriteValue(q)
+		}
+		return enc.WriteToken(jsontext.String(s))
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeStringUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		var stringify bool // always false except `string` tag with StringifyWithLegacySemantics
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			stringify = uo.Flags.Get(jsonflags.StringTag) && uo.Flags.Get(jsonflags.StringifyWithLegacySemantics)
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.StringifyWithLegacySemantics|jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+		var flags jsonwire.ValueFlags
+		val, err := xd.ReadValue(&flags)
+		if err != nil {
+			return err
+		}
+		k := val.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetString("")
+			}
+			return nil
+		case '"':
+			val = jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+			if stringify {
+				if string(val) == "null" {
+					if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+						va.SetString("")
+					}
+					return nil
+				}
+				val, err = jsontext.AppendUnquote(nil, val)
+				if err != nil {
+					return newUnmarshalErrorAfter(dec, t, err)
+				}
+			}
+			if xd.StringCache == nil {
+				xd.StringCache = new(stringCache)
+			}
+			str := makeString(xd.StringCache, val)
+			va.SetString(str)
+			return nil
+		}
+		return newUnmarshalErrorAfter(dec, t, nil)
+	}
+	return &fnc
+}
+
+var (
+	base32StdEncoding = base32.StdEncoding
+	base32HexEncoding = base32.HexEncoding
+	base64StdEncoding = base64.StdEncoding
+	base64URLEncoding = base64.URLEncoding
+)
+
+var (
+	marshalBytesOnce      sync.Once
+	appendEncodeBase16    func([]byte, []byte) []byte
+	appendEncodeBase32    func([]byte, []byte) []byte
+	appendEncodeBase32Hex func([]byte, []byte) []byte
+	appendEncodeBase64    func([]byte, []byte) []byte
+	appendEncodeBase64URL func([]byte, []byte) []byte
+)
+
+func initMarshalBytes() {
+	appendEncodeBase16 = hex.AppendEncode
+	appendEncodeBase32 = base32StdEncoding.AppendEncode
+	appendEncodeBase32Hex = base32HexEncoding.AppendEncode
+	appendEncodeBase64 = base64StdEncoding.AppendEncode
+	appendEncodeBase64URL = base64URLEncoding.AppendEncode
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeBytesMarshaler(t reflect.Type, fnc *marshaler) *marshaler {
+	// NOTE: This handles both []~byte and [N]~byte.
+	// The v2 default is to treat a []namedByte as equivalent to []T
+	// since being able to convert []namedByte to []byte relies on
+	// dubious Go reflection behavior (see https://go.dev/issue/24746).
+	// For v1 emulation, we use jsonflags.FormatBytesWithLegacySemantics
+	// to forcibly treat []namedByte as a []byte.
+	marshalArray := fnc.fnc
+	isNamedByte := t.Elem().PkgPath() != ""
+	hasMarshaler := implementsAny(t.Elem(), allMarshalerTypes...)
+	marshalBytesOnce.Do(initMarshalBytes)
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		if !mo.Flags.Get(jsonflags.FormatBytesWithLegacySemantics) && isNamedByte {
+			return marshalArray(enc, vm, mo) // treat as []T or [N]T
+		}
+		xe := export.Encoder(enc)
+		appendEncode := appendEncodeBase64
+		if mo.Flags.Has(jsonflags.TagFlags | jsonflags.FormatByteArrayAsArray | jsonflags.FormatBytesWithLegacySemantics | jsonflags.FormatNilSliceAsNull) {
+			switch {
+			case mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics):
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			case mo.Flags.Has(jsonflags.FormatTag):
+				switch mo.Format {
+				case "base64":
+					appendEncode = appendEncodeBase64
+				case "base64url":
+					appendEncode = appendEncodeBase64URL
+				case "base32":
+					appendEncode = appendEncodeBase32
+				case "base32hex":
+					appendEncode = appendEncodeBase32Hex
+				case "base16", "hex":
+					appendEncode = appendEncodeBase16
+				case "array":
+					mo.Flags.Clear(jsonflags.FormatTag)
+					return marshalArray(enc, vm, mo)
+				default:
+					return newInvalidFormatError(enc, t)
+				}
+			case mo.Flags.Get(jsonflags.FormatByteArrayAsArray) && vm.Kind() == reflect.Array:
+				return marshalArray(enc, vm, mo)
+			case mo.Flags.Get(jsonflags.FormatBytesWithLegacySemantics) && hasMarshaler:
+				return marshalArray(enc, vm, mo)
+			}
+			if mo.Flags.Get(jsonflags.FormatNilSliceAsNull) && vm.Kind() == reflect.Slice && vm.IsNil() {
+				// TODO: Provide an "emitempty" format override?
+				return enc.WriteToken(jsontext.Null)
+			}
+		}
+		return xe.AppendRaw('"', true, func(b []byte) ([]byte, error) {
+			return appendEncode(b, vm.ensureAddr().Bytes()), nil
+		})
+	}
+	return fnc
+}
+
+var (
+	unmarshalBytesOnce    sync.Once
+	appendDecodeBase16    func([]byte, []byte) ([]byte, error)
+	appendDecodeBase32    func([]byte, []byte) ([]byte, error)
+	appendDecodeBase32Hex func([]byte, []byte) ([]byte, error)
+	appendDecodeBase64    func([]byte, []byte) ([]byte, error)
+	appendDecodeBase64URL func([]byte, []byte) ([]byte, error)
+	encodedLenBase16      func(int) int
+	encodedLenBase32      func(int) int
+	encodedLenBase32Hex   func(int) int
+	encodedLenBase64      func(int) int
+	encodedLenBase64URL   func(int) int
+)
+
+func initUnmarshalBytes() {
+	appendDecodeBase16, encodedLenBase16 = hex.AppendDecode, hex.EncodedLen
+	appendDecodeBase32, encodedLenBase32 = base32StdEncoding.AppendDecode, base32StdEncoding.EncodedLen
+	appendDecodeBase32Hex, encodedLenBase32Hex = base32HexEncoding.AppendDecode, base32HexEncoding.EncodedLen
+	appendDecodeBase64, encodedLenBase64 = base64StdEncoding.AppendDecode, base64StdEncoding.EncodedLen
+	appendDecodeBase64URL, encodedLenBase64URL = base64URLEncoding.AppendDecode, base64URLEncoding.EncodedLen
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeBytesUnmarshaler(t reflect.Type, fnc *unmarshaler) *unmarshaler {
+	// NOTE: This handles both []~byte and [N]~byte.
+	unmarshalArray := fnc.fnc
+	isNamedByte := t.Elem().PkgPath() != ""
+	unmarshalBytesOnce.Do(initUnmarshalBytes)
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		if !uo.Flags.Get(jsonflags.FormatBytesWithLegacySemantics) && isNamedByte {
+			return unmarshalArray(dec, va, uo) // treat as []T or [N]T
+		}
+		xd := export.Decoder(dec)
+		appendDecode, encodedLen := appendDecodeBase64, encodedLenBase64
+		if uo.Flags.Has(jsonflags.TagFlags | jsonflags.FormatByteArrayAsArray | jsonflags.FormatBytesWithLegacySemantics) {
+			switch {
+			case uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics):
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			case uo.Flags.Has(jsonflags.FormatTag):
+				switch uo.Format {
+				case "base64":
+					appendDecode, encodedLen = appendDecodeBase64, encodedLenBase64
+				case "base64url":
+					appendDecode, encodedLen = appendDecodeBase64URL, encodedLenBase64URL
+				case "base32":
+					appendDecode, encodedLen = appendDecodeBase32, encodedLenBase32
+				case "base32hex":
+					appendDecode, encodedLen = appendDecodeBase32Hex, encodedLenBase32Hex
+				case "base16", "hex":
+					appendDecode, encodedLen = appendDecodeBase16, encodedLenBase16
+				case "array":
+					uo.Flags.Clear(jsonflags.FormatTag)
+					return unmarshalArray(dec, va, uo)
+				default:
+					return newInvalidFormatError(dec, t)
+				}
+			case uo.Flags.Get(jsonflags.FormatByteArrayAsArray) && va.Kind() == reflect.Array:
+				return unmarshalArray(dec, va, uo)
+			case uo.Flags.Get(jsonflags.FormatBytesWithLegacySemantics) && dec.PeekKind() == '[':
+				return unmarshalArray(dec, va, uo)
+			}
+		}
+		var flags jsonwire.ValueFlags
+		val, err := xd.ReadValue(&flags)
+		if err != nil {
+			return err
+		}
+		k := val.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) || va.Kind() != reflect.Array {
+				va.SetZero()
+			}
+			return nil
+		case '"':
+			// NOTE: The v2 default is to strictly comply with RFC 4648.
+			// Section 3.2 specifies that padding is required.
+			// Section 3.3 specifies that non-alphabet characters
+			// (e.g., '\r' or '\n') must be rejected.
+			// Section 3.5 specifies that unnecessary non-zero bits in
+			// the last quantum may be rejected. Since this is optional,
+			// we do not reject such inputs.
+			val = jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+			b, err := appendDecode(va.Bytes()[:0], val)
+			if err != nil {
+				return newUnmarshalErrorAfter(dec, t, err)
+			}
+			if len(val) != encodedLen(len(b)) && !uo.Flags.Get(jsonflags.ParseBytesWithLooseRFC4648) {
+				// TODO(https://go.dev/issue/53845): RFC 4648, section 3.3,
+				// specifies that non-alphabet characters must be rejected.
+				// Unfortunately, the "base32" and "base64" packages allow
+				// '\r' and '\n' characters by default.
+				i := bytes.IndexAny(val, "\r\n")
+				err := fmt.Errorf("illegal character %s at offset %d", jsonwire.QuoteRune(val[i:]), i)
+				return newUnmarshalErrorAfter(dec, t, err)
+			}
+
+			if va.Kind() == reflect.Array {
+				dst := va.Bytes()
+				clear(dst[copy(dst, b):]) // noop if len(b) >= len(dst)
+				if len(b) != len(dst) && !uo.Flags.Get(jsonflags.UnmarshalArrayFromAnyLength) {
+					err := fmt.Errorf("decoded length of %d mismatches array length of %d", len(b), len(dst))
+					return newUnmarshalErrorAfter(dec, t, err)
+				}
+			} else {
+				if b == nil {
+					b = []byte{}
+				}
+				va.SetBytes(b)
+			}
+			return nil
+		}
+		return newUnmarshalErrorAfter(dec, t, nil)
+	}
+	return fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeIntMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		stringify := xe.Tokens.Last.NeedObjectName() || mo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		if mo.Flags.Has(jsonflags.FormatTag) {
+			return newInvalidFormatError(enc, t)
+		}
+
+		// Optimize for marshaling without preceding whitespace or string escaping.
+		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify {
+			xe.CommitBuffer(strconv.AppendInt(xe.Tokens.MayAppendDelim(xe.Buf, '0'), vm.Int(), 10))
+			xe.Tokens.Last.Increment()
+			if xe.NeedFlush() {
+				return xe.Flush()
+			}
+			return nil
+		}
+
+		k := stringOrNumberKind(stringify)
+		return xe.AppendRaw(k, true, func(b []byte) ([]byte, error) {
+			return strconv.AppendInt(b, vm.Int(), 10), nil
+		})
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeIntUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	bits := t.Bits()
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		stringify := xd.Tokens.Last.NeedObjectName() || uo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		if uo.Flags.Has(jsonflags.FormatTag) {
+			return newInvalidFormatError(dec, t)
+		}
+		var flags jsonwire.ValueFlags
+		val, err := xd.ReadValue(&flags)
+		if err != nil {
+			return err
+		}
+		k := val.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetInt(0)
+			}
+			return nil
+		case '"':
+			if !stringify {
+				break
+			}
+			val = jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+			if uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+				// For historical reasons, v1 parsed a quoted number
+				// according to the Go syntax and permitted a quoted null.
+				// See https://go.dev/issue/75619
+				n, err := strconv.ParseInt(string(val), 10, bits)
+				if err != nil {
+					if string(val) == "null" && uo.Flags.Get(jsonflags.StringTag) {
+						if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+							va.SetInt(0)
+						}
+						return nil
+					}
+					return newUnmarshalErrorAfterWithValue(dec, t, errors.Unwrap(err))
+				}
+				va.SetInt(n)
+				return nil
+			}
+			fallthrough
+		case '0':
+			if stringify && k == '0' {
+				break
+			}
+			var negOffset int
+			neg := len(val) > 0 && val[0] == '-'
+			if neg {
+				negOffset = 1
+			}
+			n, ok := jsonwire.ParseUint(val[negOffset:])
+			maxInt := uint64(1) << (bits - 1)
+			overflow := (neg && n > maxInt) || (!neg && n > maxInt-1)
+			if !ok {
+				if n != math.MaxUint64 {
+					return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrSyntax)
+				}
+				overflow = true
+			}
+			if overflow {
+				return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrRange)
+			}
+			if neg {
+				va.SetInt(int64(-n))
+			} else {
+				va.SetInt(int64(+n))
+			}
+			return nil
+		}
+		return newUnmarshalErrorAfter(dec, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeUintMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		stringify := xe.Tokens.Last.NeedObjectName() || mo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		if mo.Flags.Has(jsonflags.FormatTag) {
+			return newInvalidFormatError(enc, t)
+		}
+
+		// Optimize for marshaling without preceding whitespace or string escaping.
+		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify {
+			xe.CommitBuffer(strconv.AppendUint(xe.Tokens.MayAppendDelim(xe.Buf, '0'), vm.Uint(), 10))
+			xe.Tokens.Last.Increment()
+			if xe.NeedFlush() {
+				return xe.Flush()
+			}
+			return nil
+		}
+
+		k := stringOrNumberKind(stringify)
+		return xe.AppendRaw(k, true, func(b []byte) ([]byte, error) {
+			return strconv.AppendUint(b, vm.Uint(), 10), nil
+		})
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeUintUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	bits := t.Bits()
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		stringify := xd.Tokens.Last.NeedObjectName() || uo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		if uo.Flags.Has(jsonflags.FormatTag) {
+			return newInvalidFormatError(dec, t)
+		}
+		var flags jsonwire.ValueFlags
+		val, err := xd.ReadValue(&flags)
+		if err != nil {
+			return err
+		}
+		k := val.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetUint(0)
+			}
+			return nil
+		case '"':
+			if !stringify {
+				break
+			}
+			val = jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+			if uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+				// For historical reasons, v1 parsed a quoted number
+				// according to the Go syntax and permitted a quoted null.
+				// See https://go.dev/issue/75619
+				n, err := strconv.ParseUint(string(val), 10, bits)
+				if err != nil {
+					if string(val) == "null" && uo.Flags.Get(jsonflags.StringTag) {
+						if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+							va.SetUint(0)
+						}
+						return nil
+					}
+					return newUnmarshalErrorAfterWithValue(dec, t, errors.Unwrap(err))
+				}
+				va.SetUint(n)
+				return nil
+			}
+			fallthrough
+		case '0':
+			if stringify && k == '0' {
+				break
+			}
+			n, ok := jsonwire.ParseUint(val)
+			maxUint := uint64(1) << bits
+			overflow := n > maxUint-1
+			if !ok {
+				if n != math.MaxUint64 {
+					return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrSyntax)
+				}
+				overflow = true
+			}
+			if overflow {
+				return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrRange)
+			}
+			va.SetUint(n)
+			return nil
+		}
+		return newUnmarshalErrorAfter(dec, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeFloatMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	bits := t.Bits()
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		stringify := xe.Tokens.Last.NeedObjectName() || mo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		var allowNonFinite bool
+		if mo.Flags.Has(jsonflags.FormatTag) {
+			if mo.Format == "nonfinite" {
+				allowNonFinite = true
+			} else {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+
+		fv := vm.Float()
+		if math.IsNaN(fv) || math.IsInf(fv, 0) {
+			if !allowNonFinite {
+				err := fmt.Errorf("unsupported value: %v", fv)
+				if mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+					err = &internal.ValueError{Val: vm.Interface(), Err: err}
+				}
+				return newMarshalErrorBefore(enc, t, err)
+			}
+			return enc.WriteToken(jsontext.Float(fv))
+		}
+
+		// Optimize for marshaling without preceding whitespace or string escaping.
+		if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !stringify {
+			xe.CommitBuffer(jsonwire.AppendFloat(xe.Tokens.MayAppendDelim(xe.Buf, '0'), fv, bits))
+			xe.Tokens.Last.Increment()
+			if xe.NeedFlush() {
+				return xe.Flush()
+			}
+			return nil
+		}
+
+		k := stringOrNumberKind(stringify)
+		return xe.AppendRaw(k, true, func(b []byte) ([]byte, error) {
+			return jsonwire.AppendFloat(b, vm.Float(), bits), nil
+		})
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeFloatUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	bits := t.Bits()
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		stringify := xd.Tokens.Last.NeedObjectName() || uo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.StringTag)
+		var allowNonFinite bool
+		if uo.Flags.Has(jsonflags.FormatTag) {
+			if uo.Format == "nonfinite" {
+				allowNonFinite = true
+			} else {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+
+		var flags jsonwire.ValueFlags
+		val, err := xd.ReadValue(&flags)
+		if err != nil {
+			return err
+		}
+		k := val.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetFloat(0)
+			}
+			return nil
+		case '"':
+			val = jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+			if allowNonFinite {
+				switch string(val) {
+				case "NaN":
+					va.SetFloat(math.NaN())
+					return nil
+				case "Infinity":
+					va.SetFloat(math.Inf(+1))
+					return nil
+				case "-Infinity":
+					va.SetFloat(math.Inf(-1))
+					return nil
+				}
+			}
+			if !stringify {
+				break
+			}
+			if uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+				// For historical reasons, v1 parsed a quoted number
+				// according to the Go syntax and permitted a quoted null.
+				// See https://go.dev/issue/75619
+				n, err := strconv.ParseFloat(string(val), bits)
+				if err != nil {
+					if string(val) == "null" && uo.Flags.Get(jsonflags.StringTag) {
+						if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+							va.SetFloat(0)
+						}
+						return nil
+					}
+					return newUnmarshalErrorAfterWithValue(dec, t, errors.Unwrap(err))
+				}
+				va.SetFloat(n)
+				return nil
+			}
+			if n, err := jsonwire.ConsumeNumber(val); n != len(val) || err != nil {
+				return newUnmarshalErrorAfterWithValue(dec, t, strconv.ErrSyntax)
+			}
+			fallthrough
+		case '0':
+			if stringify && k == '0' {
+				break
+			}
+			fv, err := strconv.ParseFloat(string(val), bits)
+			if err != nil {
+				return newUnmarshalErrorAfterWithValue(dec, t, errors.Unwrap(err))
+			}
+			va.SetFloat(fv)
+			return nil
+		}
+		return newUnmarshalErrorAfter(dec, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeMapMarshaler(t reflect.Type) *marshaler {
+	// NOTE: The logic below disables namespaces for tracking duplicate names
+	// when handling map keys with a unique representation.
+
+	// NOTE: Values retrieved from a map are not addressable,
+	// so we shallow copy the values to make them addressable and
+	// store them back into the map afterwards.
+
+	var fnc marshaler
+	var (
+		once    sync.Once
+		keyFncs *marshaler
+		valFncs *marshaler
+	)
+	init := func() {
+		keyFncs = lookupMarshaler(t.Key())
+		valFncs = lookupMarshaler(t.Elem())
+	}
+	nillableLegacyKey := t.Key().Kind() == reflect.Pointer &&
+		implementsAny(t.Key(), textMarshalerType, textAppenderType)
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		// Check for cycles.
+		xe := export.Encoder(enc)
+		if xe.Tokens.Depth() > startDetectingCyclesAfter {
+			if err := visitPointer(&xe.SeenPointers, vm.Value, mo); err != nil {
+				return newMarshalErrorBefore(enc, t, err)
+			}
+			defer leavePointer(&xe.SeenPointers, vm.Value)
+		}
+
+		emitNull := mo.Flags.Get(jsonflags.FormatNilMapAsNull)
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				switch mo.Format {
+				case "emitnull":
+					emitNull = true
+				case "emitempty":
+					emitNull = false
+				default:
+					return newInvalidFormatError(enc, t)
+				}
+			}
+		}
+
+		// Handle empty maps.
+		n := vm.Len()
+		if n == 0 {
+			if emitNull && vm.IsNil() {
+				return enc.WriteToken(jsontext.Null)
+			}
+			// Optimize for marshaling an empty map without any preceding whitespace.
+			if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !xe.Tokens.Last.NeedObjectName() {
+				xe.CommitBuffer(append(xe.Tokens.MayAppendDelim(xe.Buf, '{'), "{}"...))
+				xe.Tokens.Last.Increment()
+				if xe.NeedFlush() {
+					return xe.Flush()
+				}
+				return nil
+			}
+		}
+
+		once.Do(init)
+		if err := enc.WriteToken(jsontext.BeginObject); err != nil {
+			return err
+		}
+		if n > 0 {
+			nonDefaultKey := keyFncs.nonDefault
+			marshalKey := keyFncs.fnc
+			marshalVal := valFncs.fnc
+			if mo.Marshalers != nil {
+				var ok bool
+				marshalKey, ok = mo.Marshalers.(*Marshalers).lookup(marshalKey, t.Key())
+				marshalVal, _ = mo.Marshalers.(*Marshalers).lookup(marshalVal, t.Elem())
+				nonDefaultKey = nonDefaultKey || ok
+			}
+			mka := newAddressableValue(t.Key())  // temporary addressable key for each map entry
+			mva := newAddressableValue(t.Elem()) // temporary addressable value for each map entry
+
+			// A Go map guarantees that each entry has a unique key.
+			// As such, disable the expensive duplicate name check if we know
+			// that every Go key will serialize as a unique JSON string.
+			if !nonDefaultKey && mapKeyWithUniqueRepresentation(mka.Kind(), mo.Flags.Get(jsonflags.AllowInvalidUTF8)) {
+				xe.Tokens.Last.DisableNamespace()
+			}
+
+			switch {
+			case !mo.Flags.Get(jsonflags.Deterministic) || n <= 1:
+				for iter := vm.Value.MapRange(); iter.Next(); {
+					mka.SetIterKey(iter)
+					err := marshalKey(enc, maybeAddressableValue(mka), mo)
+					if err != nil {
+						if mo.Flags.Get(jsonflags.CallMethodsWithLegacySemantics) &&
+							errors.Is(err, jsontext.ErrNonStringName) && nillableLegacyKey && mka.IsNil() {
+							err = enc.WriteToken(jsontext.String(""))
+						}
+						if err != nil {
+							if serr, ok := err.(*jsontext.SyntacticError); ok && serr.Err == jsontext.ErrNonStringName {
+								err = newMarshalErrorBefore(enc, mka.Type(), err)
+							}
+							return err
+						}
+					}
+					mva.SetIterValue(iter)
+					if err := marshalVal(enc, maybeAddressableValue(mva), mo); err != nil {
+						return err
+					}
+				}
+			case !nonDefaultKey && t.Key().Kind() == reflect.String:
+				names := getStrings(n)
+				for i, iter := 0, vm.Value.MapRange(); i < n && iter.Next(); i++ {
+					mka.SetIterKey(iter)
+					(*names)[i] = mka.String()
+				}
+				slices.Sort(*names)
+				for _, name := range *names {
+					if err := enc.WriteToken(jsontext.String(name)); err != nil {
+						return err
+					}
+					// TODO(https://go.dev/issue/57061): Use mva.SetMapIndexOf.
+					mka.SetString(name)
+					mva.Set(vm.MapIndex(mka.Value))
+					if err := marshalVal(enc, maybeAddressableValue(mva), mo); err != nil {
+						return err
+					}
+				}
+				putStrings(names)
+			default:
+				type member struct {
+					name string // unquoted name
+					key  alwaysAddressableValue
+					val  alwaysAddressableValue
+				}
+				members := make([]member, n)
+				keys := reflect.MakeSlice(reflect.SliceOf(t.Key()), n, n)
+				vals := reflect.MakeSlice(reflect.SliceOf(t.Elem()), n, n)
+				for i, iter := 0, vm.Value.MapRange(); i < n && iter.Next(); i++ {
+					// Marshal the member name.
+					mka := alwaysAddressableValue{keys.Index(i), true} // indexed slice element is always addressable
+					mka.SetIterKey(iter)
+					mva := alwaysAddressableValue{vals.Index(i), true} // indexed slice element is always addressable
+					mva.SetIterValue(iter)
+					err := marshalKey(enc, maybeAddressableValue(mka), mo)
+					if err != nil {
+						if mo.Flags.Get(jsonflags.CallMethodsWithLegacySemantics) &&
+							errors.Is(err, jsontext.ErrNonStringName) && nillableLegacyKey && mka.IsNil() {
+							err = enc.WriteToken(jsontext.String(""))
+						}
+						if err != nil {
+							if serr, ok := err.(*jsontext.SyntacticError); ok && serr.Err == jsontext.ErrNonStringName {
+								err = newMarshalErrorBefore(enc, mka.Type(), err)
+							}
+							return err
+						}
+					}
+					name := xe.UnwriteOnlyObjectMemberName()
+					members[i] = member{name, mka, mva}
+				}
+				// TODO: If AllowDuplicateNames is enabled, then sort according
+				// to reflect.Value as well if the names are equal.
+				// See internal/fmtsort.
+				slices.SortFunc(members, func(x, y member) int {
+					return strings.Compare(x.name, y.name)
+				})
+				for _, member := range members {
+					if err := enc.WriteToken(jsontext.String(member.name)); err != nil {
+						return err
+					}
+					if err := marshalVal(enc, maybeAddressableValue(member.val), mo); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err := enc.WriteToken(jsontext.EndObject); err != nil {
+			return err
+		}
+		return nil
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeMapUnmarshaler(t reflect.Type) *unmarshaler {
+	// NOTE: The logic below disables namespaces for tracking duplicate names
+	// when handling map keys with a unique representation.
+
+	// NOTE: Values retrieved from a map are not addressable,
+	// so we shallow copy the values to make them addressable and
+	// store them back into the map afterwards.
+
+	var fnc unmarshaler
+	var (
+		once    sync.Once
+		keyFncs *unmarshaler
+		valFncs *unmarshaler
+	)
+	init := func() {
+		keyFncs = lookupUnmarshaler(t.Key())
+		valFncs = lookupUnmarshaler(t.Elem())
+	}
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				switch uo.Format {
+				case "emitnull", "emitempty":
+				default:
+					return newInvalidFormatError(dec, t)
+				}
+			}
+		}
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		k := tok.Kind()
+		switch k {
+		case 'n':
+			va.SetZero()
+			return nil
+		case '{':
+			once.Do(init)
+			if va.IsNil() {
+				va.Set(reflect.MakeMap(t))
+			}
+
+			nonDefaultKey := keyFncs.nonDefault
+			unmarshalKey := keyFncs.fnc
+			unmarshalVal := valFncs.fnc
+			if uo.Unmarshalers != nil {
+				var ok bool
+				unmarshalKey, ok = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshalKey, t.Key())
+				unmarshalVal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshalVal, t.Elem())
+				nonDefaultKey = nonDefaultKey || ok
+			}
+			mka := newAddressableValue(t.Key())  // temporary addressable key for each map entry
+			mva := newAddressableValue(t.Elem()) // temporary addressable value for each map entry
+
+			// Manually check for duplicate entries by virtue of whether the
+			// unmarshaled key already exists in the destination Go map.
+			// Consequently, syntactically different names (e.g., "0" and "-0")
+			// will be rejected as duplicates since they semantically refer
+			// to the same Go value. This is an unusual interaction
+			// between syntax and semantics, but is more correct.
+			if !nonDefaultKey && mapKeyWithUniqueRepresentation(mka.Kind(), uo.Flags.Get(jsonflags.AllowInvalidUTF8)) {
+				xd.Tokens.Last.DisableNamespace()
+			}
+
+			// In the rare case where the map is not already empty,
+			// then we need to manually track which keys we already saw
+			// since existing presence alone is insufficient to indicate
+			// whether the input had a duplicate name.
+			var seen reflect.Value
+			if !uo.Flags.Get(jsonflags.AllowDuplicateNames) && va.Len() > 0 {
+				seen = reflect.MakeMap(reflect.MapOf(mka.Type(), emptyStructType))
+			}
+
+			var errUnmarshal error
+			for dec.PeekKind() != '}' {
+				// Unmarshal the map entry key.
+				mka.SetZero()
+				err := unmarshalKey(dec, mka, uo)
+				if err != nil {
+					if isFatalError(err, uo.Flags) {
+						return err
+					}
+					if err := dec.SkipValue(); err != nil {
+						return err
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+					continue
+				}
+				if mka.Kind() == reflect.Interface && !mka.IsNil() && !mka.Elem().Type().Comparable() {
+					err := newUnmarshalErrorAfter(dec, t, fmt.Errorf("invalid incomparable key type %v", mka.Elem().Type()))
+					if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+						return err
+					}
+					if err2 := dec.SkipValue(); err2 != nil {
+						return err2
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+					continue
+				}
+
+				// Check if a pre-existing map entry value exists for this key.
+				if v2 := va.MapIndex(mka.Value); v2.IsValid() {
+					if !uo.Flags.Get(jsonflags.AllowDuplicateNames) && (!seen.IsValid() || seen.MapIndex(mka.Value).IsValid()) {
+						// TODO: Unread the object name.
+						name := xd.PreviousTokenOrValue()
+						return newDuplicateNameError(dec.StackPointer(), nil, dec.InputOffset()-len64(name))
+					}
+					if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+						mva.Set(v2)
+					} else {
+						mva.SetZero()
+					}
+				} else {
+					mva.SetZero()
+				}
+
+				// Unmarshal the map entry value.
+				err = unmarshalVal(dec, mva, uo)
+				va.SetMapIndex(mka.Value, mva.Value)
+				if seen.IsValid() {
+					seen.SetMapIndex(mka.Value, reflect.Zero(emptyStructType))
+				}
+				if err != nil {
+					if isFatalError(err, uo.Flags) {
+						return err
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+				}
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			return errUnmarshal
+		}
+		return newUnmarshalErrorAfterWithSkipping(dec, t, nil)
+	}
+	return &fnc
+}
+
+// mapKeyWithUniqueRepresentation reports whether all possible values of k
+// marshal to a different JSON value, and whether all possible JSON values
+// that can unmarshal into k unmarshal to different Go values.
+// In other words, the representation must be a bijection.
+func mapKeyWithUniqueRepresentation(k reflect.Kind, allowInvalidUTF8 bool) bool {
+	switch k {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	case reflect.String:
+		// For strings, we have to be careful since names with invalid UTF-8
+		// may unescape to the same Go string value.
+		return !allowInvalidUTF8
+	default:
+		// Floating-point kinds are not listed above since NaNs
+		// can appear multiple times and all serialize as "NaN".
+		return false
+	}
+}
+
+var errNilField = errors.New("cannot set embedded pointer to unexported struct type")
+var errInvalidStringTag = errors.New("invalid use of `string` tag option")
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeStructMarshaler(t reflect.Type) *marshaler {
+	// NOTE: The logic below disables namespaces for tracking duplicate names
+	// and does the tracking locally with an efficient bit-set based on which
+	// Go struct fields were seen.
+
+	var fnc marshaler
+	var (
+		once                sync.Once
+		fields              *structFields
+		fieldFncs           []*marshaler
+		embeddedFallbackFnc *marshaler
+		errInit             *SemanticError
+	)
+	init := func() {
+		fields, errInit = lookupStructFields(t)
+		fieldFncs = make([]*marshaler, len(fields.flattened))
+		for i := range fields.flattened {
+			f := &fields.flattened[i]
+			fieldFncs[f.id] = lookupMarshaler(f.typ)
+		}
+		if fields.embeddedFallback != nil && indirectType(fields.embeddedFallback.typ) != jsontextValueType {
+			embeddedFallbackFnc = lookupMarshaler(indirectType(fields.embeddedFallback.typ).Elem())
+		}
+	}
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		xe := export.Encoder(enc)
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+		once.Do(init)
+		if errInit != nil && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+			return newMarshalErrorBefore(enc, errInit.GoType, errInit.Err)
+		} else if fields.errUnsupportedFormat != nil && !mo.Flags.Get(jsonflags.FormatTagSupported) {
+			return newMarshalErrorBefore(enc, fields.errUnsupportedFormat.GoType, fields.errUnsupportedFormat.Err)
+		}
+
+		if err := enc.WriteToken(jsontext.BeginObject); err != nil {
+			return err
+		}
+		var seenIdxs uintSet
+		prevIdx := -1
+		xe.Tokens.Last.DisableNamespace() // we manually ensure unique names below
+		for i := range fields.flattened {
+			f := &fields.flattened[i]
+			v := maybeAddressableValue{vm.Field(f.index0), vm.legacyNotAddressable} // addressable if struct value is addressable
+			if len(f.index) > 0 {
+				v = v.fieldByIndex(f.index, false)
+				if !v.IsValid() {
+					continue // implies a nil embedded field
+				}
+			}
+
+			// OmitZero skips the field if the Go value is zero,
+			// which we can determine up front without calling the marshaler.
+			if (f.omitzero || mo.Flags.Get(jsonflags.OmitZeroStructFields)) &&
+				((f.isZero == nil && v.IsZero()) || (f.isZero != nil && f.isZero(v))) {
+				continue
+			}
+
+			// Check for the legacy definition of omitempty.
+			if f.omitempty && mo.Flags.Get(jsonflags.OmitEmptyWithLegacySemantics) && isLegacyEmpty(v.Value) {
+				continue
+			}
+
+			fieldFnc := fieldFncs[f.id]
+			marshal := fieldFnc.fnc
+			nonDefault := fieldFnc.nonDefault
+			if mo.Marshalers != nil {
+				var ok bool
+				marshal, ok = mo.Marshalers.(*Marshalers).lookup(marshal, f.typ)
+				nonDefault = nonDefault || ok
+			}
+
+			// OmitEmpty skips the field if the marshaled JSON value is empty,
+			// which we can know up front if there are no custom marshalers,
+			// otherwise we must marshal the value and unwrite it if empty.
+			if f.omitempty && !mo.Flags.Get(jsonflags.OmitEmptyWithLegacySemantics) &&
+				!nonDefault && f.isEmpty != nil && f.isEmpty(v) {
+				continue // fast path for omitempty
+			}
+
+			// Write the object member name.
+			//
+			// The logic below is semantically equivalent to:
+			//	enc.WriteToken(String(f.name))
+			// but specialized and simplified because:
+			//	1. The Encoder must be expecting an object name.
+			//	2. The object namespace is guaranteed to be disabled.
+			//	3. The object name is guaranteed to be valid and pre-escaped.
+			//	4. There is no need to flush the buffer (for unwrite purposes).
+			//	5. There is no possibility of an error occurring.
+			if optimizeCommon {
+				// Append any delimiters or optional whitespace.
+				b := xe.Buf
+				if xe.Tokens.Last.Length() > 0 {
+					b = append(b, ',')
+					if mo.Flags.Get(jsonflags.SpaceAfterComma) {
+						b = append(b, ' ')
+					}
+				}
+				if mo.Flags.Get(jsonflags.Multiline) {
+					b = xe.AppendIndent(b, xe.Tokens.NeedIndent('"'))
+				}
+
+				// Append the token to the output and to the state machine.
+				n0 := len(b) // offset before calling AppendQuote
+				if !f.nameNeedEscape {
+					b = append(b, f.quotedName...)
+				} else {
+					b, _ = jsonwire.AppendQuote(b, []byte(f.name), &mo.Flags)
+				}
+				xe.CommitBuffer(b)
+				xe.Names.ReplaceLastQuotedOffset(n0)
+				xe.Tokens.Last.Increment()
+			} else {
+				if err := enc.WriteToken(jsontext.String(f.name)); err != nil {
+					return err
+				}
+			}
+
+			// Write the object member value.
+			flagsOriginal := mo.Flags
+			if f.string {
+				mo.Flags.Set(jsonflags.StringTag | 1)
+			}
+			if f.format != "" {
+				mo.Flags.Set(jsonflags.FormatTag | 1)
+				mo.Format = f.format
+			}
+			err := marshal(enc, v, mo)
+			mo.Flags = flagsOriginal
+			mo.Format = ""
+			if err != nil {
+				return err
+			}
+
+			// Try unwriting the member if empty (slow path for omitempty).
+			if f.omitempty && !mo.Flags.Get(jsonflags.OmitEmptyWithLegacySemantics) {
+				var prevName *string
+				if prevIdx >= 0 {
+					prevName = &fields.flattened[prevIdx].name
+				}
+				if xe.UnwriteEmptyObjectMember(prevName) {
+					continue
+				}
+			}
+
+			// Remember the previous written object member.
+			// The set of seen fields only needs to be updated to detect
+			// duplicate names with those from the embedded fallback.
+			if !mo.Flags.Get(jsonflags.AllowDuplicateNames) && fields.embeddedFallback != nil {
+				seenIdxs.insert(uint(f.id))
+			}
+			prevIdx = f.id
+		}
+		if fields.embeddedFallback != nil {
+			var insertUnquotedName func([]byte) bool
+			if !mo.Flags.Get(jsonflags.AllowDuplicateNames) {
+				insertUnquotedName = func(name []byte) bool {
+					// Check that the name from embedded fallback does not match
+					// one of the previously marshaled names from known fields.
+					if foldedFields := fields.lookupByFoldedName(name); len(foldedFields) > 0 {
+						if f := fields.byActualName[string(name)]; f != nil {
+							return seenIdxs.insert(uint(f.id))
+						}
+						for _, f := range foldedFields {
+							if f.matchFoldedName(name, &mo.Flags) {
+								return seenIdxs.insert(uint(f.id))
+							}
+						}
+					}
+
+					// Check that the name does not match any other name
+					// previously marshaled from the embedded fallback.
+					return xe.Namespaces.Last().InsertUnquoted(name)
+				}
+			}
+			if err := marshalEmbeddedFallbackAll(enc, vm, mo, fields.embeddedFallback, embeddedFallbackFnc, insertUnquotedName); err != nil {
+				return err
+			}
+		}
+		if err := enc.WriteToken(jsontext.EndObject); err != nil {
+			return err
+		}
+		return nil
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeStructUnmarshaler(t reflect.Type) *unmarshaler {
+	// NOTE: The logic below disables namespaces for tracking duplicate names
+	// and does the tracking locally with an efficient bit-set based on which
+	// Go struct fields were seen.
+
+	var fnc unmarshaler
+	var (
+		once                sync.Once
+		fields              *structFields
+		fieldFncs           []*unmarshaler
+		embeddedFallbackFnc *unmarshaler
+		errInit             *SemanticError
+	)
+	init := func() {
+		fields, errInit = lookupStructFields(t)
+		fieldFncs = make([]*unmarshaler, len(fields.flattened))
+		for i := range fields.flattened {
+			f := &fields.flattened[i]
+			fieldFncs[f.id] = lookupUnmarshaler(f.typ)
+		}
+		if fields.embeddedFallback != nil && indirectType(fields.embeddedFallback.typ) != jsontextValueType {
+			embeddedFallbackFnc = lookupUnmarshaler(indirectType(fields.embeddedFallback.typ).Elem())
+		}
+	}
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		xd := export.Decoder(dec)
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		k := tok.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetZero()
+			}
+			return nil
+		case '{':
+			once.Do(init)
+			if errInit != nil && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorAfter(dec, errInit.GoType, errInit.Err)
+			} else if fields.errUnsupportedFormat != nil && !uo.Flags.Get(jsonflags.FormatTagSupported) {
+				return newUnmarshalErrorAfter(dec, fields.errUnsupportedFormat.GoType, fields.errUnsupportedFormat.Err)
+			}
+
+			var seenIdxs uintSet
+			xd.Tokens.Last.DisableNamespace()
+			var errUnmarshal error
+			for dec.PeekKind() != '}' {
+				// Process the object member name.
+				var flags jsonwire.ValueFlags
+				val, err := xd.ReadValue(&flags)
+				if err != nil {
+					return err
+				}
+				name := jsonwire.UnquoteMayCopy(val, flags.IsVerbatim())
+				f := fields.byActualName[string(name)]
+				if f == nil {
+					var numMatch int
+					for _, f2 := range fields.lookupByFoldedName(name) {
+						if f2.matchFoldedName(name, &uo.Flags) {
+							if f == nil {
+								f = f2 // use first seen name by breadth-first order
+							}
+							numMatch++
+						}
+					}
+					if numMatch > 1 && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+						return newUnmarshalErrorAfter(dec, t, errAmbiguousName)
+					}
+					if f == nil {
+						if uo.Flags.Get(jsonflags.RejectUnknownMembers) && fields.embeddedFallback == nil {
+							err := newUnmarshalErrorAfter(dec, t, ErrUnknownName)
+							if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+								return err
+							}
+							errUnmarshal = cmp.Or(errUnmarshal, err)
+						}
+						if !uo.Flags.Get(jsonflags.AllowDuplicateNames) && !xd.Namespaces.Last().InsertUnquoted(name) {
+							// TODO: Unread the object name.
+							return newDuplicateNameError(dec.StackPointer(), nil, dec.InputOffset()-len64(val))
+						}
+
+						if fields.embeddedFallback == nil {
+							// Skip unknown value since we have no place to store it.
+							if err := dec.SkipValue(); err != nil {
+								return err
+							}
+						} else {
+							// Unmarshal into a value capable of storing arbitrary object members.
+							if err := unmarshalEmbeddedFallbackNext(dec, va, uo, fields.embeddedFallback, embeddedFallbackFnc, val, name); err != nil {
+								if isFatalError(err, uo.Flags) {
+									return err
+								}
+								errUnmarshal = cmp.Or(errUnmarshal, err)
+							}
+						}
+						continue
+					}
+				}
+				if !uo.Flags.Get(jsonflags.AllowDuplicateNames) && !seenIdxs.insert(uint(f.id)) {
+					// TODO: Unread the object name.
+					return newDuplicateNameError(dec.StackPointer(), nil, dec.InputOffset()-len64(val))
+				}
+
+				// Process the object member value.
+				unmarshal := fieldFncs[f.id].fnc
+				if uo.Unmarshalers != nil {
+					unmarshal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshal, f.typ)
+				}
+				flagsOriginal := uo.Flags
+				if f.string {
+					uo.Flags.Set(jsonflags.StringTag | 1)
+				}
+				if f.format != "" {
+					uo.Flags.Set(jsonflags.FormatTag | 1)
+					uo.Format = f.format
+				}
+				v := alwaysAddressableValue{va.Field(f.index0), va.legacyNotAddressable} // addressable if struct value is addressable
+				if len(f.index) > 0 {
+					v = v.fieldByIndex(f.index, true)
+					if !v.IsValid() {
+						err := newUnmarshalErrorBefore(dec, t, errNilField)
+						if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+							return err
+						}
+						errUnmarshal = cmp.Or(errUnmarshal, err)
+						unmarshal = func(dec *jsontext.Decoder, _ alwaysAddressableValue, _ *jsonopts.Struct) error {
+							return dec.SkipValue()
+						}
+					}
+				}
+				err = unmarshal(dec, v, uo)
+				uo.Flags = flagsOriginal
+				uo.Format = ""
+				if err != nil {
+					if isFatalError(err, uo.Flags) {
+						return err
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+				}
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			return errUnmarshal
+		}
+		return newUnmarshalErrorAfterWithSkipping(dec, t, nil)
+	}
+	return &fnc
+}
+
+// isLegacyEmpty reports whether a value is empty according to the v1 definition.
+func isLegacyEmpty(v reflect.Value) bool {
+	// Equivalent to encoding/json.isEmptyValue@v1.21.0.
+	switch v.Kind() {
+	case reflect.Bool:
+		return v.Bool() == false
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.String, reflect.Map, reflect.Slice, reflect.Array:
+		return v.Len() == 0
+	case reflect.Pointer, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeSliceMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	var (
+		once    sync.Once
+		valFncs *marshaler
+	)
+	init := func() {
+		valFncs = lookupMarshaler(t.Elem())
+	}
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		// Check for cycles.
+		xe := export.Encoder(enc)
+		if xe.Tokens.Depth() > startDetectingCyclesAfter {
+			if err := visitPointer(&xe.SeenPointers, vm.Value, mo); err != nil {
+				return newMarshalErrorBefore(enc, t, err)
+			}
+			defer leavePointer(&xe.SeenPointers, vm.Value)
+		}
+
+		emitNull := mo.Flags.Get(jsonflags.FormatNilSliceAsNull)
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				switch mo.Format {
+				case "emitnull":
+					emitNull = true
+				case "emitempty":
+					emitNull = false
+				default:
+					return newInvalidFormatError(enc, t)
+				}
+			}
+		}
+
+		// Handle empty slices.
+		n := vm.Len()
+		if n == 0 {
+			if emitNull && vm.IsNil() {
+				return enc.WriteToken(jsontext.Null)
+			}
+			// Optimize for marshaling an empty slice without any preceding whitespace.
+			if optimizeCommon && !mo.Flags.Get(jsonflags.AnyWhitespace) && !xe.Tokens.Last.NeedObjectName() {
+				xe.CommitBuffer(append(xe.Tokens.MayAppendDelim(xe.Buf, '['), "[]"...))
+				xe.Tokens.Last.Increment()
+				if xe.NeedFlush() {
+					return xe.Flush()
+				}
+				return nil
+			}
+		}
+
+		once.Do(init)
+		if err := enc.WriteToken(jsontext.BeginArray); err != nil {
+			return err
+		}
+		marshal := valFncs.fnc
+		if mo.Marshalers != nil {
+			marshal, _ = mo.Marshalers.(*Marshalers).lookup(marshal, t.Elem())
+		}
+		for i := range n {
+			v := maybeAddressableValue{vm.Index(i), false} // indexed slice element is always addressable
+			if err := marshal(enc, v, mo); err != nil {
+				return err
+			}
+		}
+		if err := enc.WriteToken(jsontext.EndArray); err != nil {
+			return err
+		}
+		return nil
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeSliceUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	var (
+		once    sync.Once
+		valFncs *unmarshaler
+	)
+	init := func() {
+		valFncs = lookupUnmarshaler(t.Elem())
+	}
+	emptySlice := reflect.MakeSlice(t, 0, 0)
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				switch uo.Format {
+				case "emitnull", "emitempty":
+				default:
+					return newInvalidFormatError(dec, t)
+				}
+			}
+		}
+
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		k := tok.Kind()
+		switch k {
+		case 'n':
+			va.SetZero()
+			return nil
+		case '[':
+			once.Do(init)
+			unmarshal := valFncs.fnc
+			if uo.Unmarshalers != nil {
+				unmarshal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshal, t.Elem())
+			}
+			mustZero := true // we do not know the cleanliness of unused capacity
+			cap := va.Cap()
+			if cap > 0 {
+				va.SetLen(cap)
+			}
+			var i int
+			var errUnmarshal error
+			for dec.PeekKind() != ']' {
+				if i == cap {
+					va.Value.Grow(1)
+					cap = va.Cap()
+					va.SetLen(cap)
+					mustZero = false // reflect.Value.Grow ensures new capacity is zero-initialized
+				}
+				v := alwaysAddressableValue{va.Index(i), false} // indexed slice element is always addressable
+				i++
+				if mustZero && !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+					v.SetZero()
+				}
+				if err := unmarshal(dec, v, uo); err != nil {
+					if isFatalError(err, uo.Flags) {
+						va.SetLen(i)
+						return err
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+				}
+			}
+			if i == 0 {
+				va.Set(emptySlice)
+			} else {
+				va.SetLen(i)
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			return errUnmarshal
+		}
+		return newUnmarshalErrorAfterWithSkipping(dec, t, nil)
+	}
+	return &fnc
+}
+
+var errArrayUnderflow = errors.New("too few array elements")
+var errArrayOverflow = errors.New("too many array elements")
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeArrayMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	var (
+		once    sync.Once
+		valFncs *marshaler
+	)
+	init := func() {
+		valFncs = lookupMarshaler(t.Elem())
+	}
+	n := t.Len()
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			if mo.Flags.Get(jsonflags.StringTag) && !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+		once.Do(init)
+		if err := enc.WriteToken(jsontext.BeginArray); err != nil {
+			return err
+		}
+		marshal := valFncs.fnc
+		if mo.Marshalers != nil {
+			marshal, _ = mo.Marshalers.(*Marshalers).lookup(marshal, t.Elem())
+		}
+		for i := range n {
+			v := maybeAddressableValue{vm.Index(i), vm.legacyNotAddressable} // indexed array element is addressable if array is addressable
+			if err := marshal(enc, v, mo); err != nil {
+				return err
+			}
+		}
+		if err := enc.WriteToken(jsontext.EndArray); err != nil {
+			return err
+		}
+		return nil
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeArrayUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	var (
+		once    sync.Once
+		valFncs *unmarshaler
+	)
+	init := func() {
+		valFncs = lookupUnmarshaler(t.Elem())
+	}
+	n := t.Len()
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			if uo.Flags.Get(jsonflags.StringTag) && !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		k := tok.Kind()
+		switch k {
+		case 'n':
+			if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+				va.SetZero()
+			}
+			return nil
+		case '[':
+			once.Do(init)
+			unmarshal := valFncs.fnc
+			if uo.Unmarshalers != nil {
+				unmarshal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshal, t.Elem())
+			}
+			var i int
+			var errUnmarshal error
+			for dec.PeekKind() != ']' {
+				if i >= n {
+					if err := dec.SkipValue(); err != nil {
+						return err
+					}
+					err = errArrayOverflow
+					continue
+				}
+				v := alwaysAddressableValue{va.Index(i), va.legacyNotAddressable} // indexed array element is addressable if array is addressable
+				if !uo.Flags.Get(jsonflags.MergeWithLegacySemantics) {
+					v.SetZero()
+				}
+				if err := unmarshal(dec, v, uo); err != nil {
+					if isFatalError(err, uo.Flags) {
+						return err
+					}
+					errUnmarshal = cmp.Or(errUnmarshal, err)
+				}
+				i++
+			}
+			for ; i < n; i++ {
+				va.Index(i).SetZero()
+				err = errArrayUnderflow
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			if err != nil && !uo.Flags.Get(jsonflags.UnmarshalArrayFromAnyLength) {
+				return newUnmarshalErrorAfter(dec, t, err)
+			}
+			return errUnmarshal
+		}
+		return newUnmarshalErrorAfterWithSkipping(dec, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makePointerMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	var (
+		once    sync.Once
+		valFncs *marshaler
+	)
+	init := func() {
+		valFncs = lookupMarshaler(t.Elem())
+	}
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		// Check for cycles.
+		xe := export.Encoder(enc)
+		if xe.Tokens.Depth() > startDetectingCyclesAfter {
+			if err := visitPointer(&xe.SeenPointers, vm.Value, mo); err != nil {
+				return newMarshalErrorBefore(enc, t, err)
+			}
+			defer leavePointer(&xe.SeenPointers, vm.Value)
+		}
+
+		// NOTE: Struct.Format is forwarded to underlying marshal.
+		if mo.Flags.Get(jsonflags.StringTag) && mo.Flags.Get(jsonflags.StringifyWithLegacySemantics) && t.Elem().Kind() == reflect.Pointer {
+			if !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+			}
+			mo.Flags.Clear(jsonflags.StringTag) // the `string` tag option does not apply to nested pointers
+		}
+		if vm.IsNil() {
+			return enc.WriteToken(jsontext.Null)
+		}
+		once.Do(init)
+		marshal := valFncs.fnc
+		if mo.Marshalers != nil {
+			marshal, _ = mo.Marshalers.(*Marshalers).lookup(marshal, t.Elem())
+		}
+		v := maybeAddressableValue{vm.Elem(), false} // dereferenced pointer is always addressable
+		return marshal(enc, v, mo)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makePointerUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	var (
+		once    sync.Once
+		valFncs *unmarshaler
+	)
+	init := func() {
+		valFncs = lookupUnmarshaler(t.Elem())
+	}
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		// NOTE: Struct.Format is forwarded to underlying unmarshal.
+		if dec.PeekKind() == 'n' {
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			va.SetZero()
+			return nil
+		}
+		if uo.Flags.Get(jsonflags.StringTag) && uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) && t.Elem().Kind() == reflect.Pointer {
+			if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+			}
+			uo.Flags.Clear(jsonflags.StringTag) // the `string` tag option does not apply to nested pointers
+		}
+		once.Do(init)
+		unmarshal := valFncs.fnc
+		if uo.Unmarshalers != nil {
+			unmarshal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshal, t.Elem())
+		}
+		if va.IsNil() {
+			va.Set(reflect.New(t.Elem()))
+		}
+		v := alwaysAddressableValue{va.Elem(), false} // dereferenced pointer is always addressable
+		if err := unmarshal(dec, v, uo); err != nil {
+			return err
+		}
+		if uo.Flags.Get(jsonflags.StringTag) && uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+			// A JSON null quoted within a JSON string should take effect
+			// within the pointer value, rather than the indirect value.
+			//
+			// TODO: This does not correctly handle escaped nulls
+			// (e.g., "\u006e\u0075\u006c\u006c"), but is good enough
+			// for such an esoteric use case of the `string` option.
+			if string(export.Decoder(dec).PreviousTokenOrValue()) == `"null"` {
+				va.SetZero()
+			}
+		}
+		return nil
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeInterfaceMarshaler(t reflect.Type) *marshaler {
+	// NOTE: Values retrieved from an interface are not addressable.
+	// Marshal passes them through as is, and the marshaler for the
+	// underlying type copies them only if it needs an address.
+
+	var fnc marshaler
+	var whichMarshaler reflect.Type
+	for _, iface := range allMarshalerTypes {
+		if t.Implements(iface) {
+			whichMarshaler = iface
+			break
+		}
+	}
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		if mo.Flags.Has(jsonflags.TagFlags) {
+			if mo.Flags.Get(jsonflags.StringTag) {
+				if !mo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+					return newMarshalErrorBefore(enc, t, errInvalidStringTag)
+				}
+				if mo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+					mo.Flags.Clear(jsonflags.StringTag) // the `string` tag option does not apply to interface types
+				}
+			}
+			if mo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(enc, t)
+			}
+		}
+		if vm.IsNil() {
+			return enc.WriteToken(jsontext.Null)
+		} else if mo.Flags.Get(jsonflags.CallMethodsWithLegacySemantics) && whichMarshaler != nil {
+			// The marshaler for a pointer never calls the method on a nil receiver.
+			// Wrap the nil pointer within a struct type so that marshal
+			// instead appears on a value receiver and may be called.
+			if vm.Elem().Kind() == reflect.Pointer && vm.Elem().IsNil() {
+				va := newAddressableValue(whichMarshaler)
+				switch whichMarshaler {
+				case jsonMarshalerToType:
+					va.Set(reflect.ValueOf(struct{ MarshalerTo }{vm.Elem().Interface().(MarshalerTo)}))
+				case jsonMarshalerType:
+					va.Set(reflect.ValueOf(struct{ Marshaler }{vm.Elem().Interface().(Marshaler)}))
+				case textAppenderType:
+					va.Set(reflect.ValueOf(struct{ encoding.TextAppender }{vm.Elem().Interface().(encoding.TextAppender)}))
+				case textMarshalerType:
+					va.Set(reflect.ValueOf(struct{ encoding.TextMarshaler }{vm.Elem().Interface().(encoding.TextMarshaler)}))
+				}
+				vm = maybeAddressableValue(va)
+			}
+		}
+		// Optimize for the any type if there are no special options.
+		if optimizeCommon &&
+			t == anyType && !mo.Flags.Get(jsonflags.StringifyNumbers|jsonflags.TagFlags) &&
+			(mo.Marshalers == nil || !mo.Marshalers.(*Marshalers).fromAny) {
+			return marshalValueAny(enc, vm.Elem().Interface(), mo)
+		}
+		ve := maybeAddressableValue{vm.Elem(), true} // values retrieved from an interface are not addressable
+		marshal := lookupMarshaler(ve.Type()).fnc
+		if mo.Marshalers != nil {
+			marshal, _ = mo.Marshalers.(*Marshalers).lookup(marshal, ve.Type())
+		}
+		return marshal(enc, ve, mo)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeInterfaceUnmarshaler(t reflect.Type) *unmarshaler {
+	// NOTE: Values retrieved from an interface are not addressable,
+	// so we shallow copy the values to make them addressable and
+	// store them back into the interface afterwards.
+
+	var fnc unmarshaler
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		if uo.Flags.Has(jsonflags.TagFlags) {
+			if uo.Flags.Get(jsonflags.StringTag) {
+				if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+					return newUnmarshalErrorBeforeWithSkipping(dec, t, errInvalidStringTag)
+				}
+				if uo.Flags.Get(jsonflags.StringifyWithLegacySemantics) {
+					uo.Flags.Clear(jsonflags.StringTag) // the `string` tag option does not apply to interface types
+				}
+			}
+			if uo.Flags.Has(jsonflags.FormatTag) {
+				return newInvalidFormatError(dec, t)
+			}
+		}
+		if uo.Flags.Get(jsonflags.MergeWithLegacySemantics) && !va.IsNil() {
+			// Legacy merge behavior is difficult to explain.
+			// In general, it only merges for non-nil pointer kinds.
+			// As a special case, unmarshaling a JSON null into a pointer
+			// sets a concrete nil pointer of the underlying type
+			// (rather than setting the interface value itself to nil).
+			e := va.Elem()
+			if e.Kind() == reflect.Pointer && !e.IsNil() {
+				if dec.PeekKind() == 'n' && e.Elem().Kind() == reflect.Pointer {
+					if _, err := dec.ReadToken(); err != nil {
+						return err
+					}
+					va.Elem().Elem().SetZero()
+					return nil
+				}
+			} else {
+				va.SetZero()
+			}
+		}
+		if dec.PeekKind() == 'n' {
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			va.SetZero()
+			return nil
+		}
+		var v alwaysAddressableValue
+		if va.IsNil() {
+			// Optimize for the any type if there are no special options.
+			// We do not care about stringified numbers since JSON strings
+			// are always unmarshaled into an any value as Go strings.
+			// Duplicate name check must be enforced since unmarshalValueAny
+			// does not implement merge semantics.
+			if optimizeCommon &&
+				t == anyType && !uo.Flags.Get(jsonflags.AllowDuplicateNames|jsonflags.FormatTag) &&
+				(uo.Unmarshalers == nil || !uo.Unmarshalers.(*Unmarshalers).fromAny) {
+				v, err := unmarshalValueAny(dec, uo)
+				// We must check for nil interface values up front.
+				// See https://go.dev/issue/52310.
+				if v != nil {
+					va.Set(reflect.ValueOf(v))
+				}
+				return err
+			}
+
+			k := dec.PeekKind()
+			if !isAnyType(t) {
+				return newUnmarshalErrorBeforeWithSkipping(dec, t, internal.ErrNilInterface)
+			}
+			switch k {
+			case 'f', 't':
+				v = newAddressableValue(boolType)
+			case '"':
+				v = newAddressableValue(stringType)
+			case '0':
+				if uo.Flags.Get(jsonflags.UnmarshalAnyWithRawNumber) {
+					v = alwaysAddressableValue{reflect.ValueOf(internal.NewRawNumber()).Elem(), true}
+				} else {
+					v = newAddressableValue(float64Type)
+				}
+			case '{':
+				v = newAddressableValue(mapStringAnyType)
+			case '[':
+				v = newAddressableValue(sliceAnyType)
+			default:
+				// If k is invalid (e.g., due to an I/O or syntax error), then
+				// that will be cached by PeekKind and returned by ReadValue.
+				// If k is '}' or ']', then ReadValue must error since
+				// those are invalid kinds at the start of a JSON value.
+				_, err := dec.ReadValue()
+				return err
+			}
+		} else {
+			// Shallow copy the existing value to keep it addressable.
+			// Any mutations at the top-level of the value will be observable
+			// since we always store this value back into the interface value.
+			v = newAddressableValue(va.Elem().Type())
+			v.Set(va.Elem())
+		}
+		unmarshal := lookupUnmarshaler(v.Type()).fnc
+		if uo.Unmarshalers != nil {
+			unmarshal, _ = uo.Unmarshalers.(*Unmarshalers).lookup(unmarshal, v.Type())
+		}
+		err := unmarshal(dec, v, uo)
+		va.Set(v.Value)
+		return err
+	}
+	return &fnc
+}
+
+// isAnyType reports whether t is equivalent to the any interface type.
+func isAnyType(t reflect.Type) bool {
+	// This is forward compatible if the Go language permits type sets within
+	// ordinary interfaces where an interface with zero methods does not
+	// necessarily mean it can hold every possible Go type.
+	// See https://go.dev/issue/45346.
+	return t == anyType || anyType.Implements(t)
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeInvalidMarshaler(t reflect.Type) *marshaler {
+	var fnc marshaler
+	fnc.fnc = func(enc *jsontext.Encoder, vm maybeAddressableValue, mo *jsonopts.Struct) error {
+		return newMarshalErrorBefore(enc, t, nil)
+	}
+	return &fnc
+}
+
+// TODO(go.dev/issue/81380): Inlining this function prevents the closures
+// below from being analyzed for inlining.
+// This is purposefully and temporarily ugly while waiting for #81380.
+//
+//go:noinline
+func makeInvalidUnmarshaler(t reflect.Type) *unmarshaler {
+	var fnc unmarshaler
+	fnc.fnc = func(dec *jsontext.Decoder, va alwaysAddressableValue, uo *jsonopts.Struct) error {
+		// Under legacy error semantics, unmarshal continues on even with errors.
+		// Thus, always consume the value first.
+		// As a special-case, null is permitted for unsupported types.
+		if uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
+			switch val, err := dec.ReadValue(); {
+			case err != nil:
+				return err
+			case val.Kind() == 'n':
+				return nil
+			default:
+				return newUnmarshalErrorAfter(dec, t, nil)
+			}
+		}
+		return newUnmarshalErrorBefore(dec, t, nil)
+	}
+	return &fnc
+}
+
+func stringOrNumberKind(isString bool) jsontext.Kind {
+	if isString {
+		return '"'
+	} else {
+		return '0'
+	}
+}
+
+type uintSet64 uint64
+
+func (s uintSet64) has(i uint) bool { return s&(1<<i) > 0 }
+func (s *uintSet64) set(i uint)     { *s |= 1 << i }
+
+// uintSet is a set of unsigned integers.
+// It is optimized for most integers being close to zero.
+type uintSet struct {
+	lo uintSet64
+	hi []uintSet64
+}
+
+// has reports whether i is in the set.
+func (s *uintSet) has(i uint) bool {
+	if i < 64 {
+		return s.lo.has(i)
+	} else {
+		i -= 64
+		iHi, iLo := int(i/64), i%64
+		return iHi < len(s.hi) && s.hi[iHi].has(iLo)
+	}
+}
+
+// insert inserts i into the set and reports whether it was the first insertion.
+func (s *uintSet) insert(i uint) bool {
+	// TODO: Make this inlinable at least for the lower 64-bit case.
+	if i < 64 {
+		has := s.lo.has(i)
+		s.lo.set(i)
+		return !has
+	} else {
+		i -= 64
+		iHi, iLo := int(i/64), i%64
+		if iHi >= len(s.hi) {
+			s.hi = append(s.hi, make([]uintSet64, iHi+1-len(s.hi))...)
+			s.hi = s.hi[:cap(s.hi)]
+		}
+		has := s.hi[iHi].has(iLo)
+		s.hi[iHi].set(iLo)
+		return !has
+	}
+}

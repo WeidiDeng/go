@@ -58,11 +58,12 @@ func ExampleValues() {
 	v.Add("friend", "Jess")
 	v.Add("friend", "Sarah")
 	v.Add("friend", "Zoe")
-	// v.Encode() == "name=Ava&friend=Jess&friend=Sarah&friend=Zoe"
+	fmt.Println(v.Encode())
 	fmt.Println(v.Get("name"))
 	fmt.Println(v.Get("friend"))
 	fmt.Println(v["friend"])
 	// Output:
+	// friend=Jess&friend=Sarah&friend=Zoe&name=Ava
 	// Ava
 	// Jess
 	// [Jess Sarah Zoe]
@@ -199,6 +200,15 @@ func ExampleParseQuery() {
 	// {"x":["1"], "y":["2", "3"]}
 }
 
+func ExampleMustParse() {
+	u := url.MustParse("https://example.com")
+	u.Path = "/search"
+	u.RawQuery = "q=golang"
+	fmt.Println(u)
+	// Output:
+	// https://example.com/search?q=golang
+}
+
 func ExampleURL_EscapedPath() {
 	u, err := url.Parse("http://example.com/x/y%2Fz")
 	if err != nil {
@@ -251,6 +261,18 @@ func ExampleURL_IsAbs() {
 	// Output:
 	// false
 	// true
+}
+
+func ExampleURL_JoinPath() {
+	u, err := url.Parse("https://example.com/foo/bar")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println(u.JoinPath("baz", "qux"))
+
+	// Output:
+	// https://example.com/foo/bar/baz/qux
 }
 
 func ExampleURL_MarshalBinary() {

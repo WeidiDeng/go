@@ -200,12 +200,22 @@ var mulRangesZ = []struct {
 			"638952175999932299156089414639761565182862536979208272237582" +
 			"511852109168640000000000000000000000", // -99!
 	},
+
+	// overflow situations
+	{math.MaxInt64 - 0, math.MaxInt64, "9223372036854775807"},
+	{math.MaxInt64 - 1, math.MaxInt64, "85070591730234615838173535747377725442"},
+	{math.MaxInt64 - 2, math.MaxInt64, "784637716923335094969050127519550606919189611815754530810"},
+	{math.MaxInt64 - 3, math.MaxInt64, "7237005577332262206126809393809643289012107973151163787181513908099760521240"},
 }
 
 func TestMulRangeZ(t *testing.T) {
 	var tmp Int
 	// test entirely positive ranges
 	for i, r := range mulRangesN {
+		// skip mulRangesN entries that overflow int64
+		if int64(r.a) < 0 || int64(r.b) < 0 {
+			continue
+		}
 		prod := tmp.MulRange(int64(r.a), int64(r.b)).String()
 		if prod != r.prod {
 			t.Errorf("#%da: got %s; want %s", i, prod, r.prod)
@@ -245,6 +255,7 @@ func TestBinomial(t *testing.T) {
 		{100, 90, "17310309456440"},
 		{1000, 10, "263409560461970212832400"},
 		{1000, 990, "263409560461970212832400"},
+		{5, -1, "0"},
 	} {
 		if got := z.Binomial(test.n, test.k).String(); got != test.want {
 			t.Errorf("Binomial(%d, %d) = %s; want %s", test.n, test.k, got, test.want)
@@ -254,7 +265,7 @@ func TestBinomial(t *testing.T) {
 
 func BenchmarkBinomial(b *testing.B) {
 	var z Int
-	for i := b.N - 1; i >= 0; i-- {
+	for i := 0; i < b.N; i++ {
 		z.Binomial(1000, 990)
 	}
 }
@@ -494,6 +505,124 @@ func BenchmarkQuoRem(b *testing.B) {
 	}
 }
 
+func TestIntDivide(t *testing.T) {
+	x := new(Int)
+	y := new(Int)
+	q := new(Int)
+	r := new(Int)
+	f := new(Int)
+	qGot := new(Int)
+	rGot := new(Int)
+
+	check := func(i, j, q_ int64, mode RoundingMode, modeName string) {
+		x.SetInt64(i)
+		y.SetInt64(j)
+		q.SetInt64(q_)
+		r.SetInt64(i - j*q_)
+
+		// The quotient remains the same irrespective of scaling factor f,
+		// everything else gets scaled by f; f is set by the caller.
+		x.Mul(x, f)
+		y.Mul(y, f)
+		r.Mul(r, f)
+
+		qGot, rGot = qGot.Divide(x, y, rGot, mode)
+		if qGot.Cmp(q) != 0 || rGot.Cmp(r) != 0 {
+			t.Errorf("%v(%v/%v): got q = %v, r = %v; want q = %v, r = %v", modeName, x, y, qGot, rGot, q, r)
+		}
+
+		// nil remainder result
+		qGot, _ = qGot.Divide(x, y, nil, mode)
+		if qGot.Cmp(q) != 0 {
+			t.Errorf("%v(%v/%v): got q = %v; want q = %v", modeName, x, y, qGot, q)
+		}
+
+		// nil quotient result
+		_, rGot = (*Int)(nil).Divide(x, y, rGot, mode)
+		if rGot.Cmp(r) != 0 {
+			t.Errorf("%v(%v/%v): got r = %v; want r = %v", modeName, x, y, rGot, r)
+		}
+
+		// nil quotient and remainder must not panic
+		(*Int)(nil).Divide(x, y, nil, mode)
+	}
+
+	// test each case with different scaling factors f
+	for _, s := range []string{
+		"1",
+		"1234",
+		"99991",
+		"1234567890",
+		"12345678901234567890",
+	} {
+		f.SetString(s, 10)
+		const n int64 = 10
+		for i := -n; i <= n; i++ {
+			for j := -n; j <= n; j++ {
+				if j == 0 {
+					continue
+				}
+				z := float64(i) / float64(j)
+				check(i, j, i/j, Trunc, "trunc") // T-division is regular Go integer division
+				check(i, j, int64(math.Trunc(z)), Trunc, "trunc")
+				check(i, j, int64(math.Floor(z)), Floor, "floor")
+				check(i, j, int64(math.Ceil(z)), Ceil, "ceil")
+				check(i, j, int64(math.RoundToEven(z)), Round, "round")
+			}
+		}
+	}
+}
+
+func TestIntDivideRemainderAliasingDivisor(t *testing.T) {
+	tests := []struct {
+		name       string
+		x, y, q, r int64
+		mode       RoundingMode
+	}{
+		{"trunc", 5, 3, 1, 2, Trunc},
+		{"ceil", 5, 3, 2, -1, Ceil},
+		{"floor", -5, 3, -2, 1, Floor},
+		{"round", 2, 3, 1, -1, Round},
+	}
+
+	for _, test := range tests {
+		for _, scaleString := range []string{"1", "12345678901234567890"} {
+			t.Run(test.name+"/scale="+scaleString, func(t *testing.T) {
+				scale, ok := new(Int).SetString(scaleString, 10)
+				if !ok {
+					t.Fatal("invalid test scale")
+				}
+				x := new(Int).Mul(NewInt(test.x), scale)
+				y := new(Int).Mul(NewInt(test.y), scale)
+				wantQ := NewInt(test.q)
+				wantR := new(Int).Mul(NewInt(test.r), scale)
+
+				gotQ, gotR := new(Int).Divide(x, y, y, test.mode)
+				if gotQ.Cmp(wantQ) != 0 || gotR.Cmp(wantR) != 0 {
+					t.Fatalf("Divide(%v, %v, y, %v) = (%v, %v); want (%v, %v)", x, test.y, test.mode, gotQ, gotR, wantQ, wantR)
+				}
+
+				y.Mul(NewInt(test.y), scale)
+				_, gotR = (*Int)(nil).Divide(x, y, y, test.mode)
+				if gotR.Cmp(wantR) != 0 {
+					t.Fatalf("Divide(%v, %v, y, %v) with nil quotient returned remainder %v; want %v", x, test.y, test.mode, gotR, wantR)
+				}
+			})
+		}
+	}
+
+	t.Run("shared backing array", func(t *testing.T) {
+		x := NewInt(5)
+		y := NewInt(3)
+		r := new(Int).SetBits(y.Bits())
+
+		gotQ, gotR := new(Int).Divide(x, y, r, Ceil)
+		if gotQ.Cmp(NewInt(2)) != 0 || gotR.Cmp(NewInt(-1)) != 0 {
+			t.Fatalf("Divide(5, 3, r, Ceil) = (%v, %v); want (2, -1)", gotQ, gotR)
+		}
+	})
+}
+
 var bitLenTests = []struct {
 	in  string
 	out int
@@ -658,6 +787,41 @@ func BenchmarkExp(b *testing.B) {
 	out := new(Int)
 	for i := 0; i < b.N; i++ {
 		out.Exp(x, y, n)
+	}
+}
+
+func BenchmarkExpMont(b *testing.B) {
+	x, _ := new(Int).SetString("297778224889315382157302278696111964193", 0)
+	y, _ := new(Int).SetString("2548977943381019743024248146923164919440527843026415174732254534318292492375775985739511369575861449426580651447974311336267954477239437734832604782764979371984246675241012538135715981292390886872929238062252506842498360562303324154310849745753254532852868768268023732398278338025070694508489163836616810661033068070127919590264734220833816416141878688318329193389865030063416339367925710474801991305827284114894677717927892032165200876093838921477120036402410731159852999623461591709308405270748511350289172153076023215", 0)
+	var mods = []struct {
+		name string
+		val  string
+	}{
+		{"Odd", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF"},
+		{"Even1", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FE"},
+		{"Even2", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FC"},
+		{"Even3", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281F8"},
+		{"Even4", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281F0"},
+		{"Even8", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B21828100"},
+		{"Even32", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B00000000"},
+		{"Even64", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828282828200FF0000000000000000"},
+		{"Even96", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF82828283000000000000000000000000"},
+		{"Even128", "0x82828282828200FFFF28FF2B218281FF82828282828200FFFF28FF2B218281FF00000000000000000000000000000000"},
+		{"Even255", "0x82828282828200FFFF28FF2B218281FF8000000000000000000000000000000000000000000000000000000000000000"},
+		{"SmallEven1", "0x7E"},
+		{"SmallEven2", "0x7C"},
+		{"SmallEven3", "0x78"},
+		{"SmallEven4", "0x70"},
+	}
+	for _, mod := range mods {
+		n, _ := new(Int).SetString(mod.val, 0)
+		out := new(Int)
+		b.Run(mod.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				out.Exp(x, y, n)
+			}
+		})
 	}
 }
 
@@ -1390,7 +1554,6 @@ func BenchmarkBitset(b *testing.B) {
 	z := new(Int)
 	z.SetBit(z, 512, 1)
 	b.ResetTimer()
-	b.StartTimer()
 	for i := b.N - 1; i >= 0; i-- {
 		z.SetBit(z, i&512, 1)
 	}
@@ -1400,7 +1563,6 @@ func BenchmarkBitsetNeg(b *testing.B) {
 	z := NewInt(-1)
 	z.SetBit(z, 512, 0)
 	b.ResetTimer()
-	b.StartTimer()
 	for i := b.N - 1; i >= 0; i-- {
 		z.SetBit(z, i&512, 0)
 	}
@@ -1410,7 +1572,6 @@ func BenchmarkBitsetOrig(b *testing.B) {
 	z := new(Int)
 	altSetBit(z, z, 512, 1)
 	b.ResetTimer()
-	b.StartTimer()
 	for i := b.N - 1; i >= 0; i-- {
 		altSetBit(z, z, i&512, 1)
 	}
@@ -1420,7 +1581,6 @@ func BenchmarkBitsetNegOrig(b *testing.B) {
 	z := NewInt(-1)
 	altSetBit(z, z, 512, 0)
 	b.ResetTimer()
-	b.StartTimer()
 	for i := b.N - 1; i >= 0; i-- {
 		altSetBit(z, z, i&512, 0)
 	}
@@ -1573,7 +1733,7 @@ func TestModInverse(t *testing.T) {
 
 func BenchmarkModInverse(b *testing.B) {
 	p := new(Int).SetInt64(1) // Mersenne prime 2**1279 -1
-	p.abs = p.abs.shl(p.abs, 1279)
+	p.abs = p.abs.lsh(p.abs, 1279)
 	p.Sub(p, intOne)
 	x := new(Int).Sub(p, intOne)
 	z := new(Int)
@@ -1868,7 +2028,7 @@ func TestFillBytes(t *testing.T) {
 		"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	} {
 		t.Run(n, func(t *testing.T) {
-			t.Logf(n)
+			t.Log(n)
 			x, ok := new(Int).SetString(n, 0)
 			if !ok {
 				panic("invalid test entry")
@@ -1917,6 +2077,55 @@ func TestNewIntAllocs(t *testing.T) {
 		})
 		if got != 0 {
 			t.Errorf("x.Add(x, NewInt(%d)), wanted 0 allocations, got %f", n, got)
+		}
+	}
+}
+
+func TestFloat64(t *testing.T) {
+	for _, test := range []struct {
+		istr string
+		f    float64
+		acc  Accuracy
+	}{
+		{"-1000000000000000000000000000000000000000000000000000000", -1000000000000000078291540404596243842305360299886116864.000000, Below},
+		{"-9223372036854775809", math.MinInt64, Above},
+		{"-9223372036854775808", -9223372036854775808, Exact}, // -2^63
+		{"-9223372036854775807", -9223372036854775807, Below},
+		{"-18014398509481985", -18014398509481984.000000, Above},
+		{"-18014398509481984", -18014398509481984.000000, Exact}, // -2^54
+		{"-18014398509481983", -18014398509481984.000000, Below},
+		{"-9007199254740993", -9007199254740992.000000, Above},
+		{"-9007199254740992", -9007199254740992.000000, Exact}, // -2^53
+		{"-9007199254740991", -9007199254740991.000000, Exact},
+		{"-4503599627370497", -4503599627370497.000000, Exact},
+		{"-4503599627370496", -4503599627370496.000000, Exact}, // -2^52
+		{"-4503599627370495", -4503599627370495.000000, Exact},
+		{"-12345", -12345, Exact},
+		{"-1", -1, Exact},
+		{"0", 0, Exact},
+		{"1", 1, Exact},
+		{"12345", 12345, Exact},
+		{"0x1010000000000000", 0x1010000000000000, Exact}, // >2^53 but exact nonetheless
+		{"9223372036854775807", 9223372036854775808, Above},
+		{"9223372036854775808", 9223372036854775808, Exact}, // +2^63
+		{"1000000000000000000000000000000000000000000000000000000", 1000000000000000078291540404596243842305360299886116864.000000, Above},
+	} {
+		i, ok := new(Int).SetString(test.istr, 0)
+		if !ok {
+			t.Errorf("SetString(%s) failed", test.istr)
+			continue
+		}
+
+		// Test against expectation.
+		f, acc := i.Float64()
+		if f != test.f || acc != test.acc {
+			t.Errorf("%s: got %f (%s); want %f (%s)", test.istr, f, acc, test.f, test.acc)
+		}
+
+		// Cross-check the fast path against the big.Float implementation.
+		f2, acc2 := new(Float).SetInt(i).Float64()
+		if f != f2 || acc != acc2 {
+			t.Errorf("%s: got %f (%s); Float.Float64 gives %f (%s)", test.istr, f, acc, f2, acc2)
 		}
 	}
 }

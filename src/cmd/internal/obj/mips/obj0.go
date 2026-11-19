@@ -31,16 +31,16 @@ package mips
 
 import (
 	"cmd/internal/obj"
-	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"encoding/binary"
 	"fmt"
+	"internal/abi"
 	"log"
 	"math"
 )
 
 func progedit(ctxt *obj.Link, p *obj.Prog, newprog obj.ProgAlloc) {
-	c := ctxt0{ctxt: ctxt, newprog: newprog}
+	c := ctxt0{ctxt: ctxt}
 
 	p.From.Class = 0
 	p.To.Class = 0
@@ -267,7 +267,6 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	var q1 *obj.Prog
 	autosize := int32(0)
 	var p1 *obj.Prog
-	var p2 *obj.Prog
 	for p := c.cursym.Func().Text; p != nil; p = p.Link {
 		o := p.As
 		switch o {
@@ -359,99 +358,19 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				q.To.Reg = REGSP
 			}
 
-			if c.cursym.Func().Text.From.Sym.Wrapper() && c.cursym.Func().Text.Mark&LEAF == 0 {
-				// if(g->panic != nil && g->panic->argp == FP) g->panic->argp = bottom-of-frame
-				//
-				//	MOV	g_panic(g), R1
-				//	BEQ	R1, end
-				//	MOV	panic_argp(R1), R2
-				//	ADD	$(autosize+FIXED_FRAME), R29, R3
-				//	BNE	R2, R3, end
-				//	ADD	$FIXED_FRAME, R29, R2
-				//	MOV	R2, panic_argp(R1)
-				// end:
-				//	NOP
-				//
-				// The NOP is needed to give the jumps somewhere to land.
-				// It is a liblink NOP, not an mips NOP: it encodes to 0 instruction bytes.
-				//
-				// We don't generate this for leafs because that means the wrapped
-				// function was inlined into the wrapper.
-
-				q = obj.Appendp(q, newprog)
-
-				q.As = mov
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REGG
-				q.From.Offset = 4 * int64(c.ctxt.Arch.PtrSize) // G.panic
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R1
-
-				q = obj.Appendp(q, newprog)
-				q.As = ABEQ
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R1
-				q.To.Type = obj.TYPE_BRANCH
-				q.Mark |= BRANCH
-				p1 = q
-
-				q = obj.Appendp(q, newprog)
-				q.As = mov
-				q.From.Type = obj.TYPE_MEM
-				q.From.Reg = REG_R1
-				q.From.Offset = 0 // Panic.argp
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R2
-
-				q = obj.Appendp(q, newprog)
-				q.As = add
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = int64(autosize) + ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R3
-
-				q = obj.Appendp(q, newprog)
-				q.As = ABNE
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R2
-				q.Reg = REG_R3
-				q.To.Type = obj.TYPE_BRANCH
-				q.Mark |= BRANCH
-				p2 = q
-
-				q = obj.Appendp(q, newprog)
-				q.As = add
-				q.From.Type = obj.TYPE_CONST
-				q.From.Offset = ctxt.Arch.FixedFrameSize
-				q.Reg = REGSP
-				q.To.Type = obj.TYPE_REG
-				q.To.Reg = REG_R2
-
-				q = obj.Appendp(q, newprog)
-				q.As = mov
-				q.From.Type = obj.TYPE_REG
-				q.From.Reg = REG_R2
-				q.To.Type = obj.TYPE_MEM
-				q.To.Reg = REG_R1
-				q.To.Offset = 0 // Panic.argp
-
-				q = obj.Appendp(q, newprog)
-
-				q.As = obj.ANOP
-				p1.To.SetTarget(q)
-				p2.To.SetTarget(q)
-			}
-
 		case ARET:
 			if p.From.Type == obj.TYPE_CONST {
 				ctxt.Diag("using BECOME (%v) is not supported!", p)
 				break
 			}
 
-			retSym := p.To.Sym
+			retSym, retReg := p.To.Sym, p.To.Reg
+			if retReg == obj.REG_NONE {
+				retReg = REGLINK
+			}
 			p.To.Name = obj.NAME_NONE // clear fields as we may modify p to other instruction
 			p.To.Sym = nil
+			p.To.Reg = obj.REG_NONE
 
 			if c.cursym.Func().Text.Mark&LEAF != 0 {
 				if autosize == 0 {
@@ -463,7 +382,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 						p.To.Sym = retSym
 					} else {
 						p.To.Type = obj.TYPE_MEM
-						p.To.Reg = REGLINK
+						p.To.Reg = retReg
 						p.To.Offset = 0
 					}
 					p.Mark |= BRANCH
@@ -486,7 +405,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 					q.To.Sym = retSym
 				} else {
 					q.To.Type = obj.TYPE_MEM
-					q.To.Reg = REGLINK
+					q.To.Reg = retReg
 					q.To.Offset = 0
 				}
 				q.Mark |= BRANCH
@@ -528,7 +447,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 			} else {
 				q1.To.Type = obj.TYPE_MEM
 				q1.To.Offset = 0
-				q1.To.Reg = REGLINK
+				q1.To.Reg = retReg
 			}
 			q1.Mark |= BRANCH
 			q1.Spadj = +autosize
@@ -560,8 +479,8 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 
 		if p.To.Type == obj.TYPE_REG && p.To.Reg == REGSP && p.Spadj == 0 {
 			f := c.cursym.Func()
-			if f.FuncFlag&objabi.FuncFlag_SPWRITE == 0 {
-				c.cursym.Func().FuncFlag |= objabi.FuncFlag_SPWRITE
+			if f.FuncFlag&abi.FuncFlagSPWrite == 0 {
+				c.cursym.Func().FuncFlag |= abi.FuncFlagSPWrite
 				if ctxt.Debugvlog || !ctxt.IsAsm {
 					ctxt.Logf("auto-SPWRITE: %s %v\n", c.cursym.Name, p)
 					if !ctxt.IsAsm {
@@ -774,7 +693,7 @@ func (c *ctxt0) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	p = c.ctxt.StartUnsafePoint(p, c.newprog)
 
 	var q *obj.Prog
-	if framesize <= objabi.StackSmall {
+	if framesize <= abi.StackSmall {
 		// small stack: SP < stackguard
 		//	AGTU	SP, stackguard, R1
 		p = obj.Appendp(p, c.newprog)
@@ -787,8 +706,8 @@ func (c *ctxt0) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 		p.To.Reg = REG_R1
 	} else {
 		// large stack: SP-framesize < stackguard-StackSmall
-		offset := int64(framesize) - objabi.StackSmall
-		if framesize > objabi.StackBig {
+		offset := int64(framesize) - abi.StackSmall
+		if framesize > abi.StackBig {
 			// Such a large stack we need to protect against underflow.
 			// The runtime guarantees SP > objabi.StackBig, but
 			// framesize is large enough that SP-framesize may

@@ -6,7 +6,10 @@
 package base32
 
 import (
+	"internal/byteorder"
 	"io"
+	"math"
+	"slices"
 	"strconv"
 )
 
@@ -19,15 +22,18 @@ import (
 // introduced for SASL GSSAPI and standardized in RFC 4648.
 // The alternate "base32hex" encoding is used in DNSSEC.
 type Encoding struct {
-	encode    [32]byte
-	decodeMap [256]byte
+	encode    [32]byte   // mapping of symbol index to symbol byte value
+	decodeMap [256]uint8 // mapping of symbol byte value to symbol index
 	padChar   rune
 }
 
 const (
-	StdPadding          rune = '=' // Standard padding character
-	NoPadding           rune = -1  // No padding
-	decodeMapInitialize      = "" +
+	StdPadding rune = '=' // Standard padding character
+	NoPadding  rune = -1  // No padding
+)
+
+const (
+	decodeMapInitialize = "" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
@@ -44,13 +50,16 @@ const (
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" +
 		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+	invalidIndex = '\xff'
 )
 
-const encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-const encodeHex = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
-
-// NewEncoding returns a new Encoding defined by the given alphabet,
-// which must be a 32-byte string.
+// NewEncoding returns a new padded Encoding defined by the given alphabet,
+// which must be a 32-byte string that contains unique byte values and
+// does not contain the padding character or CR / LF ('\r', '\n').
+// The alphabet is treated as a sequence of byte values
+// without any special treatment for multi-byte UTF-8.
+// The resulting Encoding uses the default padding character ('='),
+// which may be changed or disabled via [Encoding.WithPadding].
 func NewEncoding(encoder string) *Encoding {
 	if len(encoder) != 32 {
 		panic("encoding alphabet is not 32-bytes long")
@@ -62,35 +71,41 @@ func NewEncoding(encoder string) *Encoding {
 	copy(e.decodeMap[:], decodeMapInitialize)
 
 	for i := 0; i < len(encoder); i++ {
-		e.decodeMap[encoder[i]] = byte(i)
+		// Note: While we document that the alphabet cannot contain
+		// the padding character, we do not enforce it since we do not know
+		// if the caller intends to switch the padding from StdPadding later.
+		switch {
+		case encoder[i] == '\n' || encoder[i] == '\r':
+			panic("encoding alphabet contains newline character")
+		case e.decodeMap[encoder[i]] != invalidIndex:
+			panic("encoding alphabet includes duplicate symbols")
+		}
+		e.decodeMap[encoder[i]] = uint8(i)
 	}
 	return e
 }
 
-// StdEncoding is the standard base32 encoding, as defined in
-// RFC 4648.
-var StdEncoding = NewEncoding(encodeStd)
+// StdEncoding is the standard base32 encoding, as defined in RFC 4648.
+var StdEncoding = NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
 
 // HexEncoding is the “Extended Hex Alphabet” defined in RFC 4648.
 // It is typically used in DNS.
-var HexEncoding = NewEncoding(encodeHex)
+var HexEncoding = NewEncoding("0123456789ABCDEFGHIJKLMNOPQRSTUV")
 
 // WithPadding creates a new encoding identical to enc except
 // with a specified padding character, or NoPadding to disable padding.
-// The padding character must not be '\r' or '\n', must not
-// be contained in the encoding's alphabet and must be a rune equal or
-// below '\xff'.
+// The padding character must not be '\r' or '\n',
+// must not be contained in the encoding's alphabet,
+// must not be negative, and must be a rune equal or below '\xff'.
+// Padding characters above '\x7f' are encoded as their exact byte value
+// rather than using the UTF-8 representation of the codepoint.
 func (enc Encoding) WithPadding(padding rune) *Encoding {
-	if padding == '\r' || padding == '\n' || padding > 0xff {
+	switch {
+	case padding < NoPadding || padding == '\r' || padding == '\n' || padding > 0xff:
 		panic("invalid padding")
+	case padding != NoPadding && enc.decodeMap[byte(padding)] != invalidIndex:
+		panic("padding contained in alphabet")
 	}
-
-	for i := 0; i < len(enc.encode); i++ {
-		if rune(enc.encode[i]) == padding {
-			panic("padding contained in alphabet")
-		}
-	}
-
 	enc.padChar = padding
 	return &enc
 }
@@ -99,85 +114,85 @@ func (enc Encoding) WithPadding(padding rune) *Encoding {
  * Encoder
  */
 
-// Encode encodes src using the encoding enc, writing
-// EncodedLen(len(src)) bytes to dst.
+// Encode encodes src using the encoding enc,
+// writing [Encoding.EncodedLen](len(src)) bytes to dst.
 //
 // The encoding pads the output to a multiple of 8 bytes,
 // so Encode is not appropriate for use on individual blocks
-// of a large data stream. Use NewEncoder() instead.
+// of a large data stream. Use [NewEncoder] instead.
 func (enc *Encoding) Encode(dst, src []byte) {
-	for len(src) > 0 {
-		var b [8]byte
+	if len(src) == 0 {
+		return
+	}
+	// enc is a pointer receiver, so the use of enc.encode within the hot
+	// loop below means a nil check at every operation. Lift that nil check
+	// outside of the loop to speed up the encoder.
+	_ = enc.encode
 
-		// Unpack 8x 5-bit source blocks into a 5 byte
-		// destination quantum
-		switch len(src) {
-		default:
-			b[7] = src[4] & 0x1F
-			b[6] = src[4] >> 5
-			fallthrough
-		case 4:
-			b[6] |= (src[3] << 3) & 0x1F
-			b[5] = (src[3] >> 2) & 0x1F
-			b[4] = src[3] >> 7
-			fallthrough
-		case 3:
-			b[4] |= (src[2] << 1) & 0x1F
-			b[3] = (src[2] >> 4) & 0x1F
-			fallthrough
-		case 2:
-			b[3] |= (src[1] << 4) & 0x1F
-			b[2] = (src[1] >> 1) & 0x1F
-			b[1] = (src[1] >> 6) & 0x1F
-			fallthrough
-		case 1:
-			b[1] |= (src[0] << 2) & 0x1F
-			b[0] = src[0] >> 3
-		}
+	for len(src) >= 5 {
+		// Combining two 32 bit loads allows the same code to be used
+		// for 32 and 64 bit platforms.
+		hi := uint32(src[0])<<24 | uint32(src[1])<<16 | uint32(src[2])<<8 | uint32(src[3])
+		lo := hi<<8 | uint32(src[4])
 
-		// Encode 5-bit blocks using the base32 alphabet
-		size := len(dst)
-		if size >= 8 {
-			// Common case, unrolled for extra performance
-			dst[0] = enc.encode[b[0]&31]
-			dst[1] = enc.encode[b[1]&31]
-			dst[2] = enc.encode[b[2]&31]
-			dst[3] = enc.encode[b[3]&31]
-			dst[4] = enc.encode[b[4]&31]
-			dst[5] = enc.encode[b[5]&31]
-			dst[6] = enc.encode[b[6]&31]
-			dst[7] = enc.encode[b[7]&31]
-		} else {
-			for i := 0; i < size; i++ {
-				dst[i] = enc.encode[b[i]&31]
-			}
-		}
-
-		// Pad the final quantum
-		if len(src) < 5 {
-			if enc.padChar == NoPadding {
-				break
-			}
-
-			dst[7] = byte(enc.padChar)
-			if len(src) < 4 {
-				dst[6] = byte(enc.padChar)
-				dst[5] = byte(enc.padChar)
-				if len(src) < 3 {
-					dst[4] = byte(enc.padChar)
-					if len(src) < 2 {
-						dst[3] = byte(enc.padChar)
-						dst[2] = byte(enc.padChar)
-					}
-				}
-			}
-
-			break
-		}
+		_ = dst[7] // Eliminate bounds checks below.
+		dst[0] = enc.encode[(hi>>27)&0x1F]
+		dst[1] = enc.encode[(hi>>22)&0x1F]
+		dst[2] = enc.encode[(hi>>17)&0x1F]
+		dst[3] = enc.encode[(hi>>12)&0x1F]
+		dst[4] = enc.encode[(hi>>7)&0x1F]
+		dst[5] = enc.encode[(hi>>2)&0x1F]
+		dst[6] = enc.encode[(lo>>5)&0x1F]
+		dst[7] = enc.encode[(lo)&0x1F]
 
 		src = src[5:]
 		dst = dst[8:]
 	}
+
+	// Add the remaining small block
+	if len(src) == 0 {
+		return
+	}
+
+	// Encode the remaining bytes in reverse order.
+	val := uint32(0)
+	switch len(src) {
+	case 4:
+		val |= uint32(src[3])
+		dst[6] = enc.encode[val<<3&0x1F]
+		dst[5] = enc.encode[val>>2&0x1F]
+		fallthrough
+	case 3:
+		val |= uint32(src[2]) << 8
+		dst[4] = enc.encode[val>>7&0x1F]
+		fallthrough
+	case 2:
+		val |= uint32(src[1]) << 16
+		dst[3] = enc.encode[val>>12&0x1F]
+		dst[2] = enc.encode[val>>17&0x1F]
+		fallthrough
+	case 1:
+		val |= uint32(src[0]) << 24
+		dst[1] = enc.encode[val>>22&0x1F]
+		dst[0] = enc.encode[val>>27&0x1F]
+	}
+
+	// Pad the final quantum
+	if enc.padChar != NoPadding {
+		nPad := (len(src) * 8 / 5) + 1
+		for i := nPad; i < 8; i++ {
+			dst[i] = byte(enc.padChar)
+		}
+	}
+}
+
+// AppendEncode appends the base32 encoded src to dst
+// and returns the extended buffer.
+func (enc *Encoding) AppendEncode(dst, src []byte) []byte {
+	n := enc.EncodedLen(len(src))
+	dst = slices.Grow(dst, n)
+	enc.Encode(dst[len(dst):][:n], src)
+	return dst[:len(dst)+n]
 }
 
 // EncodeToString returns the base32 encoding of src.
@@ -266,9 +281,17 @@ func NewEncoder(enc *Encoding, w io.Writer) io.WriteCloser {
 
 // EncodedLen returns the length in bytes of the base32 encoding
 // of an input buffer of length n.
+// It panics if the encoded length overflows int,
+// which can happen only if n > [math.MaxInt]/8*5.
 func (enc *Encoding) EncodedLen(n int) int {
 	if enc.padChar == NoPadding {
-		return (n*8 + 4) / 5
+		if n > math.MaxInt/8*5+4 {
+			panic("encoded length overflows int")
+		}
+		return n/5*8 + (n%5*8+4)/5
+	}
+	if n > math.MaxInt/8*5 {
+		panic("encoded length overflows int")
 	}
 	return (n + 4) / 5 * 8
 }
@@ -293,6 +316,41 @@ func (enc *Encoding) decode(dst, src []byte) (n int, end bool, err error) {
 
 	dsti := 0
 	olen := len(src)
+
+	// Fast path: decode whole quanta, 8 bytes in and 5 out.
+	// A quantum holding padding or a bad byte ends the fast path;
+	// the loop below takes it from there and reports any error.
+	// If the padding character is itself in the alphabet, a table
+	// lookup cannot tell padding from data, so skip the fast path.
+	if enc.decodeMap[byte(enc.padChar)] == invalidIndex {
+		for len(src) >= 8 {
+			d0 := enc.decodeMap[src[0]]
+			d1 := enc.decodeMap[src[1]]
+			d2 := enc.decodeMap[src[2]]
+			d3 := enc.decodeMap[src[3]]
+			d4 := enc.decodeMap[src[4]]
+			d5 := enc.decodeMap[src[5]]
+			d6 := enc.decodeMap[src[6]]
+			d7 := enc.decodeMap[src[7]]
+			// A valid index fits in 5 bits and invalidIndex is all
+			// ones, so the OR is invalidIndex if any byte is bad.
+			if d0|d1|d2|d3|d4|d5|d6|d7 == invalidIndex {
+				break
+			}
+
+			// Pack eight 5-bit values into 5 bytes. The first 4 bytes
+			// fit in a uint32, which is cheap on 32-bit machines too.
+			hi := uint32(d0)<<27 | uint32(d1)<<22 | uint32(d2)<<17 | uint32(d3)<<12 |
+				uint32(d4)<<7 | uint32(d5)<<2 | uint32(d6)>>3
+			_ = dst[4] // Eliminate bounds checks below.
+			byteorder.BEPutUint32(dst, hi)
+			dst[4] = d6<<5 | d7
+
+			src = src[8:]
+			dst = dst[5:]
+			n += 5
+		}
+	}
 
 	for len(src) > 0 && !end {
 		// Decode quantum using the base32 alphabet
@@ -371,10 +429,11 @@ func (enc *Encoding) decode(dst, src []byte) (n int, end bool, err error) {
 }
 
 // Decode decodes src using the encoding enc. It writes at most
-// DecodedLen(len(src)) bytes to dst and returns the number of bytes
-// written. If src contains invalid base32 data, it will return the
-// number of bytes successfully written and CorruptInputError.
-// New line characters (\r and \n) are ignored.
+// [Encoding.DecodedLen](len(src)) bytes to dst and returns the number of bytes
+// written. The caller must ensure that dst is large enough to hold all
+// the decoded data. If src contains invalid base32 data, it will return the
+// number of bytes successfully written and [CorruptInputError].
+// Newline characters (\r and \n) are ignored.
 func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	buf := make([]byte, len(src))
 	l := stripNewlines(buf, src)
@@ -382,7 +441,26 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 	return
 }
 
+// AppendDecode appends the base32 decoded src to dst
+// and returns the extended buffer.
+// If the input is malformed, it returns the partially decoded src and an error.
+// New line characters (\r and \n) are ignored.
+func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
+	// Compute the output size without padding to avoid over allocating.
+	n := len(src)
+	for n > 0 && rune(src[n-1]) == enc.padChar {
+		n--
+	}
+	n = decodedLen(n, NoPadding)
+
+	dst = slices.Grow(dst, n)
+	n, err := enc.Decode(dst[len(dst):][:n], src)
+	return dst[:len(dst)+n], err
+}
+
 // DecodeString returns the bytes represented by the base32 string s.
+// If the input is malformed, it returns the partially decoded data and
+// [CorruptInputError]. New line characters (\r and \n) are ignored.
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
 	buf := []byte(s)
 	l := stripNewlines(buf, buf)
@@ -436,7 +514,7 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 	}
 
 	// Read a chunk.
-	nn := len(p) / 5 * 8
+	nn := (len(p) + 4) / 5 * 8
 	if nn < 8 {
 		nn = 8
 	}
@@ -508,13 +586,34 @@ type newlineFilteringReader struct {
 // stripNewlines removes newline characters and returns the number
 // of non-newline characters copied to dst.
 func stripNewlines(dst, src []byte) int {
+	const (
+		lo = 0x0101010101010101 // low bit of each byte
+		hi = 0x8080808080808080 // high bit of each byte
+	)
 	offset := 0
-	for _, b := range src {
-		if b == '\r' || b == '\n' {
-			continue
+	for len(src) > 0 {
+		if len(src) >= 8 {
+			// Look at 8 bytes at once. The expression below is
+			// nonzero exactly when some byte of x is <= '\r', which
+			// covers both newlines: subtracting '\r'+1 from every
+			// byte wraps a byte that small and sets its high bit,
+			// and &^x drops bytes whose high bit was already set.
+			// This is the classic zero-byte test (see Hacker's
+			// Delight, section 6-1) with '\r'+1 in place of 1.
+			x := byteorder.LEUint64(src)
+			if (x-lo*('\r'+1))&^x&hi == 0 {
+				// No newline in sight; copy all 8 bytes.
+				byteorder.LEPutUint64(dst[offset:], x)
+				offset += 8
+				src = src[8:]
+				continue
+			}
 		}
-		dst[offset] = b
-		offset++
+		if b := src[0]; b != '\r' && b != '\n' {
+			dst[offset] = b
+			offset++
+		}
+		src = src[1:]
 	}
 	return offset
 }
@@ -541,9 +640,12 @@ func NewDecoder(enc *Encoding, r io.Reader) io.Reader {
 // DecodedLen returns the maximum length in bytes of the decoded data
 // corresponding to n bytes of base32-encoded data.
 func (enc *Encoding) DecodedLen(n int) int {
-	if enc.padChar == NoPadding {
-		return n * 5 / 8
-	}
+	return decodedLen(n, enc.padChar)
+}
 
+func decodedLen(n int, padChar rune) int {
+	if padChar == NoPadding {
+		return n/8*5 + n%8*5/8
+	}
 	return n / 8 * 5
 }

@@ -29,14 +29,14 @@ func ExampleNewGCM_encrypt() {
 		panic(err.Error())
 	}
 
-	// Never use more than 2^32 random nonces with a given key because of the risk of a repeat.
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
 		panic(err.Error())
 	}
 
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
+	// Never use more than 2^32 random nonces with a given key because of the risk of a repeat.
+	nonce := make([]byte, aesgcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		panic(err.Error())
 	}
 
@@ -310,7 +310,7 @@ func ExampleStreamReader() {
 	// If the key is unique for each ciphertext, then it's ok to use a zero
 	// IV.
 	var iv [aes.BlockSize]byte
-	stream := cipher.NewOFB(block, iv[:])
+	stream := cipher.NewCTR(block, iv[:])
 
 	reader := &cipher.StreamReader{S: stream, R: bReader}
 	// Copy the input to the output stream, decrypting as we go.
@@ -343,7 +343,7 @@ func ExampleStreamWriter() {
 	// If the key is unique for each ciphertext, then it's ok to use a zero
 	// IV.
 	var iv [aes.BlockSize]byte
-	stream := cipher.NewOFB(block, iv[:])
+	stream := cipher.NewCTR(block, iv[:])
 
 	var out bytes.Buffer
 

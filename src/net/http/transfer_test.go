@@ -112,8 +112,8 @@ func (w *mockTransferWriter) Write(p []byte) (int, error) {
 }
 
 func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
-	fileType := reflect.TypeOf(&os.File{})
-	bufferType := reflect.TypeOf(&bytes.Buffer{})
+	fileType := reflect.TypeFor[*os.File]()
+	bufferType := reflect.TypeFor[*bytes.Buffer]()
 
 	nBytes := int64(1 << 10)
 	newFileFunc := func() (r io.Reader, done func(), err error) {
@@ -264,6 +264,12 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 					actualReader = reflect.TypeOf(lr.R)
 				} else {
 					actualReader = reflect.TypeOf(mw.CalledReader)
+					// We have to handle this special case for genericWriteTo in os,
+					// this struct is introduced to support a zero-copy optimization,
+					// check out https://go.dev/issue/58808 for details.
+					if actualReader.Kind() == reflect.Struct && actualReader.PkgPath() == "os" && actualReader.Name() == "fileWithoutWriteTo" {
+						actualReader = actualReader.Field(1).Type
+					}
 				}
 
 				if tc.expectedReader != actualReader {
@@ -278,60 +284,16 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 	}
 }
 
-func TestParseTransferEncoding(t *testing.T) {
-	tests := []struct {
-		hdr     Header
-		wantErr error
-	}{
-		{
-			hdr:     Header{"Transfer-Encoding": {"fugazi"}},
-			wantErr: &unsupportedTEError{`unsupported transfer encoding: "fugazi"`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {"chunked, chunked", "identity", "chunked"}},
-			wantErr: &unsupportedTEError{`too many transfer encodings: ["chunked, chunked" "identity" "chunked"]`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {""}},
-			wantErr: &unsupportedTEError{`unsupported transfer encoding: ""`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {"chunked, identity"}},
-			wantErr: &unsupportedTEError{`unsupported transfer encoding: "chunked, identity"`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {"chunked", "identity"}},
-			wantErr: &unsupportedTEError{`too many transfer encodings: ["chunked" "identity"]`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {"\x0bchunked"}},
-			wantErr: &unsupportedTEError{`unsupported transfer encoding: "\vchunked"`},
-		},
-		{
-			hdr:     Header{"Transfer-Encoding": {"chunked"}},
-			wantErr: nil,
-		},
-	}
-
-	for i, tt := range tests {
-		tr := &transferReader{
-			Header:     tt.hdr,
-			ProtoMajor: 1,
-			ProtoMinor: 1,
-		}
-		gotErr := tr.parseTransferEncoding()
-		if !reflect.DeepEqual(gotErr, tt.wantErr) {
-			t.Errorf("%d.\ngot error:\n%v\nwant error:\n%v\n\n", i, gotErr, tt.wantErr)
-		}
-	}
-}
-
 // issue 39017 - disallow Content-Length values such as "+3"
 func TestParseContentLength(t *testing.T) {
 	tests := []struct {
 		cl      string
 		wantErr error
 	}{
+		{
+			cl:      "",
+			wantErr: badStringError("invalid empty Content-Length", ""),
+		},
 		{
 			cl:      "3",
 			wantErr: nil,
@@ -356,7 +318,7 @@ func TestParseContentLength(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if _, gotErr := parseContentLength(tt.cl); !reflect.DeepEqual(gotErr, tt.wantErr) {
+		if _, _, gotErr := parseContentLength([]string{tt.cl}); !reflect.DeepEqual(gotErr, tt.wantErr) {
 			t.Errorf("%q:\n\tgot=%v\n\twant=%v", tt.cl, gotErr, tt.wantErr)
 		}
 	}

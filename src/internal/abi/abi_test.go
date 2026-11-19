@@ -7,8 +7,8 @@ package abi_test
 import (
 	"internal/abi"
 	"internal/testenv"
-	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -30,6 +30,38 @@ func TestFuncPC(t *testing.T) {
 	}
 }
 
+//go:noinline
+func dynamicFuncPC(f func(int) int) uintptr {
+	return abi.FuncPCABIInternal(f)
+}
+
+func funcPCTarget(x int) int { return x + 1 }
+
+type funcPCReceiver int
+
+func (r funcPCReceiver) method(x int) int { return x + int(r) }
+
+func TestFuncPCDynamic(t *testing.T) {
+	offset := len(t.Name())
+	for _, test := range []struct {
+		name string
+		fn   func(int) int
+	}{
+		{"function", funcPCTarget},
+		{"closure", func(x int) int { return x + offset }},
+		{"method", funcPCReceiver(offset).method},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, want := dynamicFuncPC(test.fn), reflect.ValueOf(test.fn).Pointer(); got != want {
+				t.Errorf("FuncPCABIInternal = %#x, want %#x", got, want)
+			}
+		})
+	}
+	if got, want := dynamicFuncPC(funcPCTarget), abi.FuncPCABIInternal(funcPCTarget); got != want {
+		t.Errorf("dynamic FuncPCABIInternal = %#x, want static PC %#x", got, want)
+	}
+}
+
 func TestFuncPCCompileError(t *testing.T) {
 	// Test that FuncPC* on a function of a mismatched ABI is rejected.
 	testenv.MustHaveGoBuild(t)
@@ -42,18 +74,19 @@ func TestFuncPCCompileError(t *testing.T) {
 	symabi := filepath.Join(tmpdir, "symabi")
 	obj := filepath.Join(tmpdir, "x.o")
 
+	// Write an importcfg file for the dependencies of the package.
 	importcfgfile := filepath.Join(tmpdir, "hello.importcfg")
-	testenv.WriteImportcfg(t, importcfgfile, nil)
+	testenv.WriteImportcfg(t, importcfgfile, nil, "internal/abi")
 
 	// parse assembly code for symabi.
-	cmd := exec.Command(testenv.GoToolPath(t), "tool", "asm", "-gensymabis", "-o", symabi, asmSrc)
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-p=p", "-gensymabis", "-o", symabi, asmSrc)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("go tool asm -gensymabis failed: %v\n%s", err, out)
 	}
 
 	// compile go code.
-	cmd = exec.Command(testenv.GoToolPath(t), "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-symabis", symabi, "-o", obj, goSrc)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-symabis", symabi, "-o", obj, goSrc)
 	out, err = cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("go tool compile did not fail")

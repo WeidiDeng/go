@@ -1,0 +1,1095 @@
+// Copyright 2025 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package main
+
+import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"slices"
+	"strings"
+	"text/template"
+
+	"simd/archsimd/_gen/sgutil"
+	"simd/archsimd/_gen/simdgen/types"
+)
+
+// tplRuleData is the input to one of the ruleTemplates, which produces one
+// rule. Most fields are fragments of rule syntax. writeSIMDRules creates one
+// for each operation and then copies and modifies it for each kind of rule it
+// produces for that operation.
+type tplRuleData struct {
+	op *Operation // the operation this rule is for
+
+	TplName        string // e.g. "sftimm"
+	RuleIndex      int    // index of the rule in its operation's rule list
+	GoOp           string // e.g. "ShiftAllLeft"
+	GoType         string // e.g. "Uint32x8"
+	Args           string // e.g. "x y"
+	Asm            string // e.g. "VPSLLD256"
+	ArgsOut        string // e.g. "x y"
+	MaskInConvert  string // e.g. "VPMOVVec32x8ToM"
+	MaskOutConvert string // e.g. "VPMOVMToVec32x8"
+	ElementSize    int    // e.g. 32
+	Size           int    // e.g. 128
+	ArgsLoadAddr   string // [Args] with its last vreg arg being a concrete "(VMOVDQUload* ptr mem)", and might contain mask.
+	ArgsAddr       string // [Args] with its last vreg arg being replaced by "ptr", and might contain mask, and with a "mem" at the end.
+	FeatCheck      string // e.g. "v.Block.CPUfeatures.hasFeature(CPUavx512)" -- for a ssa/_gen rules file.
+	RuleCond       string // e.g. "a==0" -- condition for asmRule or argsMatchRule.
+	RuleOut        string // e.g. "y" -- output of an asmRule or argsMatchRule.
+	RuleArgs       string // custom args pattern for argsMatchRule.
+	Rule           string // the whole rule
+	// ConstImm reports that the operation has a constant immediate: the
+	// generic op has no aux (so Args has no "[a]"), but the machine op
+	// carries the immediate in its aux field (ArgsOut starts with "[c]").
+	// Rules that match the machine op must match and keep that aux.
+	ConstImm bool
+}
+
+// Helper type to make template map initialization less repetitive
+// (and also remove a chance for errors.)
+type ruleTemplateMap struct {
+	sgutil.InsertMap[string, *template.Template]
+}
+
+// Add creates a template named "name" after appending "// {{.TmplName}}\n" to the
+// template, and returns the input so that additions may be chained.
+// This helps make template initialization easy to order and easy to read.
+func (rtm *ruleTemplateMap) Add(name string, templ string) *ruleTemplateMap {
+	// Append debugging comment AND end of line
+	templ += " // {{.TplName}}\n"
+	ct := template.Must(template.New(name).Parse(templ))
+	rtm.InsertMap.Put(name, ct)
+	return rtm
+}
+
+var (
+	// ORDER MATTERS.  These should appear in most-to-least-specific order
+	// TODO: vregMemFeatCheck is not necessarily in the right place; there was an order,
+	// this was copied from it, but vregMemFeatCheck was not in it.  It's not clear
+	// it was ever used.
+	// It's also not clear that this is strictly most-to-least-specific?
+	ruleTemplates = new(ruleTemplateMap).
+		Add("masksftimm", `({{.Asm}} x (MOVQconst [c]) mask) => ({{.Asm}}const [amd64CapAVXShift(c)] x mask)`).
+		Add("sftimm", `({{.Asm}} x (MOVQconst [c])) => ({{.Asm}}const [amd64CapAVXShift(c)] x)`).
+		Add("maskInMaskOut", `({{.GoOp}}{{.GoType}} {{.Args}} mask) => ({{.MaskOutConvert}} ({{.Asm}} {{.ArgsOut}} ({{.MaskInConvert}} <types.TypeMask> mask)))`).
+		Add("maskOut", `({{.GoOp}}{{.GoType}} {{.Args}}) => ({{.MaskOutConvert}} ({{.Asm}} {{.ArgsOut}}))`).
+		Add("maskIn", `({{.GoOp}}{{.GoType}} {{.Args}} mask) => ({{.Asm}} {{.ArgsOut}} ({{.MaskInConvert}} <types.TypeMask> mask))`).
+		Add("pureVreg", `({{.GoOp}}{{.GoType}} {{.Args}}) => ({{.Asm}} {{.ArgsOut}})`).
+		Add("vregMem", `({{.Asm}} {{.ArgsLoadAddr}}) && ssa.CanMergeLoad(v, l) && ssa.Clobber(l) => ({{.Asm}}load {{.ArgsAddr}})`).
+		Add("vregMemFeatCheck", `({{.Asm}} {{.ArgsLoadAddr}}) && {{.FeatCheck}} && ssa.CanMergeLoad(v, l) && ssa.Clobber(l) => ({{.Asm}}load {{.ArgsAddr}})`).
+		Add("asmRule", `({{.Asm}} {{.Args}}) {{.RuleCond}} => {{.RuleOut}}`).
+		Add("lowerRule", `{{.Rule}}`).
+		Add("peepholeRule", `{{.Rule}}`)
+)
+
+func (d tplRuleData) MaskOptimization(asmCheck map[string]bool) string {
+	asmNoMask, zeroMove, ok := d.op.zeroMaskedForm()
+	if !ok || !asmCheck[asmNoMask] {
+		return ""
+	}
+	args := d.Args
+	if d.ConstImm {
+		// Match the machine op's immediate and keep it; otherwise this
+		// would match any immediate and drop it.
+		args = "[a] " + args
+	}
+	return fmt.Sprintf("(%s (%s %s) mask) => (%s %s mask)\n", zeroMove, asmNoMask, args, d.Asm, args)
+}
+
+// zeroMaskedForm and mergeMaskedForm express o's zeroing-masked and
+// merging-masked machine ops in terms of its unmasked machine op asmNoMask
+// followed by a masking operation (a zeroing move or a blend) on the result.
+//
+// In both cases, the AVX-512 opmask applies to the elements of the result, so
+// the masking operation has the result's element width and vector width, which
+// can differ from the inputs' shape (for example, in conversions that change
+// the element size).
+//
+// Note that asmNoMask is the name the unmasked machine op would have, which
+// may not exist as a machine op (for example, if the mask is required).
+
+// zeroMaskedForm reports whether o, an amd64 operation, is the zeroing-masked
+// form of the unmasked machine op asmNoMask. That is, for any args,
+//
+//	(machineOp args mask) == (zeroMove (asmNoMask args) mask)
+//
+// where machineOp is o's machine op and zeroMove is a zeroing masked move.
+func (o *Operation) zeroMaskedForm() (asmNoMask, zeroMove string, ok bool) {
+	if o.Zeroing != nil && !*o.Zeroing {
+		// The masked op merges.
+		return "", "", false
+	}
+	if len(o.Out) != 1 || o.Out[0].Class != "vreg" || o.Out[0].ElemBits == nil {
+		// Only operations that produce a single vector register have a
+		// zeroing masked move form. (For example, comparisons produce a
+		// mask.)
+		return "", "", false
+	}
+	// Check that o is masked by a write opmask (rather than a control mask
+	// like VPBLENDM or VCOMPRESS).
+	hasOpmask := false
+	for i := range o.In {
+		// Both "opmask" and "opmask-partial" are valid when zeroing, since
+		// both sides zero the upper elements of a partial result.
+		if in := &o.In[i]; in.MaskRole != nil && (*in.MaskRole == "opmask" || *in.MaskRole == "opmask-partial") {
+			hasOpmask = true
+			break
+		}
+	}
+	if !hasOpmask {
+		return "", "", false
+	}
+	elemBits, size := o.resultShape()
+	return machineOpName(NoMask, *o), fmt.Sprintf("VMOVDQU%dMasked%d", elemBits, size), true
+}
+
+// mergeMaskedForm reports whether o has a merging-masked machine op (see
+// hasMaskedMerging) and returns how to express it in terms of the unmasked
+// machine op asmNoMask. That is, for any args,
+//
+//	(machineOpMerging dst args mask) == (blend dst (asmNoMask args) mask)
+//
+// where machineOpMerging is o's merging-masked machine op and blend is a
+// VPBLENDM machine op, which takes the elements of its second argument where
+// mask is true and of dst elsewhere.
+//
+// Blends with a vector mask (VPBLENDVB, VBLENDVP[SD]) become VPBLENDM if the
+// mask is known to be converted from an AVX-512 mask (see AMD64.rules), so
+// this also covers those.
+func (o *Operation) mergeMaskedForm(maskType maskShape, outType outShape) (asmNoMask, blend string, ok bool) {
+	if !o.hasMaskedMerging(maskType, outType) {
+		return "", "", false
+	}
+	elemBits, size := o.resultShape()
+	letter := map[int]string{8: "B", 16: "W", 32: "D", 64: "Q"}[elemBits]
+	return machineOpName(NoMask, *o), fmt.Sprintf("VPBLENDM%sMasked%d", letter, size), true
+}
+
+// resultShape returns the element width and vector width of o's result.
+func (o *Operation) resultShape() (elemBits, vectorWidth int) {
+	if len(o.Out) != 1 || o.Out[0].Class != "vreg" || o.Out[0].ElemBits == nil {
+		panic(fmt.Errorf("unexpected result of %v", o))
+	}
+	elemBits = *o.Out[0].ElemBits
+	switch elemBits {
+	case 8, 16, 32, 64:
+	default:
+		panic(fmt.Errorf("unexpected result element width %d on %v", elemBits, o))
+	}
+	vectorWidth = o.VectorWidth()
+	switch vectorWidth {
+	case 128, 256, 512:
+	default:
+		panic(fmt.Errorf("unexpected vector width %d on %v", vectorWidth, o))
+	}
+	return elemBits, vectorWidth
+}
+
+func compareTplRuleData(x, y tplRuleData) int {
+	if c := compareNatural(x.GoOp, y.GoOp); c != 0 {
+		return c
+	}
+	if c := compareNatural(x.GoType, y.GoType); c != 0 {
+		return c
+	}
+	if c := compareNatural(x.Args, y.Args); c != 0 {
+		return c
+	}
+	if x.TplName != y.TplName {
+		return ruleTemplates.Compare(x.TplName, y.TplName)
+	}
+	return cmp.Compare(x.RuleIndex, y.RuleIndex)
+}
+
+// parseAsmRule parses an asmRules entry, "<cond> => <result>".
+func parseAsmRule(rule string) (cond, out string) {
+	cond, out, ok := strings.Cut(rule, "=>")
+	cond, out = strings.TrimSpace(cond), strings.TrimSpace(out)
+	if !ok || cond == "" || out == "" {
+		panic(fmt.Errorf("simdgen: asm rule %q is not of the form \"<cond> => <result>\"", rule))
+	}
+	return cond, out
+}
+
+// expandRule expands the format specifiers in a lowerRules or peepholeRules
+// entry. See [types.RawOperation].
+func expandRule(rule string, data tplRuleData, elemBits int) string {
+	rule = expandFormatSpecifiers(rule, elemBits)
+	rule = strings.ReplaceAll(rule, "%g", data.GoOp+data.GoType)
+	rule = strings.ReplaceAll(rule, "%h", data.Asm)
+	return rule
+}
+
+// expandFormatSpecifiers replaces format specifiers in s with concrete values
+// derived from elemBits (the element size in bits for the current vector type).
+//
+// Supported specifiers:
+//
+//	%s - lane size letter (B, H, S, D)
+//	%a - arrangement suffix (16B, 8H, 4S, 2D) for neon instructions
+//	%b - bits per lane (8, 16, 32, 64)
+//	%r - register-width letter of scalar move ops (B, H, W, D)
+func expandFormatSpecifiers(s string, elemBits int) string {
+	elemLetters := map[int]string{8: "B", 16: "H", 32: "S", 64: "D"}
+	regLetters := map[int]string{8: "B", 16: "H", 32: "W", 64: "D"}
+	arrangements := map[int]string{8: "16B", 16: "8H", 32: "4S", 64: "2D"}
+	s = strings.ReplaceAll(s, "%s", elemLetters[elemBits])
+	s = strings.ReplaceAll(s, "%r", regLetters[elemBits])
+	s = strings.ReplaceAll(s, "%a", arrangements[elemBits])
+	s = strings.ReplaceAll(s, "%b", fmt.Sprintf("%d", elemBits))
+	return s
+}
+
+// sveBroadcastScalarArgs returns the machine-op arguments for the generic-op
+// arguments args of an SVE op: its scalar operand (treatLikeAScalarOfSize), if
+// any, is broadcast into the vector operand the instruction takes, e.g.
+// "x y" becomes "x (ZDUPD y)" for a shift by 64-bit elements.
+func sveBroadcastScalarArgs(gOp Operation, args string) string {
+	idx, err := checkVecAsScalar(gOp)
+	if err != nil {
+		panic(err)
+	}
+	if idx < 0 || !CurrentArch().isSVE() {
+		return args
+	}
+	scalar := gOp.In[idx]
+	if *scalar.Base == "float" {
+		panic(fmt.Errorf("simdgen: SVE broadcasts only integer scalar operands: %s", gOp))
+	}
+	// The scalar is the k-th vector argument; immediates are written as [a].
+	k := 0
+	for i := 0; i < idx; i++ {
+		if gOp.In[i].Class == "vreg" {
+			k++
+		}
+	}
+	fields := strings.Fields(args)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "[") {
+			continue
+		}
+		if k == 0 {
+			fields[i] = fmt.Sprintf("(%s %s)", sveBroadcastOp(*scalar.ElemBits), f)
+			break
+		}
+		k--
+	}
+	return strings.Join(fields, " ")
+}
+
+// sveBroadcastOp returns the machine op that broadcasts a general register
+// into every element of a vector with elemBits-bit elements.
+func sveBroadcastOp(elemBits int) string {
+	return "ZDUP" + map[int]string{8: "B", 16: "H", 32: "S", 64: "D"}[elemBits]
+}
+
+// sveSftimmRule returns the rule that turns an SVE shift by a broadcast
+// constant amount into the instruction's immediate form, the <asm>const
+// machine op, when the amount is in the immediate's range:
+//
+//	(ZLSLH x (ZDUPDconst [c])) && c >= 0 && c <= 15 => (ZLSLHconst [uint8(c)] x)
+//
+// The range is the immediate op's, which constImmRange maps its machine op name
+// to (see sveImmRanges). A constant that small is broadcast by ZDUPDconst (see
+// ARM64.rules); any other keeps the vector form, which handles it. pred is the
+// op's synthesized all-true governing predicate, or "" when it has none.
+//
+// A select can fold the shift into its merging form first, so each merging
+// form whose immediate form also has one gets the same rule:
+//
+//	(ZLSLMergingH x (ZDUPDconst [c]) mask) && ... => (ZLSLMergingHconst [uint8(c)] x mask)
+func sveSftimmRule(gOp Operation, asm, pred string, constImmRange map[string][2]int) string {
+	r, ok := constImmRange[asm+"const"]
+	if !ok {
+		panic(fmt.Errorf("simdgen: SVE sftimm needs an immediate form %sconst with a known range: %s", asm, gOp))
+	}
+	idx, err := checkVecAsScalar(gOp)
+	if err != nil || idx < 0 {
+		panic(fmt.Errorf("simdgen: SVE sftimm needs a scalar shift operand: %s", gOp))
+	}
+	bcast := sveBroadcastOp(*gOp.In[idx].ElemBits)
+	args := strings.Replace(sveBroadcastScalarArgs(gOp, "x y"), "("+bcast+" y)", "("+bcast+"const [c])", 1)
+	if pred != "" {
+		args += " " + pred
+	}
+	rules := fmt.Sprintf("(%s %s) && c >= %d && c <= %d => (%sconst [uint8(c)] x) // sftimm\n", asm, args, r[0], r[1], asm)
+	for _, p := range gOp.svePredicatedOps() {
+		merging := machineOpName(OneMask, p)
+		if _, ok := constImmRange[merging+"const"]; !ok {
+			continue
+		}
+		mArgs := strings.Replace(sveBroadcastScalarArgs(gOp, "x y"), "("+bcast+" y)", "("+bcast+"const [c])", 1)
+		rules += fmt.Sprintf("(%s %s mask) && c >= %d && c <= %d => (%sconst [uint8(c)] x mask) // sftimm\n", merging, mArgs, r[0], r[1], merging)
+	}
+	if gOp.Go == "ShiftAllLeft" {
+		rules += sveShiftLeftPastRangeRules(gOp, asm, pred, bcast, r[1])
+	}
+	return rules
+}
+
+// sveShiftLeftPastRangeRules returns the rules for a left shift by a constant
+// amount past the immediate's range, max: every bit is shifted out, so the
+// result is the zero vector, and under a select it is zero in the active
+// lanes. A negative ZDUPDconst is a 64-bit amount of 2**63 or more.
+//
+//	(ZLSLH x (ZDUPDconst [c])) && (c < 0 || c > 15) => (ZDUPBconst [0])
+//	(ZLSLH x (ZDUPD (MOVDconst [c]))) && uint64(c) > 15 => (ZDUPBconst [0])
+//	(ZLSLMergingH x (ZDUPDconst [c]) mask) && (c < 0 || c > 15) => (ZSELH (ZDUPBconst [0]) x mask)
+//
+// (A logical right shift past its range is zero too; an arithmetic one is the
+// sign, which its immediate form reaches at its maximum.)
+func sveShiftLeftPastRangeRules(gOp Operation, asm, pred, bcast string, max int) string {
+	args := func(c string) string {
+		return strings.Replace(sveBroadcastScalarArgs(gOp, "x y"), "("+bcast+" y)", c, 1)
+	}
+	small, large := "("+bcast+"const [c])", "("+bcast+" (MOVDconst [c]))"
+	smallCond := fmt.Sprintf("(c < 0 || c > %d)", max)
+	largeCond := fmt.Sprintf("uint64(c) > %d", max)
+	p := ""
+	if pred != "" {
+		p = " " + pred
+	}
+	rules := fmt.Sprintf("(%s %s%s) && %s => (ZDUPBconst [0]) // sftimm\n", asm, args(small), p, smallCond)
+	rules += fmt.Sprintf("(%s %s%s) && %s => (ZDUPBconst [0]) // sftimm\n", asm, args(large), p, largeCond)
+	sel := "ZSEL" + sveArrangementLetter(gOp)
+	for _, pr := range gOp.svePredicatedOps() {
+		merging := machineOpName(OneMask, pr)
+		rules += fmt.Sprintf("(%s %s mask) && %s => (%s (ZDUPBconst [0]) x mask) // sftimm\n", merging, args(small), smallCond, sel)
+		rules += fmt.Sprintf("(%s %s mask) && %s => (%s (ZDUPBconst [0]) x mask) // sftimm\n", merging, args(large), largeCond, sel)
+	}
+	return rules
+}
+
+// sveImplicitPredRule returns the lowering rule for an SVE op whose governing
+// predicate is implicit-all-true: the unpredicated generic op lowers straight to
+// the predicated machine op with a synthesized all-true predicate.
+//
+// The all-true predicate is PWHILELT<letter>(0, lanes) with lanes =
+// MaxVectorBits/elemBits, the lane count at the maximum supported vector length.
+// Since PWHILELT saturates
+// (lane i is set while i < hi), this predicate is all-true at any smaller VL too,
+// so it stands in for the not-yet-available PTRUE.
+//
+// For example, GreaterInt8s lowers to:
+//
+//	(GreaterInt8s x y) => (ZCMPGTB x y (Select0 <types.TypeMask> (PWHILELTB (MOVDconst [0]) (MOVDconst [32]))))
+func sveImplicitPredRule(gOp Operation, asm, args string) string {
+	elemBits := *gOp.Out[0].ElemBits
+	letter := sveArrangementLetter(gOp)
+	lanes := types.MaxVectorBits / elemBits
+	return fmt.Sprintf("(%s %s) => (%s %s (Select0 <types.TypeMask> (PWHILELT%s (MOVDconst [0]) (MOVDconst [%d]))))\n",
+		gOp.GenericName(), args, asm, sveBroadcastScalarArgs(gOp, args), letter, lanes)
+}
+
+// sveFeatureConst maps a def's cpuFeature string to the ssa.CPUfeatures
+// constant the generated rule conditions on.
+func sveFeatureConst(feature string) string {
+	switch feature {
+	case "SVE2":
+		return "CPUsve2"
+	}
+	panic(fmt.Errorf("simdgen: no ssa.CPUfeatures constant for feature %q", feature))
+}
+
+// sveAllTruePattern returns the rule text for the synthesized all-true
+// governing predicate of an operation, the same term sveImplicitPredRule
+// produces. Matching it, rather than a wildcard, is what makes the peepholes
+// below sound: they replace the predicate, so they may only fire on one that
+// selects every lane.
+func sveAllTruePattern(gOp Operation) string {
+	elemBits := *gOp.Out[0].ElemBits
+	return fmt.Sprintf("(Select0 <types.TypeMask> (PWHILELT%s (MOVDconst [0]) (MOVDconst [%d])))",
+		sveArrangementLetter(gOp), types.MaxVectorBits/elemBits)
+}
+
+// sveImplicitPredPeepholes returns the rules that fold a select over an
+// operation whose governing predicate is implicit-all-true into that
+// operation's genuinely predicated forms. The operation computes every lane and
+// the select then throws most of them away, so the predicate the select
+// describes can simply take the place of the all-true one:
+//
+//	(ZSELB (ZABSB x <all-true>) z mask) => (ZABSMergingB z x mask)
+//
+// The select's "else" operand stays in the inactive lanes, which is what merging
+// predication does; naming that operand is something a constructive instruction
+// does natively, so no MOVPRFX is involved. Masked -- a select against zero --
+// folds through the same rule, with the zero vector as the else operand.
+func sveImplicitPredPeepholes(gOp Operation, asm, args string) string {
+	if governingInput(gOp.In) < 0 {
+		return ""
+	}
+	sel := "ZSEL" + sveArrangementLetter(gOp)
+	var rules string
+	for _, pred := range gOp.svePredicatedOps() {
+		if sveMaskSuffix(pred) != "Merging" {
+			continue
+		}
+		if pred.sveMergeSourceIn0 {
+			// Constructive: the merge value is an operand of its own, so any
+			// else operand folds.
+			rules += fmt.Sprintf("(%s (%s %s %s) z mask) => (%s z %s mask)\n",
+				sel, asm, args, sveAllTruePattern(gOp), machineOpName(OneMask, pred), args)
+			continue
+		}
+		if pred.sveInPlaceInput() != 0 {
+			continue
+		}
+		// Destructive: the inactive lanes keep the first source, so only an
+		// else operand that is that source folds directly (either source when
+		// commutative); any other else operand goes through the
+		// MOVPRFX-prefixed form. These mirror sveMergingPeephole, with the
+		// all-true operation in place of the unpredicated encoding it lacks.
+		allTrue := sveAllTruePattern(gOp)
+		merging := machineOpName(OneMask, pred)
+		rules += fmt.Sprintf("(%s (%s %s %s) x mask) => (%s %s mask)\n", sel, asm, args, allTrue, merging, args)
+		if gOp.Commutative {
+			if args != "x y" {
+				panic(fmt.Errorf("simdgen: %s is a commutative destructive op with %d sources; only two are supported", gOp.Asm, len(gOp.In)-1))
+			}
+			rules += fmt.Sprintf("(%s (%s x y %s) y mask) => (%s y x mask)\n", sel, asm, allTrue, merging)
+		}
+		if prefixed := pred.sveMergingPrefixedOp(); prefixed != nil {
+			rules += fmt.Sprintf("(%s (%s x y %s) z mask) => (%s z x y mask)\n",
+				sel, asm, allTrue, machineOpName(OneMask, *prefixed))
+		}
+	}
+	return rules
+}
+
+// sveMergingPeephole returns the rules that fold a select over an unpredicated
+// SVE operation into the operation's merging-predicated form, e.g.
+//
+//	(ZSELB (ZADDB x y) x mask) => (ZADDMergingB x y mask)
+//
+// which is what x.Add(y).IfElse(mask, x) lowers to. Merging predication keeps
+// the destination — and an SVE predicated instruction is destructive, so the
+// destination is the first source — which is why the select's "else" operand
+// must be that same operand for this shortest form to hold. A commutative
+// operation gets the mirrored rule too, since either source can play that role.
+//
+// A commutative operation also gets the general rule, whose "else" operand is
+// unrestricted because the lowering prefixes a MOVPRFX:
+//
+//	(ZSELB (ZADDB x y) z mask) => (ZADDMergingPrefixedB z x y mask)
+//
+// It is emitted last so the two rules above win where they apply and save the
+// prefix. See [Operation.sveMergingPrefixedOp] for why it needs commutativity.
+//
+// imm reports that the operation also takes an immediate, which shape has
+// moved out of gOp's inputs into the machine op's aux, e.g.
+//
+//	(ZSELB (ZLSLBconst [a] x) x mask) => (ZLSLMergingBconst [a] x mask)
+func sveMergingPeephole(gOp Operation, imm bool) string {
+	var pred *types.Operand
+	vregs := 0
+	for i := range gOp.In {
+		switch {
+		case gOp.In[i].Class == "mask" && gOp.In[i].Predication != nil && !gOp.In[i].IsGoverning():
+			pred = &gOp.In[i]
+		case gOp.In[i].Class == "vreg":
+			vregs++
+		}
+	}
+	if pred == nil || *pred.Predication != "M" {
+		return ""
+	}
+	sel := "ZSEL" + sveArrangementLetter(gOp)
+	unpred := machineOpName(NoMask, gOp)
+	merging := machineOpName(OneMask, gOp)
+	if vregs == 1 && imm {
+		// An operation on one vector and an immediate, e.g. a shift by an
+		// immediate: the vector is the destructive source.
+		return fmt.Sprintf("(%s (%s [a] x) x mask) => (%s [a] x mask)\n", sel, unpred, merging)
+	}
+	if vregs != 2 {
+		return ""
+	}
+	rules := fmt.Sprintf("(%s (%s x y) x mask) => (%s x y mask)\n", sel, unpred, merging)
+	if gOp.Commutative {
+		rules += fmt.Sprintf("(%s (%s x y) y mask) => (%s y x mask)\n", sel, unpred, merging)
+	}
+	if gOp.sveMergingPrefixedOp() != nil {
+		// The general case: any "else" operand, reached by prefixing a MOVPRFX.
+		// It subsumes the two rules above, which come first so that a select
+		// whose "else" is already one of the sources keeps the shorter encoding.
+		rules += fmt.Sprintf("(%s (%s x y) z mask) => (%s z x y mask)\n", sel, unpred, machineOpName(OneMask, *gOp.sveMergingPrefixedOp()))
+	}
+	return rules
+}
+
+// writeSIMDRules generates the lowering and rewrite rules for ssa and writes it to simdAMD64.rules
+// within the specified directory.
+func writeSIMDRules(buffer *bytes.Buffer, ops []Operation) {
+	buffer.WriteString(generatedHeader() + "\n")
+
+	// asm -> masked merging rules
+	maskedMergeOpts := make(map[string]string)
+	asmCheck := map[string]bool{}    // for masked merge optimizations.
+	sftimmCheck := map[string]bool{} // deduplicate sftimm rules
+	var allData []tplRuleData
+	var optData []tplRuleData    // for mask peephole optimizations, and other misc
+	var memOptData []tplRuleData // for memory peephole optimizations
+	// memOpKey identifies a memory-operand rule: a machine op and the width
+	// of the load it folds.
+	type memOpKey struct {
+		asm  string
+		bits int
+	}
+	memOpSeen := make(map[memOpKey]bool)
+	// Deduplicate rules shared by operations. Asm and peephole rules are
+	// keyed by machine op, lower rules by generic op.
+	asmRulesDone := make(map[string]bool)
+	peepholeRulesDone := make(map[string]bool)
+	lowerRulesDone := make(map[string]bool)
+
+	var sveRules []string // SVE implicit-all-true predicated ops, emitted separately.
+
+	// constImmRange maps the machine op of each SVE immediate form (ssaVariant
+	// "const") to its immediate's range, for the sftimm rules.
+	constImmRange := map[string][2]int{}
+	if CurrentArch().isSVE() {
+		for _, op := range ops {
+			_, _, maskType, _, gOp, _ := op.shape()
+			imm := op.In[0]
+			if op.SSAVariant == nil || *op.SSAVariant != "const" || imm.Class != "immediate" || imm.ImmMin == nil || imm.ImmMax == nil {
+				continue
+			}
+			r := [2]int{*imm.ImmMin, *imm.ImmMax}
+			constImmRange[machineOpName(maskType, gOp)] = r
+			for _, p := range gOp.svePredicatedOps() {
+				constImmRange[machineOpName(OneMask, p)] = r
+			}
+		}
+	}
+
+	for _, opr := range ops {
+		opInShape, opOutShape, maskType, immType, gOp, _ := opr.shape()
+		asm := machineOpName(maskType, gOp)
+		// An implicit-all-true governing predicate is a machine-op input only, so
+		// it is not one of the data-vector args of the (unpredicated) generic op.
+		vregInCnt := len(gOp.In) - opr.implicitPredCount()
+		if maskType == OneMask {
+			vregInCnt--
+		}
+
+		data := tplRuleData{
+			op:   &gOp,
+			GoOp: gOp.Go,
+			Asm:  asm,
+		}
+
+		if vregInCnt == 1 {
+			data.Args = "x"
+			data.ArgsOut = data.Args
+		} else if vregInCnt == 2 {
+			data.Args = "x y"
+			data.ArgsOut = data.Args
+			if gOp.OperandOrder != nil && *gOp.OperandOrder == "21" {
+				data.ArgsOut = "y x"
+			}
+		} else if vregInCnt == 3 {
+			data.Args = "x y z"
+			data.ArgsOut = data.Args
+			if gOp.OperandOrder != nil && *gOp.OperandOrder == "21" {
+				data.ArgsOut = "y x z"
+			}
+		} else {
+			panic(fmt.Errorf("simdgen does not support more than 3 vreg in inputs"))
+		}
+		if immType == ConstImm {
+			data.ArgsOut = fmt.Sprintf("[%s] %s", *opr.In[0].Const, data.ArgsOut)
+			data.ConstImm = true
+		} else if immType == VarImm || immType == VarImmLim {
+			data.Args = fmt.Sprintf("[a] %s", data.Args)
+			data.ArgsOut = fmt.Sprintf("[a] %s", data.ArgsOut)
+		} else if immType == ConstVarImm {
+			data.Args = fmt.Sprintf("[a] %s", data.Args)
+			data.ArgsOut = fmt.Sprintf("[a+%s] %s", *opr.In[0].Const, data.ArgsOut)
+		}
+
+		data.ArgsOut = sveBroadcastScalarArgs(gOp, data.ArgsOut)
+
+		// An SVE operation whose unpredicated encoding needs a higher feature
+		// level than the operation itself lowers through its merging-predicated
+		// sibling under a synthesized all-true predicate, with the unpredicated
+		// encoding as a feature-gated upgrade in blocks where the cpufeatures
+		// analysis proves the level:
+		//
+		//	(MulInt8s x y) && ...HasFeature(ssa.CPUsve2) => (ZMULB x y)
+		//	(MulInt8s x y) => (ZMULMergingB x y <all-true>)
+		if gOp.UnpredCPUFeature != nil {
+			preds := gOp.svePredicatedOps()
+			if len(preds) == 0 || sveMaskSuffix(preds[0]) != "Merging" {
+				panic(fmt.Errorf("simdgen: %s has unpredCpuFeature but no merging fallback", gOp.Asm))
+			}
+			merging := machineOpName(OneMask, preds[0])
+			sveRules = append(sveRules, fmt.Sprintf("(%s %s) && v.Block.CPUfeatures.HasFeature(ssa.%s) => (%s %s)\n",
+				gOp.GenericName(), data.Args, sveFeatureConst(*gOp.UnpredCPUFeature), asm, data.Args))
+			sveRules = append(sveRules, fmt.Sprintf("(%s %s) => (%s %s %s)\n",
+				gOp.GenericName(), data.Args, merging, data.Args, sveAllTruePattern(gOp)))
+			// A select over the fallback folds by replacing the synthesized
+			// all-true predicate, mirroring sveMergingPeephole's three forms.
+			sel := "ZSEL" + sveArrangementLetter(gOp)
+			allTrue := sveAllTruePattern(gOp)
+			sveRules = append(sveRules, fmt.Sprintf("(%s (%s x y %s) x mask) => (%s x y mask)\n", sel, merging, allTrue, merging))
+			if gOp.Commutative {
+				sveRules = append(sveRules, fmt.Sprintf("(%s (%s x y %s) y mask) => (%s y x mask)\n", sel, merging, allTrue, merging))
+				if preds[0].sveMergingPrefixedOp() != nil {
+					sveRules = append(sveRules, fmt.Sprintf("(%s (%s x y %s) z mask) => (%s z x y mask)\n",
+						sel, merging, allTrue, machineOpName(OneMask, *preds[0].sveMergingPrefixedOp())))
+				}
+			}
+			asmCheck[asm] = true
+			asmCheck[merging] = true
+			continue
+		}
+
+		// SVE ops with an implicit-all-true governing predicate expose an
+		// unpredicated Go API: lower the generic op straight to the predicated
+		// machine op, synthesizing an all-true predicate. This bypasses the AVX
+		// mask-conversion machinery below (SVE predicates are represented as-is).
+		if opr.implicitPredCount() > 0 {
+			if gOp.Sftimm {
+				sveRules = append(sveRules, sveSftimmRule(gOp, asm, sveAllTruePattern(gOp), constImmRange))
+			}
+			sveRules = append(sveRules, sveImplicitPredRule(gOp, asm, data.Args))
+			if r := sveImplicitPredPeepholes(gOp, asm, data.Args); r != "" {
+				sveRules = append(sveRules, r)
+			}
+			asmCheck[asm] = true
+			continue
+		}
+
+		goType := func(op Operation) string {
+			if op.OperandOrder != nil {
+				switch *op.OperandOrder {
+				case "21Type1", "231Type1":
+					// Permute uses operand[1] for method receiver.
+					return *op.In[1].Go
+				}
+			}
+			return *op.In[0].Go
+		}
+		var tplName string
+		// If class overwrite is happening, that's not really a mask but a vreg.
+		if opOutShape == OneVregOut || opOutShape == OneVregOutAtIn || opOutShape == OneVregOutScalar || gOp.Out[0].OverwriteClass != nil {
+			switch opInShape {
+			case OneImmIn:
+				tplName = "pureVreg"
+				data.GoType = goType(gOp)
+			case PureVregIn, VlistIn:
+				tplName = "pureVreg"
+				data.GoType = goType(gOp)
+			case OneKmaskImmIn:
+				fallthrough
+			case OneKmaskIn:
+				tplName = "maskIn"
+				data.GoType = goType(gOp)
+				rearIdx := len(gOp.In) - 1
+				// Mask is at the end.
+				width := *gOp.In[rearIdx].ElemBits
+				data.MaskInConvert = fmt.Sprintf("VPMOVVec%dx%dToM", width, *gOp.In[rearIdx].Lanes)
+				data.ElementSize = width
+			case PureKmaskIn:
+				panic(fmt.Errorf("simdgen does not support pure k mask instructions, they should be generated by compiler optimizations"))
+			}
+		} else if opOutShape == OneGregOut || opOutShape == OneFpregOut {
+			tplName = "pureVreg" // TODO this will be wrong
+			data.GoType = goType(gOp)
+		} else {
+			// OneKmaskOut case
+			data.MaskOutConvert = fmt.Sprintf("VPMOVMToVec%dx%d", *gOp.Out[0].ElemBits, *gOp.In[0].Lanes)
+			switch opInShape {
+			case OneImmIn:
+				fallthrough
+			case PureVregIn:
+				tplName = "maskOut"
+				data.GoType = goType(gOp)
+			case OneKmaskImmIn:
+				fallthrough
+			case OneKmaskIn:
+				tplName = "maskInMaskOut"
+				data.GoType = goType(gOp)
+				rearIdx := len(gOp.In) - 1
+				data.MaskInConvert = fmt.Sprintf("VPMOVVec%dx%dToM", *gOp.In[rearIdx].ElemBits, *gOp.In[rearIdx].Lanes)
+			case PureKmaskIn:
+				panic(fmt.Errorf("simdgen does not support pure k mask instructions, they should be generated by compiler optimizations"))
+			}
+		}
+
+		if gOp.Sftimm && CurrentArch().isSVE() {
+			sveRules = append(sveRules, sveSftimmRule(gOp, asm, "", constImmRange))
+		} else if gOp.Sftimm {
+			if !sftimmCheck[data.Asm] {
+				sftimmCheck[data.Asm] = true
+				sftImmData := data
+				if tplName == "maskIn" {
+					sftImmData.TplName = "masksftimm"
+				} else {
+					sftImmData.TplName = "sftimm"
+				}
+				allData = append(allData, sftImmData)
+				asmCheck[sftImmData.Asm+"const"] = true
+			}
+		}
+		if len(gOp.AsmRules) > 0 && !asmRulesDone[data.Asm] {
+			asmRulesDone[data.Asm] = true
+			// Asm rules are written for the unmasked machine op. A masked
+			// machine op is its unmasked form followed by a zeroing masked
+			// move, so its form of a rule applies that move to the result.
+			var zeroMove string
+			if maskType == OneMask {
+				ok := false
+				if CurrentArch().GoTypeArch == "amd64" && tplName == "maskIn" {
+					_, zeroMove, ok = gOp.zeroMaskedForm()
+				}
+				if !ok {
+					panic(fmt.Errorf("simdgen: asm rules are not supported on masked machine op %s", data.Asm))
+				}
+			}
+			// Likewise, a merging machine op is its unmasked form followed by
+			// a blend into dst.
+			_, mergeBlend, _ := gOp.mergeMaskedForm(maskType, opOutShape)
+			for i, rule := range gOp.AsmRules {
+				cond, out := parseAsmRule(rule)
+				optData := data
+				optData.TplName = "asmRule"
+				optData.RuleIndex = i
+				optData.RuleCond = "&& " + cond
+				optData.RuleOut = out
+				if zeroMove != "" {
+					optData.Args += " mask"
+					optData.RuleOut = fmt.Sprintf("(%s %s mask)", zeroMove, out)
+				}
+				allData = append(allData, optData)
+				if mergeBlend != "" {
+					mergeData := optData
+					mergeData.Asm += "Merging"
+					mergeData.Args = "dst " + optData.Args
+					mergeData.RuleOut = fmt.Sprintf("(%s dst %s mask)", mergeBlend, out)
+					allData = append(allData, mergeData)
+				}
+			}
+		}
+		if len(gOp.LowerRules) > 0 || len(gOp.PeepholeRules) > 0 {
+			// Get elemBits from the operation's inputs.
+			elemBits := 0
+			for _, in := range gOp.In {
+				if in.ElemBits != nil {
+					elemBits = *in.ElemBits
+					break
+				}
+			}
+			addRules := func(rules []string, tplName string) {
+				for i, rule := range rules {
+					optData := data
+					optData.TplName = tplName
+					optData.RuleIndex = i
+					optData.Rule = expandRule(rule, data, elemBits)
+					allData = append(allData, optData)
+				}
+			}
+			if len(gOp.PeepholeRules) > 0 && !peepholeRulesDone[data.Asm] {
+				peepholeRulesDone[data.Asm] = true
+				addRules(gOp.PeepholeRules, "peepholeRule")
+			}
+			if len(gOp.LowerRules) > 0 {
+				if key := data.GoOp + data.GoType; !lowerRulesDone[key] {
+					lowerRulesDone[key] = true
+					addRules(gOp.LowerRules, "lowerRule")
+				}
+				// The lower rules replace the default lowering rule.
+				continue
+			}
+		}
+		if gOp.MemFeatures != nil && *gOp.MemFeatures == "vbcst" {
+			// sanity check
+			selected := true
+			for _, a := range gOp.In {
+				if a.TreatLikeAScalarOfSize != nil {
+					selected = false
+					break
+				}
+			}
+			// Each rule combines a load with the operation, in
+			// place of its last vreg, giving a single instruction
+			// that both loads from memory and performs the
+			// operation. Most operations load and operate on the
+			// same size, so they get one rule, for a load of that
+			// vreg's Go width. A machine op shared by operations
+			// whose last vregs have different Go widths gets one
+			// rule for each of those widths.
+			//
+			// Operations with a narrow input (see
+			// [Operand.NarrowReg]), such as the widening ExtendTo*
+			// conversions, use only the low N < M bits of their
+			// M-bit input vector, so they can be combined with a
+			// load of any width between N and M. For example,
+			// Int8x32.ExtendToInt32 is VPMOVSXBD256, which uses
+			// only the low 128 bits of its 256-bit input. Usually
+			// its input is a VMOVDQUload256, but after the
+			// compiler's "simd enlarge" pass (see
+			// writeSIMDEnlargeTables) rewrites
+			// LoadInt8x16(s).Enlarge().ExtendToInt32(), its input
+			// is a VMOVDQUload128. We can still combine the load
+			// and the extend into one instruction, but need
+			// additional rules for each valid load width.
+			lastVreg := gOp.In[vregInCnt-1]
+			// Sanity check
+			if selected && lastVreg.Class != "vreg" {
+				panic(fmt.Errorf("simdgen expects vbcst replaced operand to be a vreg, but %v found", lastVreg))
+			}
+			// loadWidths are the widths of the loads to generate
+			// rules for combining with the operation.
+			var loadWidths []int
+			if !selected {
+				// Leave loadWidths empty. An operation with an
+				// input treated as a scalar (see
+				// [Operand.TreatLikeAScalarOfSize]) has no
+				// load form for a rule to produce:
+				// writeSIMDMachineOps doesn't create one.
+			} else {
+				// The operation uses the low N bits of its
+				// M-bit input. In the common case of an
+				// operation that uses its whole input, N == M,
+				// so this is a single width.
+				n, m := lastVreg.Bits.N(), lastVreg.GoWidth().N()
+				for w := n; w <= m; w *= 2 {
+					loadWidths = append(loadWidths, w)
+				}
+			}
+			for _, loadWidth := range loadWidths {
+				memKey := memOpKey{data.Asm, loadWidth}
+				if memOpSeen[memKey] {
+					continue
+				}
+				memOpSeen[memKey] = true
+				memOpData := data
+				// Remove the last vreg from the arg and change it to a load.
+				origArgs := data.Args[:len(data.Args)-1]
+				// Prepare imm args.
+				immArg := ""
+				immArgCombineOff := " [off] "
+				if immType != NoImm && immType != InvalidImm {
+					_, after, found := strings.Cut(origArgs, "]")
+					if found {
+						origArgs = after
+					}
+					immArg = "[c] "
+					immArgCombineOff = " [ssa.MakeValAndOff(int32(uint8(c)),off)] "
+				}
+				memOpData.ArgsLoadAddr = immArg + origArgs + fmt.Sprintf("l:(VMOVDQUload%d {sym} [off] ptr mem)", loadWidth)
+				// Remove the last vreg from the arg and change it to "ptr".
+				memOpData.ArgsAddr = "{sym}" + immArgCombineOff + origArgs + "ptr"
+				if maskType == OneMask {
+					memOpData.ArgsAddr += " mask"
+					memOpData.ArgsLoadAddr += " mask"
+				}
+				memOpData.ArgsAddr += " mem"
+				if gOp.MemFeaturesData != nil {
+					_, feat2 := getVbcstData(*gOp.MemFeaturesData)
+					knownFeatChecks := map[string]string{
+						"AVX":    "v.Block.CPUfeatures.HasFeature(ssa.CPUavx)",
+						"AVX2":   "v.Block.CPUfeatures.HasFeature(ssa.CPUavx2)",
+						"AVX512": "v.Block.CPUfeatures.HasFeature(ssa.CPUavx512)",
+					}
+					memOpData.FeatCheck = knownFeatChecks[feat2]
+					memOpData.TplName = "vregMemFeatCheck"
+				} else {
+					memOpData.TplName = "vregMem"
+				}
+				memOptData = append(memOptData, memOpData)
+				asmCheck[memOpData.Asm+"load"] = true
+			}
+		}
+		// Generate the masked merging optimization rules
+		if noMaskName, blend, ok := gOp.mergeMaskedForm(maskType, opOutShape); ok {
+			// TODO: handle customized operand order and special lower.
+			// The rule matches the machine op, which carries the immediate
+			// in its aux field even when the generic op has a constant
+			// immediate (and so no [a] in data.Args). Match and pass it
+			// through, so the merging op keeps it.
+			mergeArgs := data.Args
+			if data.ConstImm {
+				mergeArgs = "[a] " + mergeArgs
+			}
+			rule := fmt.Sprintf("(%s dst (%s %s) mask) => (%sMerging dst %s mask)\n",
+				blend, noMaskName, mergeArgs, data.Asm, mergeArgs)
+			if ruleExisting, ok := maskedMergeOpts[noMaskName]; ok && ruleExisting != rule {
+				panic(fmt.Sprintf("multiple masked merge rules for one op:\n%s\n%s\n", ruleExisting, rule))
+			}
+			maskedMergeOpts[noMaskName] = rule
+		}
+
+		if tplName == "pureVreg" && data.Args == data.ArgsOut {
+			data.Args = "..."
+			data.ArgsOut = "..."
+		}
+		data.TplName = tplName
+		for _, pred := range gOp.svePredicatedOps() {
+			if r := sveMergingPeephole(pred, immType != NoImm); r != "" {
+				sveRules = append(sveRules, r)
+			}
+		}
+		if opr.NoGenericOps != nil && *opr.NoGenericOps == "true" ||
+			opr.SkipMaskedMethod() {
+			optData = append(optData, data)
+			continue
+		}
+		allData = append(allData, data)
+		asmCheck[data.Asm] = true
+	}
+
+	slices.SortFunc(allData, compareTplRuleData)
+
+	hiHalfRules := generateHiHalfFoldingRules(ops)
+	for _, rule := range hiHalfRules {
+		buffer.WriteString(rule)
+	}
+
+	for _, data := range allData {
+		tpl := ruleTemplates.Get(data.TplName)
+		if tpl == nil {
+			panic(fmt.Errorf("template %s not found", data.TplName))
+		}
+		if err := tpl.Execute(buffer, data); err != nil {
+			panic(fmt.Errorf("failed to execute template %s for %s: %w", data.TplName, data.GoOp+data.GoType, err))
+		}
+	}
+
+	// Signed and unsigned element types share machine ops, so the same rule can
+	// be produced more than once.
+	slices.Sort(sveRules)
+	sveRules = slices.Compact(sveRules)
+	for _, rule := range sveRules {
+		buffer.WriteString(rule)
+	}
+
+	seen := make(map[string]bool)
+
+	for _, data := range optData {
+		if data.TplName == "maskIn" {
+			rule := data.MaskOptimization(asmCheck)
+			if seen[rule] {
+				continue
+			}
+			seen[rule] = true
+			buffer.WriteString(rule)
+		}
+	}
+
+	maskedMergeOptsRules := []string{}
+	for asm, rule := range maskedMergeOpts {
+		if !asmCheck[asm] {
+			continue
+		}
+		maskedMergeOptsRules = append(maskedMergeOptsRules, rule)
+	}
+	slices.Sort(maskedMergeOptsRules)
+	for _, rule := range maskedMergeOptsRules {
+		buffer.WriteString(rule)
+	}
+
+	for _, data := range memOptData {
+		tpl := ruleTemplates.Get(data.TplName)
+		if tpl == nil {
+			panic(fmt.Errorf("template %s not found", data.TplName))
+		}
+		if err := tpl.Execute(buffer, data); err != nil {
+			panic(fmt.Errorf("failed to execute template %s for %s: %w", data.TplName, data.Asm, err))
+		}
+	}
+}
+
+// Note: SetHi was removed (temporarily?) from 1.27, but may return in some form
+// and these optimizations may apply to the equivalent idioms.
+//
+// generateHiHalfFoldingRules generates folding rules that combine SetHi/HiToLo patterns
+// with narrow/long base operations into the hi-half "2" variant instruction.
+//
+// x.HiToLo() is lowered as (VDUPDextr[1] x)
+//
+// x.SetHi(lo) is lowered as (VMOVDins0 [1] x (VDUPDextr [0] lo))
+//
+// Narrow (e.g., SHRN): SetHi wraps the narrow result.
+//
+//	(VMOVDins0 [1] dst y:(VSHRN4S [a] x)) => (VSHRN2_4S dst [a] x)
+//
+// Unary Long (e.g., USHLL) getting high half (HiToLo) as input:
+//
+//	(VUSHLL4H [a] (VDUPDextr [1] x)) => (VUSHLL2_4H [a] x)
+//
+// Binary Long (e.g., UMULL, SMULL), both inputs from HiToLo:
+//
+//	(VUMULL4H (VDUPDextr [1] x) (VDUPDextr [1] y)) => (VUMULL2_4H x y)
+func generateHiHalfFoldingRules(ops []Operation) []string {
+	seen := make(map[string]bool)
+	var rules []string
+
+	for _, opr := range ops {
+		if opr.HiHalfAsm == nil {
+			continue
+		}
+		kind := opr.hiHalfKind()
+		if kind == "" {
+			continue
+		}
+		_, _, maskType, immType, gOp, _ := opr.shape()
+		asm := machineOpName(maskType, gOp)
+		asm2 := hiHalfOpName(*gOp.HiHalfAsm, gOp)
+
+		if seen[asm] {
+			continue
+		}
+		seen[asm] = true
+
+		vregInCnt := 0
+		for _, in := range gOp.In {
+			if in.Class == "vreg" {
+				vregInCnt++
+			}
+		}
+		hasImm := immType == VarImm || immType == VarImmLim || immType == ConstVarImm
+
+		switch kind {
+		case "narrow":
+			switch vregInCnt {
+			case 1:
+				// Note, at least for 1.27, SetHi is not supported, because it is an emulated instruction,
+				// not part of the scalable set, and though it is intended to mimic the similar instruction
+				// on amd64, it is actually slightly different.
+				//
+				// Narrow: the value used by SetHi may be produced with asm2 (hiHalf) variant.
+				// TODO: Maybe have a separate rule: (VMOVDins0 [c] dst (VDUPDextr [0] src)) => (VMOVDins0 [c] dst src)
+				if hasImm {
+					rules = append(rules, fmt.Sprintf("(VMOVDins0 [1] dst (VDUPDextr [0] (%s [c] y))) => (%s dst [c] y)\n", asm, asm2))
+				} else {
+					rules = append(rules, fmt.Sprintf("(VMOVDins0 [1] dst (VDUPDextr [0] (%s y))) => (%s dst y)\n", asm, asm2))
+				}
+			default:
+				panic("unsupported yet folding narrow ops cases")
+			}
+		case "long":
+			switch vregInCnt {
+			case 1:
+				// Long: input from HiToLo (VDUPDextr [1]), prefer hiHalf variant.
+				if hasImm {
+					rules = append(rules, fmt.Sprintf("(%s [a] (VDUPDextr [1] x)) => (%s [a] x)\n", asm, asm2))
+				} else {
+					rules = append(rules, fmt.Sprintf("(%s (VDUPDextr [1] x)) => (%s x)\n", asm, asm2))
+				}
+			case 2:
+				// Binary Long: both inputs are from HiToLo, fold into hiHalf variant.
+				rules = append(rules, fmt.Sprintf("(%s (VDUPDextr [1] x) (VDUPDextr [1] y)) => (%s x y)\n", asm, asm2))
+			default:
+				panic("unsupported yet folding long ops cases")
+			}
+		}
+	}
+
+	slices.Sort(rules)
+	return rules
+}

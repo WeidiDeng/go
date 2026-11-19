@@ -94,7 +94,7 @@ type missingValType struct{}
 
 var missingVal = reflect.ValueOf(missingValType{})
 
-var missingValReflectType = reflect.TypeOf(missingValType{})
+var missingValReflectType = reflect.TypeFor[missingValType]()
 
 func isMissing(v reflect.Value) bool {
 	return v.IsValid() && v.Type() == missingValReflectType
@@ -103,12 +103,6 @@ func isMissing(v reflect.Value) bool {
 // at marks the state to be on node n, for error reporting.
 func (s *state) at(node parse.Node) {
 	s.node = node
-}
-
-// doublePercent returns the string with %'s replaced by %%, if necessary,
-// so it can be used safely inside a Printf format string.
-func doublePercent(str string) string {
-	return strings.ReplaceAll(str, "%", "%%")
 }
 
 // TODO: It would be nice if ExecError was more broken down, but
@@ -133,16 +127,19 @@ func (e ExecError) Unwrap() error {
 
 // errorf records an ExecError and terminates processing.
 func (s *state) errorf(format string, args ...any) {
-	name := doublePercent(s.tmpl.Name())
+	name := s.tmpl.Name()
+	var err error
 	if s.node == nil {
-		format = fmt.Sprintf("template: %s: %s", name, format)
+		args = append([]any{name}, args...)
+		err = fmt.Errorf("template: %s: "+format, args...)
 	} else {
 		location, context := s.tmpl.ErrorContext(s.node)
-		format = fmt.Sprintf("template: %s: executing %q at <%s>: %s", location, name, doublePercent(context), format)
+		args = append([]any{location, name, context}, args...)
+		err = fmt.Errorf("template: %s: executing %q at <%s>: "+format, args...)
 	}
 	panic(ExecError{
 		Name: s.tmpl.Name(),
-		Err:  fmt.Errorf(format, args...),
+		Err:  err,
 	})
 }
 
@@ -201,8 +198,8 @@ func (t *Template) ExecuteTemplate(wr io.Writer, name string, data any) error {
 // A template may be executed safely in parallel, although if parallel
 // executions share a Writer the output may be interleaved.
 //
-// If data is a reflect.Value, the template applies to the concrete
-// value that the reflect.Value holds, as in fmt.Print.
+// If data is a [reflect.Value], the template applies to the concrete
+// value that the reflect.Value holds, as in [fmt.Print].
 func (t *Template) Execute(wr io.Writer, data any) error {
 	return t.execute(wr, data)
 }
@@ -228,7 +225,7 @@ func (t *Template) execute(wr io.Writer, data any) (err error) {
 // DefinedTemplates returns a string listing the defined templates,
 // prefixed by the string "; defined templates are: ". If there are none,
 // it returns the empty string. For generating an error message here
-// and in html/template.
+// and in [html/template].
 func (t *Template) DefinedTemplates() string {
 	if t.common == nil {
 		return ""
@@ -314,9 +311,17 @@ func (s *state) walkIfOrWith(typ parse.NodeType, dot reflect.Value, pipe *parse.
 	}
 }
 
-// IsTrue reports whether the value is 'true', in the sense of not the zero of its type,
-// and whether the value has a meaningful truth value. This is the definition of
-// truth used by if and other such actions.
+// IsTrue reports whether the value is true, in the sense of being nonzero,
+// nonempty, or non-nil, and whether the value has a meaningful truth value.
+// This is the definition of truth used in "if" actions and elsewhere in
+// templates:
+//
+//   - A boolean value is true if it is true.
+//   - A numeric value is true if it is nonzero.
+//   - An array, map, slice, or string value is true if its length is
+//     greater than zero.
+//   - Any other value is true if it is non-nil; struct values are
+//     never nil, and therefore always true.
 func IsTrue(val any) (truth, ok bool) {
 	return isTrue(reflect.ValueOf(val))
 }
@@ -333,7 +338,7 @@ func isTrue(val reflect.Value) (truth, ok bool) {
 		truth = val.Bool()
 	case reflect.Complex64, reflect.Complex128:
 		truth = val.Complex() != 0
-	case reflect.Chan, reflect.Func, reflect.Pointer, reflect.Interface:
+	case reflect.Chan, reflect.Func, reflect.Pointer, reflect.UnsafePointer, reflect.Interface:
 		truth = !val.IsNil()
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		truth = val.Int() != 0
@@ -361,13 +366,29 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 	// mark top of stack before any variables in the body are pushed.
 	mark := s.mark()
 	oneIteration := func(index, elem reflect.Value) {
-		// Set top var (lexically the second if there are two) to the element.
 		if len(r.Pipe.Decl) > 0 {
-			s.setTopVar(1, elem)
+			if r.Pipe.IsAssign {
+				// With two variables, index comes first.
+				// With one, we use the element.
+				if len(r.Pipe.Decl) > 1 {
+					s.setVar(r.Pipe.Decl[0].Ident[0], index)
+				} else {
+					s.setVar(r.Pipe.Decl[0].Ident[0], elem)
+				}
+			} else {
+				// Set top var (lexically the second if there
+				// are two) to the element.
+				s.setTopVar(1, elem)
+			}
 		}
-		// Set next var (lexically the first if there are two) to the index.
 		if len(r.Pipe.Decl) > 1 {
-			s.setTopVar(2, index)
+			if r.Pipe.IsAssign {
+				s.setVar(r.Pipe.Decl[1].Ident[0], elem)
+			} else {
+				// Set next var (lexically the first if there
+				// are two) to the index.
+				s.setTopVar(2, index)
+			}
 		}
 		defer s.pop(mark)
 		defer func() {
@@ -379,6 +400,22 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 		s.walk(elem, r.List)
 	}
 	switch val.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if len(r.Pipe.Decl) > 1 {
+			s.errorf("can't use %v to iterate over more than one variable", val)
+			break
+		}
+		run := false
+		for v := range val.Seq() {
+			run = true
+			// Pass element as second value, as we do for channels.
+			oneIteration(reflect.Value{}, v)
+		}
+		if !run {
+			break
+		}
+		return
 	case reflect.Array, reflect.Slice:
 		if val.Len() == 0 {
 			break
@@ -392,8 +429,8 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 			break
 		}
 		om := fmtsort.Sort(val)
-		for i, key := range om.Key {
-			oneIteration(key, om.Value[i])
+		for _, m := range om {
+			oneIteration(m.Key, m.Value)
 		}
 		return
 	case reflect.Chan:
@@ -418,6 +455,43 @@ func (s *state) walkRange(dot reflect.Value, r *parse.RangeNode) {
 		return
 	case reflect.Invalid:
 		break // An invalid value is likely a nil map, etc. and acts like an empty map.
+	case reflect.Func:
+		if val.Type().CanSeq() {
+			if len(r.Pipe.Decl) > 1 {
+				s.errorf("can't use %v iterate over more than one variable", val)
+				break
+			}
+			run := false
+			for v := range val.Seq() {
+				run = true
+				// Pass element as second value,
+				// as we do for channels.
+				oneIteration(reflect.Value{}, v)
+			}
+			if !run {
+				break
+			}
+			return
+		}
+		if val.Type().CanSeq2() {
+			run := false
+			for i, v := range val.Seq2() {
+				run = true
+				if len(r.Pipe.Decl) > 1 {
+					oneIteration(i, v)
+				} else {
+					// If there is only one range variable,
+					// oneIteration will use the
+					// second value.
+					oneIteration(reflect.Value{}, i)
+				}
+			}
+			if !run {
+				break
+			}
+			return
+		}
+		fallthrough
 	default:
 		s.errorf("range can't iterate over %v", val)
 	}
@@ -463,7 +537,7 @@ func (s *state) evalPipeline(dot reflect.Value, pipe *parse.PipeNode) (value ref
 		value = s.evalCommand(dot, cmd, value) // previous value is this one's final arg.
 		// If the object has type interface{}, dig down one level to the thing inside.
 		if value.Kind() == reflect.Interface && value.Type().NumMethod() == 0 {
-			value = reflect.ValueOf(value.Interface()) // lovely!
+			value = value.Elem()
 		}
 	}
 	for _, variable := range pipe.Decl {
@@ -692,9 +766,10 @@ func (s *state) evalField(dot reflect.Value, fieldName string, node parse.Node, 
 }
 
 var (
-	errorType        = reflect.TypeOf((*error)(nil)).Elem()
-	fmtStringerType  = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
-	reflectValueType = reflect.TypeOf((*reflect.Value)(nil)).Elem()
+	errorType        = reflect.TypeFor[error]()
+	fmtStringerType  = reflect.TypeFor[fmt.Stringer]()
+	reflectValueType = reflect.TypeFor[reflect.Value]()
+	stringType       = reflect.TypeFor[string]()
 )
 
 // evalCall executes a function or method call. If it's a method, fun already has the receiver bound, so
@@ -718,9 +793,8 @@ func (s *state) evalCall(dot, fun reflect.Value, isBuiltin bool, node parse.Node
 	} else if numIn != typ.NumIn() {
 		s.errorf("wrong number of args for %s: want %d got %d", name, typ.NumIn(), numIn)
 	}
-	if !goodFunc(typ) {
-		// TODO: This could still be a confusing error; maybe goodFunc should provide info.
-		s.errorf("can't call method/function %q with %d results", name, typ.NumOut())
+	if err := goodFunc(name, typ); err != nil {
+		s.errorf("%v", err)
 	}
 
 	unwrap := func(v reflect.Value) reflect.Value {
@@ -742,7 +816,7 @@ func (s *state) evalCall(dot, fun reflect.Value, isBuiltin bool, node parse.Node
 				return v
 			}
 		}
-		if final != missingVal {
+		if !final.Equal(missingVal) {
 			// The last argument to and/or is coming from
 			// the pipeline. We didn't short circuit on an earlier
 			// argument, so we are going to return this one.
@@ -784,6 +858,21 @@ func (s *state) evalCall(dot, fun reflect.Value, isBuiltin bool, node parse.Node
 		}
 		argv[i] = s.validateType(final, t)
 	}
+
+	// Special case for the "call" builtin.
+	// Insert the name of the callee function as the first argument.
+	if isBuiltin && name == "call" {
+		var calleeName string
+		if len(args) == 0 {
+			// final must be present or we would have errored out above.
+			calleeName = final.String()
+		} else {
+			calleeName = args[0].String()
+		}
+		argv = append([]reflect.Value{reflect.ValueOf(calleeName)}, argv...)
+		fun = reflect.ValueOf(call)
+	}
+
 	v, err := safeCall(fun, argv)
 	// If we have an error that is not nil, stop execution and return that
 	// error to the caller.
@@ -1017,6 +1106,17 @@ func indirectInterface(v reflect.Value) reflect.Value {
 // the template.
 func (s *state) printValue(n parse.Node, v reflect.Value) {
 	s.at(n)
+	// Fast path for a plain string, which is what every html/template
+	// action prints. A string has no methods, so fmt.Fprint would write
+	// it unchanged.
+	if v.IsValid() && v.Type() == stringType {
+		if sw, ok := s.wr.(io.StringWriter); ok {
+			if _, err := sw.WriteString(v.String()); err != nil {
+				s.writeError(err)
+			}
+			return
+		}
+	}
 	iface, ok := printableValue(v)
 	if !ok {
 		s.errorf("can't print %s of type %s", n, v.Type())

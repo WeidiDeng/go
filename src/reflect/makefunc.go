@@ -8,6 +8,7 @@ package reflect
 
 import (
 	"internal/abi"
+	"internal/goarch"
 	"unsafe"
 )
 
@@ -22,7 +23,7 @@ type makeFuncImpl struct {
 	fn   func([]Value) []Value
 }
 
-// MakeFunc returns a new function of the given Type
+// MakeFunc returns a new function of the given [Type]
 // that wraps the function fn. When called, that new function
 // does the following:
 //
@@ -30,28 +31,29 @@ type makeFuncImpl struct {
 //   - runs results := fn(args).
 //   - returns the results as a slice of Values, one per formal result.
 //
-// The implementation fn can assume that the argument Value slice
+// The implementation fn can assume that the argument [Value] slice
 // has the number and type of arguments given by typ.
 // If typ describes a variadic function, the final Value is itself
 // a slice representing the variadic arguments, as in the
 // body of a variadic function. The result Value slice returned by fn
 // must have the number and type of results given by typ.
 //
-// The Value.Call method allows the caller to invoke a typed function
+// The [Value.Call] method allows the caller to invoke a typed function
 // in terms of Values; in contrast, MakeFunc allows the caller to implement
 // a typed function in terms of Values.
 //
 // The Examples section of the documentation includes an illustration
 // of how to use MakeFunc to build a swap function for different types.
 func MakeFunc(typ Type, fn func(args []Value) (results []Value)) Value {
+	t := typ.common()
+	typ = toType(t) // for #80332, ensure t's exported methods are not shadowed
 	if typ.Kind() != Func {
 		panic("reflect: call of MakeFunc with non-Func type")
 	}
 
-	t := typ.common()
 	ftyp := (*funcType)(unsafe.Pointer(t))
 
-	code := abi.FuncPCABI0(makeFuncStub)
+	code := funcHandle(abi.FuncPCABI0(makeFuncStub))
 
 	// makeFuncImpl contains a stack map for use by the runtime
 	_, _, abid := funcLayout(ftyp, nil)
@@ -86,27 +88,30 @@ type methodValue struct {
 	rcvr   Value
 }
 
-// makeMethodValue converts v from the rcvr+method index representation
-// of a method value to an actual method func value, which is
-// basically the receiver value with a special bit set, into a true
-// func value - a value holding an actual func. The output is
-// semantically equivalent to the input as far as the user of package
-// reflect can tell, but the true func representation can be handled
-// by code like Convert and Interface and Assign.
-func makeMethodValue(op string, v Value) Value {
-	if v.flag&flagMethod == 0 {
-		panic("reflect: internal error: invalid use of makeMethodValue")
+// makeMethodValue implements Value.Method(i). It creates a method func
+// value closure containing the receiver v and method index i, with the
+// flagMethod bit set so that direct calls via reflect can use a fast path.
+func makeMethodValue(v Value, i int) Value {
+	var mtyp *abi.Type
+	typ := v.typ()
+	if typ.Kind() == abi.Interface {
+		tt := (*interfaceType)(unsafe.Pointer(typ))
+		if uint(i) >= uint(len(tt.Methods)) {
+			panic("reflect: internal error: invalid method index")
+		}
+		m := &tt.Methods[i]
+		mtyp = typeOffFor(typ, m.Typ)
+	} else {
+		ms := typ.ExportedMethods()
+		if uint(i) >= uint(len(ms)) {
+			panic("reflect: internal error: invalid method index")
+		}
+		m := ms[i]
+		mtyp = typeOffFor(typ, m.Mtyp)
 	}
+	ftyp := mtyp.FuncType()
 
-	// Ignoring the flagMethod bit, v describes the receiver, not the method type.
-	fl := v.flag & (flagRO | flagAddr | flagIndir)
-	fl |= flag(v.typ.Kind())
-	rcvr := Value{v.typ, v.ptr, fl}
-
-	// v.Type returns the actual type of the method value.
-	ftyp := (*funcType)(unsafe.Pointer(v.Type().(*rtype)))
-
-	code := methodValueCallCodePtr()
+	code := methodValueCallCode()
 
 	// methodValue contains a stack map for use by the runtime
 	_, _, abid := funcLayout(ftyp, nil)
@@ -117,20 +122,15 @@ func makeMethodValue(op string, v Value) Value {
 			argLen:  abid.stackCallArgsSize,
 			regPtrs: abid.inRegPtrs,
 		},
-		method: int(v.flag) >> flagMethodShift,
-		rcvr:   rcvr,
+		method: i,
+		rcvr:   v,
 	}
 
-	// Cause panic if method is not appropriate.
-	// The panic would still happen during the call if we omit this,
-	// but we want Interface() and other operations to fail early.
-	methodReceiver(op, fv.rcvr, fv.method)
-
-	return Value{&ftyp.rtype, unsafe.Pointer(fv), v.flag&flagRO | flag(Func)}
+	return Value{ftyp.Common(), unsafe.Pointer(fv), v.flag.ro() | flagMethod | flag(Func)}
 }
 
-func methodValueCallCodePtr() uintptr {
-	return abi.FuncPCABI0(methodValueCall)
+func methodValueCallCode() uintptr {
+	return funcHandle(abi.FuncPCABI0(methodValueCall))
 }
 
 // methodValueCall is an assembly function that is the code half of
@@ -164,13 +164,18 @@ func moveMakeFuncArgPtrs(ctxt *makeFuncCtxt, args *abi.RegArgs) {
 	for i, arg := range args.Ints {
 		// Avoid write barriers! Because our write barrier enqueues what
 		// was there before, we might enqueue garbage.
+		// Also avoid bounds checks, we don't have the stack space for it.
+		// (Normally the prove pass removes them, but for -N builds we
+		// use too much stack.)
+		// ptr := &args.Ptrs[i] (but cast from *unsafe.Pointer to *uintptr)
+		ptr := (*uintptr)(add(unsafe.Pointer(unsafe.SliceData(args.Ptrs[:])), uintptr(i)*goarch.PtrSize, "always in [0:IntArgRegs]"))
 		if ctxt.regPtrs.Get(i) {
-			*(*uintptr)(unsafe.Pointer(&args.Ptrs[i])) = arg
+			*ptr = arg
 		} else {
 			// We *must* zero this space ourselves because it's defined in
 			// assembly code and the GC will scan these pointers. Otherwise,
 			// there will be garbage here.
-			*(*uintptr)(unsafe.Pointer(&args.Ptrs[i])) = 0
+			*ptr = 0
 		}
 	}
 }

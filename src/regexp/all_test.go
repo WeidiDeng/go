@@ -5,8 +5,12 @@
 package regexp
 
 import (
+	"bytes"
+	"internal/race"
+	"internal/testenv"
 	"reflect"
 	"regexp/syntax"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -49,6 +53,7 @@ var badRe = []stringError{
 	{`a**`, "invalid nested repetition operator: `**`"},
 	{`a*+`, "invalid nested repetition operator: `*+`"},
 	{`\x`, "invalid escape sequence: `\\x`"},
+	{strings.Repeat(`\pL`, 27000), "expression too large"},
 }
 
 func compileTest(t *testing.T, expr string, error string) *Regexp {
@@ -77,6 +82,9 @@ func TestBadCompile(t *testing.T) {
 }
 
 func matchTest(t *testing.T, test *FindTest) {
+	if test.max == 0 {
+		return
+	}
 	re := compileTest(t, test.pat, "")
 	if re == nil {
 		return
@@ -504,7 +512,10 @@ var splitTests = []struct {
 	{"", ".*", -1, []string{""}},
 	{"", ".+", -1, []string{""}},
 	{"", "", -1, []string{}},
+	{"", "", 2, []string{}},
 	{"foobar", "", -1, []string{"f", "o", "o", "b", "a", "r"}},
+	{"foobar", "", 3, []string{"f", "o", "obar"}},
+	{"abc", "x*", 2, []string{"a", "bc"}},
 	{"abaabaccadaaae", "a*", 5, []string{"", "b", "b", "c", "cadaaae"}},
 	{":x:y:z:", ":", -1, []string{"", "x", "y", "z", ""}},
 }
@@ -518,14 +529,39 @@ func TestSplit(t *testing.T) {
 		}
 
 		split := re.Split(test.s, test.n)
-		if !reflect.DeepEqual(split, test.out) {
+		if !slices.Equal(split, test.out) || (split == nil) != (test.out == nil) {
+			t.Errorf("#%d: %q: got %#v; want %#v", i, test.r, split, test.out)
+		}
+
+		if QuoteMeta(test.r) == test.r {
+			strsplit := strings.SplitN(test.s, test.r, test.n)
+			if !slices.Equal(split, strsplit) {
+				t.Errorf("#%d: Split(%q, %q, %d): regexp vs strings mismatch\nregexp=%q\nstrings=%q", i, test.s, test.r, test.n, split, strsplit)
+			}
+		}
+	}
+}
+
+func TestSplitAll(t *testing.T) {
+	for i, test := range splitTests {
+		re, err := Compile(test.r)
+		if err != nil {
+			t.Errorf("#%d: %q: compile error: %s", i, test.r, err.Error())
+			continue
+		}
+		if test.n >= 0 {
+			continue
+		}
+
+		split := slices.Collect(re.SplitSeq(test.s))
+		if !slices.Equal(split, test.out) {
 			t.Errorf("#%d: %q: got %q; want %q", i, test.r, split, test.out)
 		}
 
 		if QuoteMeta(test.r) == test.r {
 			strsplit := strings.SplitN(test.s, test.r, test.n)
-			if !reflect.DeepEqual(split, strsplit) {
-				t.Errorf("#%d: Split(%q, %q, %d): regexp vs strings mismatch\nregexp=%q\nstrings=%q", i, test.s, test.r, test.n, split, strsplit)
+			if !slices.Equal(split, strsplit) {
+				t.Errorf("#%d: SplitSeq(%q, %q): regexp vs strings mismatch\nregexp=%q\nstrings=%q", i, test.s, test.r, split, strsplit)
 			}
 		}
 	}
@@ -598,6 +634,40 @@ func BenchmarkFind(b *testing.B) {
 	}
 }
 
+func TestFindAllNoMatchAllocs(t *testing.T) {
+	if race.Enabled {
+		t.Skip("The race detector randomly drops pooled objects.")
+	}
+	if testenv.OptimizationOff() {
+		t.Skip("skipping test with optimizations disabled")
+	}
+	re := MustCompile("a+b+")
+	text := "acddee"
+	data := []byte(text)
+	for _, test := range []struct {
+		name string
+		find func() bool
+	}{
+		{"FindAll", func() bool { return re.FindAll(data, -1) == nil }},
+		{"FindAllString", func() bool { return re.FindAllString(text, -1) == nil }},
+		{"FindAllIndex", func() bool { return re.FindAllIndex(data, -1) == nil }},
+		{"FindAllStringIndex", func() bool { return re.FindAllStringIndex(text, -1) == nil }},
+		{"FindAllSubmatch", func() bool { return re.FindAllSubmatch(data, -1) == nil }},
+		{"FindAllStringSubmatch", func() bool { return re.FindAllStringSubmatch(text, -1) == nil }},
+		{"FindAllSubmatchIndex", func() bool { return re.FindAllSubmatchIndex(data, -1) == nil }},
+		{"FindAllStringSubmatchIndex", func() bool { return re.FindAllStringSubmatchIndex(text, -1) == nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !test.find() {
+				t.Fatal("got non-nil result, want nil")
+			}
+			if n := testing.AllocsPerRun(100, func() { test.find() }); n != 0 {
+				t.Errorf("got %v allocs, want 0", n)
+			}
+		})
+	}
+}
+
 func BenchmarkFindAllNoMatches(b *testing.B) {
 	re := MustCompile("a+b+")
 	s := []byte("acddee")
@@ -607,6 +677,19 @@ func BenchmarkFindAllNoMatches(b *testing.B) {
 		all := re.FindAll(s, -1)
 		if all != nil {
 			b.Fatalf("FindAll(%q) = %q; want nil", s, all)
+		}
+	}
+}
+
+func BenchmarkFindAllTenMatches(b *testing.B) {
+	re := MustCompile("a+b+")
+	s := bytes.Repeat([]byte("acddeeabbax"), 10)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		all := re.FindAll(s, -1)
+		if len(all) != 10 {
+			b.Fatalf("FindAll(%q) = %q; want 10 matches", s, all)
 		}
 	}
 }
@@ -945,4 +1028,45 @@ func TestMinInputLen(t *testing.T) {
 			t.Errorf("regexp %#q has minInputLen %d, should be %d", tt.Regexp, m, tt.min)
 		}
 	}
+}
+
+func TestUnmarshalText(t *testing.T) {
+	unmarshaled := new(Regexp)
+	for i := range goodRe {
+		re := compileTest(t, goodRe[i], "")
+		marshaled, err := re.MarshalText()
+		if err != nil {
+			t.Errorf("regexp %#q failed to marshal: %s", re, err)
+			continue
+		}
+		if err := unmarshaled.UnmarshalText(marshaled); err != nil {
+			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
+			continue
+		}
+		if unmarshaled.String() != goodRe[i] {
+			t.Errorf("UnmarshalText returned unexpected value: %s", unmarshaled.String())
+		}
+
+		buf := make([]byte, 4, 32)
+		marshalAppend, err := re.AppendText(buf)
+		if err != nil {
+			t.Errorf("regexp %#q failed to marshal: %s", re, err)
+			continue
+		}
+		marshalAppend = marshalAppend[4:]
+		if err := unmarshaled.UnmarshalText(marshalAppend); err != nil {
+			t.Errorf("regexp %#q failed to unmarshal: %s", re, err)
+			continue
+		}
+		if unmarshaled.String() != goodRe[i] {
+			t.Errorf("UnmarshalText returned unexpected value: %s", unmarshaled.String())
+		}
+	}
+	t.Run("invalid pattern", func(t *testing.T) {
+		re := new(Regexp)
+		err := re.UnmarshalText([]byte(`\`))
+		if err == nil {
+			t.Error("unexpected success")
+		}
+	})
 }

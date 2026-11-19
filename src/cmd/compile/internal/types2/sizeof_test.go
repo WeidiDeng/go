@@ -13,11 +13,21 @@ import (
 
 func TestSizeof(t *testing.T) {
 	const _64bit = ^uint(0)>>32 != 0
+	// wasm32 has 32-bit pointers with 8-byte alignment for uint64.
+	_wasm32 := reflect.TypeFor[uintptr]().Size() == 4 &&
+		reflect.TypeFor[uint64]().Align() == 8
+
+	// Objects and Scope each have two position fields (syntax.Pos vs token.Pos),
+	// which accounts for 16 extra bytes in types2 on both 32-bit and 64-bit platforms.
+	var extra uintptr
+	if isTypes2 {
+		extra = 16
+	}
 
 	var tests = []struct {
-		val    interface{} // type as a value
-		_32bit uintptr     // size on 32bit platforms
-		_64bit uintptr     // size on 64bit platforms
+		val    any     // type as a value
+		_32bit uintptr // size on 32bit platforms
+		_64bit uintptr // size on 64bit platforms
 	}{
 		// Types
 		{Basic{}, 16, 32},
@@ -26,28 +36,28 @@ func TestSizeof(t *testing.T) {
 		{Struct{}, 24, 48},
 		{Pointer{}, 8, 16},
 		{Tuple{}, 12, 24},
-		{Signature{}, 28, 56},
+		{Signature{}, 32, 64},
 		{Union{}, 12, 24},
 		{Interface{}, 40, 80},
 		{Map{}, 16, 32},
 		{Chan{}, 12, 24},
-		{Named{}, 60, 112},
+		{Named{}, 68, 128},
 		{TypeParam{}, 28, 48},
 		{term{}, 12, 24},
 
 		// Objects
-		{PkgName{}, 64, 104},
-		{Const{}, 64, 104},
-		{TypeName{}, 56, 88},
-		{Var{}, 64, 104},
-		{Func{}, 64, 104},
-		{Label{}, 60, 96},
-		{Builtin{}, 60, 96},
-		{Nil{}, 56, 88},
+		{PkgName{}, 40 + extra, 80 + extra},
+		{Const{}, 44 + extra, 88 + extra},
+		{TypeName{}, 36 + extra, 72 + extra},
+		{Var{}, 44 + extra, 88 + extra},
+		{Func{}, 44 + extra, 88 + extra},
+		{Label{}, 40 + extra, 80 + extra},
+		{Builtin{}, 40 + extra, 80 + extra},
+		{Nil{}, 36 + extra, 72 + extra},
 
 		// Misc
-		{Scope{}, 60, 104},
-		{Package{}, 36, 72},
+		{Scope{}, 48 + extra, 96 + extra},
+		{Package{}, 44, 88},
 		{_TypeSet{}, 28, 56},
 	}
 
@@ -56,6 +66,11 @@ func TestSizeof(t *testing.T) {
 		want := test._32bit
 		if _64bit {
 			want = test._64bit
+		} else if _wasm32 {
+			switch test.val.(type) {
+			case TypeParam:
+				want = 32
+			}
 		}
 		if got != want {
 			t.Errorf("unsafe.Sizeof(%T) = %d, want %d", test.val, got, want)

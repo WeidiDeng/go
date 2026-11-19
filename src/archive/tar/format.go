@@ -33,7 +33,7 @@ import "strings"
 //	sub-second times  |     no |       yes |        no
 //	sparse files      |     no |       yes |       yes
 //
-// The table's upper portion shows the Header fields, where each format reports
+// The table's upper portion shows the [Header] fields, where each format reports
 // the maximum number of bytes allowed for each string field and
 // the integer type used to store each numeric field
 // (where timestamps are stored as the number of seconds since the Unix epoch).
@@ -147,6 +147,12 @@ const (
 	// Max length of a special file (PAX header, GNU long name or link).
 	// This matches the limit used by libarchive.
 	maxSpecialFileSize = 1 << 20
+
+	// Maximum number of sparse file entries.
+	// We should never actually hit this limit
+	// (every sparse encoding will first be limited by maxSpecialFileSize),
+	// but this adds an additional layer of defense.
+	maxSparseFileEntries = 1 << 20
 )
 
 // blockPadding computes the number of bytes needed to pad offset up to the
@@ -166,7 +172,7 @@ func (b *block) toSTAR() *headerSTAR   { return (*headerSTAR)(b) }
 func (b *block) toUSTAR() *headerUSTAR { return (*headerUSTAR)(b) }
 func (b *block) toSparse() sparseArray { return sparseArray(b[:]) }
 
-// GetFormat checks that the block is a valid tar header based on the checksum.
+// getFormat checks that the block is a valid tar header based on the checksum.
 // It then attempts to guess the specific format based on magic values.
 // If the checksum fails, then FormatUnknown is returned.
 func (b *block) getFormat() Format {
@@ -229,17 +235,23 @@ func (b *block) setFormat(format Format) {
 // signed byte values.
 // We compute and return both.
 func (b *block) computeChecksum() (unsigned, signed int64) {
-	for i, c := range b {
-		if 148 <= i && i < 156 {
-			c = ' ' // Treat the checksum field itself as all spaces.
-		}
+	for _, c := range b[:148] {
+		unsigned += int64(c)
+		signed += int64(int8(c))
+	}
+	// Treat the checksum field itself (bytes 148 to 155, inclusive)
+	// as if it were all spaces.
+	const chksumSpaces = 8 * int64(' ')
+	unsigned += chksumSpaces
+	signed += chksumSpaces
+	for _, c := range b[156:] {
 		unsigned += int64(c)
 		signed += int64(int8(c))
 	}
 	return unsigned, signed
 }
 
-// Reset clears the block with all zeros.
+// reset clears the block with all zeros.
 func (b *block) reset() {
 	*b = block{}
 }

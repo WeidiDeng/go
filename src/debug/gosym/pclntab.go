@@ -11,6 +11,8 @@ package gosym
 import (
 	"bytes"
 	"encoding/binary"
+	"internal/abi"
+	"internal/saferio"
 	"sort"
 	"sync"
 )
@@ -29,7 +31,7 @@ const (
 
 // A LineTable is a data structure mapping program counters to line numbers.
 //
-// In Go 1.1 and earlier, each function (represented by a Func) had its own LineTable,
+// In Go 1.1 and earlier, each function (represented by a [Func]) had its own LineTable,
 // and the line number corresponded to a numbering of all source lines in the
 // program, across all files. That absolute line number would then have to be
 // converted separately to a file name and line number within the file.
@@ -39,7 +41,7 @@ const (
 // numbers, just line numbers within specific files.
 //
 // For the most part, LineTable's methods should be treated as an internal
-// detail of the package; callers should use the methods on Table instead.
+// detail of the package; callers should use the methods on [Table] instead.
 type LineTable struct {
 	Data []byte
 	PC   uint64
@@ -148,7 +150,11 @@ func (t *LineTable) LineToPC(line int, maxpc uint64) uint64 {
 // NewLineTable returns a new PC/line table
 // corresponding to the encoded data.
 // Text must be the start address of the
-// corresponding text segment.
+// corresponding text segment, with the exact
+// value stored in the 'runtime.text' symbol.
+// This value may differ from the start
+// address of the text segment if
+// binary was built with cgo enabled.
 func NewLineTable(data []byte, text uint64) *LineTable {
 	return &LineTable{Data: data, PC: text, Line: 0, funcNames: make(map[uint32]string), strings: make(map[uint32]string)}
 }
@@ -169,13 +175,6 @@ func (t *LineTable) isGo12() bool {
 	t.parsePclnTab()
 	return t.version >= ver12
 }
-
-const (
-	go12magic  = 0xfffffffb
-	go116magic = 0xfffffffa
-	go118magic = 0xfffffff0
-	go120magic = 0xfffffff1
-)
 
 // uintptr returns the pointer-sized value encoded at b.
 // The pointer size is dictated by the table being read.
@@ -216,33 +215,44 @@ func (t *LineTable) parsePclnTab() {
 	}
 
 	var possibleVersion version
-	leMagic := binary.LittleEndian.Uint32(t.Data)
-	beMagic := binary.BigEndian.Uint32(t.Data)
+
+	// The magic numbers are chosen such that reading the value with
+	// a different endianness does not result in the same value.
+	// That lets us the magic number to determine the endianness.
+	leMagic := abi.PCLnTabMagic(binary.LittleEndian.Uint32(t.Data))
+	beMagic := abi.PCLnTabMagic(binary.BigEndian.Uint32(t.Data))
+
 	switch {
-	case leMagic == go12magic:
+	case leMagic == abi.Go12PCLnTabMagic:
 		t.binary, possibleVersion = binary.LittleEndian, ver12
-	case beMagic == go12magic:
+	case beMagic == abi.Go12PCLnTabMagic:
 		t.binary, possibleVersion = binary.BigEndian, ver12
-	case leMagic == go116magic:
+	case leMagic == abi.Go116PCLnTabMagic:
 		t.binary, possibleVersion = binary.LittleEndian, ver116
-	case beMagic == go116magic:
+	case beMagic == abi.Go116PCLnTabMagic:
 		t.binary, possibleVersion = binary.BigEndian, ver116
-	case leMagic == go118magic:
+	case leMagic == abi.Go118PCLnTabMagic:
 		t.binary, possibleVersion = binary.LittleEndian, ver118
-	case beMagic == go118magic:
+	case beMagic == abi.Go118PCLnTabMagic:
 		t.binary, possibleVersion = binary.BigEndian, ver118
-	case leMagic == go120magic:
+	case leMagic == abi.Go120PCLnTabMagic:
 		t.binary, possibleVersion = binary.LittleEndian, ver120
-	case beMagic == go120magic:
+	case beMagic == abi.Go120PCLnTabMagic:
 		t.binary, possibleVersion = binary.BigEndian, ver120
 	default:
 		return
 	}
-	t.version = possibleVersion
 
 	// quantum and ptrSize are the same between 1.2, 1.16, and 1.18
 	t.quantum = uint32(t.Data[6])
 	t.ptrsize = uint32(t.Data[7])
+
+	// Compute the field size from possibleVersion because t.version must
+	// remain ver11 until parsing succeeds.
+	fieldsize := int(t.ptrsize)
+	if possibleVersion >= ver118 {
+		fieldsize = 4
+	}
 
 	offset := func(word uint32) uint64 {
 		return t.uintptr(t.Data[8+word*t.ptrsize:])
@@ -262,7 +272,7 @@ func (t *LineTable) parsePclnTab() {
 		t.pctab = data(6)
 		t.funcdata = data(7)
 		t.functab = data(7)
-		functabsize := (int(t.nfunctab)*2 + 1) * t.functabFieldSize()
+		functabsize := (int(t.nfunctab)*2 + 1) * fieldsize
 		t.functab = t.functab[:functabsize]
 	case ver116:
 		t.nfunctab = uint32(offset(0))
@@ -273,7 +283,7 @@ func (t *LineTable) parsePclnTab() {
 		t.pctab = data(5)
 		t.funcdata = data(6)
 		t.functab = data(6)
-		functabsize := (int(t.nfunctab)*2 + 1) * t.functabFieldSize()
+		functabsize := (int(t.nfunctab)*2 + 1) * fieldsize
 		t.functab = t.functab[:functabsize]
 	case ver12:
 		t.nfunctab = uint32(t.uintptr(t.Data[8:]))
@@ -281,7 +291,7 @@ func (t *LineTable) parsePclnTab() {
 		t.funcnametab = t.Data
 		t.functab = t.Data[8+t.ptrsize:]
 		t.pctab = t.Data
-		functabsize := (int(t.nfunctab)*2 + 1) * t.functabFieldSize()
+		functabsize := (int(t.nfunctab)*2 + 1) * fieldsize
 		fileoff := t.binary.Uint32(t.functab[functabsize:])
 		t.functab = t.functab[:functabsize]
 		t.filetab = t.Data[fileoff:]
@@ -290,6 +300,8 @@ func (t *LineTable) parsePclnTab() {
 	default:
 		panic("unreachable")
 	}
+
+	t.version = possibleVersion
 }
 
 // go12Funcs returns a slice of Funcs derived from the Go 1.2+ pcln table.
@@ -302,24 +314,31 @@ func (t *LineTable) go12Funcs() []Func {
 	}
 
 	ft := t.funcTab()
-	funcs := make([]Func, ft.Count())
-	syms := make([]Sym, len(funcs))
-	for i := range funcs {
-		f := &funcs[i]
+	funcCount := ft.Count()
+	cf := saferio.SliceCap[Func](uint64(funcCount))
+	cs := saferio.SliceCap[Sym](uint64(funcCount))
+	if cf < 0 || cs < 0 {
+		return nil
+	}
+	funcs := make([]Func, 0, cf)
+	syms := make([]Sym, 0, cs)
+	for i := range funcCount {
+		var f Func
 		f.Entry = ft.pc(i)
 		f.End = ft.pc(i + 1)
 		info := t.funcData(uint32(i))
 		f.LineTable = t
 		f.FrameSize = int(info.deferreturn())
-		syms[i] = Sym{
+		funcs = append(funcs, f)
+		syms = append(syms, Sym{
 			Value:     f.Entry,
 			Type:      'T',
 			Name:      t.funcName(info.nameOff()),
 			GoType:    0,
-			Func:      f,
+			Func:      &funcs[i],
 			goVersion: t.version,
-		}
-		f.Sym = &syms[i]
+		})
+		funcs[i].Sym = &syms[i]
 	}
 	return funcs
 }

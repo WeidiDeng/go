@@ -5,9 +5,12 @@
 package gcimporter
 
 import (
+	"cmp"
 	"go/token"
 	"go/types"
 	"internal/pkgbits"
+	"slices"
+	"strings"
 )
 
 // A pkgReader holds the shared state for reading a unified IR package
@@ -28,9 +31,11 @@ type pkgReader struct {
 
 	// laterFns holds functions that need to be invoked at the end of
 	// import reading.
+	//
+	// TODO(mdempsky): Is it safe to have a single "later" slice or do
+	// we need to have multiple passes? See comments on CL 386002 and
+	// go.dev/issue/52104.
 	laterFns []func()
-	// laterFors is used in case of 'type A B' to ensure that B is processed before A.
-	laterFors map[types.Type]int
 
 	// ifaces holds a list of constructed Interfaces, which need to have
 	// Complete called after importing is done.
@@ -39,15 +44,6 @@ type pkgReader struct {
 
 // later adds a function to be invoked at the end of import reading.
 func (pr *pkgReader) later(fn func()) {
-	pr.laterFns = append(pr.laterFns, fn)
-}
-
-// laterFor adds a function to be invoked at the end of import reading, and records the type that function is finishing.
-func (pr *pkgReader) laterFor(t types.Type, fn func()) {
-	if pr.laterFors == nil {
-		pr.laterFors = make(map[types.Type]int)
-	}
-	pr.laterFors[t] = len(pr.laterFns)
 	pr.laterFns = append(pr.laterFns, fn)
 }
 
@@ -65,22 +61,26 @@ func readUnifiedPackage(fset *token.FileSet, ctxt *types.Context, imports map[st
 		ctxt:    ctxt,
 		imports: imports,
 
-		posBases: make([]string, input.NumElems(pkgbits.RelocPosBase)),
-		pkgs:     make([]*types.Package, input.NumElems(pkgbits.RelocPkg)),
-		typs:     make([]types.Type, input.NumElems(pkgbits.RelocType)),
+		posBases: make([]string, input.NumElems(pkgbits.SectionPosBase)),
+		pkgs:     make([]*types.Package, input.NumElems(pkgbits.SectionPkg)),
+		typs:     make([]types.Type, input.NumElems(pkgbits.SectionType)),
 	}
 	defer pr.fake.setLines()
 
-	r := pr.newReader(pkgbits.RelocMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
+	r := pr.newReader(pkgbits.SectionMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
 	pkg := r.pkg()
-	r.Bool() // TODO(mdempsky): Remove; was "has init"
+	if r.Version().Has(pkgbits.HasInit) {
+		r.Bool()
+	}
 
 	for i, n := 0, r.Len(); i < n; i++ {
 		// As if r.obj(), but avoiding the Scope.Lookup call,
 		// to avoid eager loading of imports.
 		r.Sync(pkgbits.SyncObject)
-		assert(!r.Bool())
-		r.p.objIdx(r.Reloc(pkgbits.RelocObj))
+		if r.Version().Has(pkgbits.DerivedFuncInstance) {
+			assert(!r.Bool())
+		}
+		r.p.objIdx(r.Reloc(pkgbits.SectionObj))
 		assert(r.Len() == 0)
 	}
 
@@ -93,6 +93,18 @@ func readUnifiedPackage(fset *token.FileSet, ctxt *types.Context, imports map[st
 	for _, iface := range pr.ifaces {
 		iface.Complete()
 	}
+
+	// Imports() of pkg are all of the transitive packages that were loaded.
+	var imps []*types.Package
+	for _, imp := range pr.pkgs {
+		if imp != nil && imp != pkg {
+			imps = append(imps, imp)
+		}
+	}
+	slices.SortFunc(imps, func(a, b *types.Package) int {
+		return strings.Compare(a.Path(), b.Path())
+	})
+	pkg.SetImports(imps)
 
 	pkg.MarkComplete()
 	return pkg
@@ -111,27 +123,26 @@ type reader struct {
 // A readerDict holds the state for type parameters that parameterize
 // the current unified IR element.
 type readerDict struct {
-	// bounds is a slice of typeInfos corresponding to the underlying
-	// bounds of the element's type parameters.
-	bounds []typeInfo
+	rtbounds []typeInfo         // contains constraint types for each parameter in rtparams
+	rtparams []*types.TypeParam // contains receiver type parameters for an element
 
-	// tparams is a slice of the constructed TypeParams for the element.
-	tparams []*types.TypeParam
+	tbounds []typeInfo         // contains constraint types for each parameter in tparams
+	tparams []*types.TypeParam // contains type parameters for an element
 
-	// devived is a slice of types derived from tparams, which may be
+	// derived is a slice of types derived from tparams, which may be
 	// instantiated while reading the current element.
 	derived      []derivedInfo
 	derivedTypes []types.Type // lazily instantiated from derived
 }
 
-func (pr *pkgReader) newReader(k pkgbits.RelocKind, idx pkgbits.Index, marker pkgbits.SyncMarker) *reader {
+func (pr *pkgReader) newReader(k pkgbits.SectionKind, idx pkgbits.Index, marker pkgbits.SyncMarker) *reader {
 	return &reader{
 		Decoder: pr.NewDecoder(k, idx, marker),
 		p:       pr,
 	}
 }
 
-func (pr *pkgReader) tempReader(k pkgbits.RelocKind, idx pkgbits.Index, marker pkgbits.SyncMarker) *reader {
+func (pr *pkgReader) tempReader(k pkgbits.SectionKind, idx pkgbits.Index, marker pkgbits.SyncMarker) *reader {
 	return &reader{
 		Decoder: pr.TempDecoder(k, idx, marker),
 		p:       pr,
@@ -158,7 +169,7 @@ func (r *reader) pos() token.Pos {
 }
 
 func (r *reader) posBase() string {
-	return r.p.posBaseIdx(r.Reloc(pkgbits.RelocPosBase))
+	return r.p.posBaseIdx(r.Reloc(pkgbits.SectionPosBase))
 }
 
 func (pr *pkgReader) posBaseIdx(idx pkgbits.Index) string {
@@ -168,7 +179,7 @@ func (pr *pkgReader) posBaseIdx(idx pkgbits.Index) string {
 
 	var filename string
 	{
-		r := pr.tempReader(pkgbits.RelocPosBase, idx, pkgbits.SyncPosBase)
+		r := pr.tempReader(pkgbits.SectionPosBase, idx, pkgbits.SyncPosBase)
 
 		// Within types2, position bases have a lot more details (e.g.,
 		// keeping track of where //line directives appeared exactly).
@@ -198,7 +209,7 @@ func (pr *pkgReader) posBaseIdx(idx pkgbits.Index) string {
 
 func (r *reader) pkg() *types.Package {
 	r.Sync(pkgbits.SyncPkg)
-	return r.p.pkgIdx(r.Reloc(pkgbits.RelocPkg))
+	return r.p.pkgIdx(r.Reloc(pkgbits.SectionPkg))
 }
 
 func (pr *pkgReader) pkgIdx(idx pkgbits.Index) *types.Package {
@@ -208,7 +219,7 @@ func (pr *pkgReader) pkgIdx(idx pkgbits.Index) *types.Package {
 		return pkg
 	}
 
-	pkg := pr.newReader(pkgbits.RelocPkg, idx, pkgbits.SyncPkgDef).doPkg()
+	pkg := pr.newReader(pkgbits.SectionPkg, idx, pkgbits.SyncPkgDef).doPkg()
 	pr.pkgs[idx] = pkg
 	return pkg
 }
@@ -233,43 +244,7 @@ func (r *reader) doPkg() *types.Package {
 	pkg := types.NewPackage(path, name)
 	r.p.imports[path] = pkg
 
-	imports := make([]*types.Package, r.Len())
-	for i := range imports {
-		imports[i] = r.pkg()
-	}
-
-	// The documentation for (*types.Package).Imports requires
-	// flattening the import graph when reading from export data, as
-	// obviously incorrect as that is.
-	//
-	// TODO(mdempsky): Remove this if go.dev/issue/54096 is accepted.
-	pkg.SetImports(flattenImports(imports))
-
 	return pkg
-}
-
-// flattenImports returns the transitive closure of all imported
-// packages rooted from pkgs.
-func flattenImports(pkgs []*types.Package) []*types.Package {
-	var res []*types.Package
-
-	seen := make(map[*types.Package]bool)
-	var add func(pkg *types.Package)
-	add = func(pkg *types.Package) {
-		if seen[pkg] {
-			return
-		}
-		seen[pkg] = true
-		res = append(res, pkg)
-		for _, imp := range pkg.Imports() {
-			add(imp)
-		}
-	}
-
-	for _, pkg := range pkgs {
-		add(pkg)
-	}
-	return res
 }
 
 // @@@ Types
@@ -283,7 +258,7 @@ func (r *reader) typInfo() typeInfo {
 	if r.Bool() {
 		return typeInfo{idx: pkgbits.Index(r.Len()), derived: true}
 	}
-	return typeInfo{idx: r.Reloc(pkgbits.RelocType), derived: false}
+	return typeInfo{idx: r.Reloc(pkgbits.SectionType), derived: false}
 }
 
 func (pr *pkgReader) typIdx(info typeInfo, dict *readerDict) types.Type {
@@ -302,7 +277,7 @@ func (pr *pkgReader) typIdx(info typeInfo, dict *readerDict) types.Type {
 
 	var typ types.Type
 	{
-		r := pr.tempReader(pkgbits.RelocType, idx, pkgbits.SyncTypeIdx)
+		r := pr.tempReader(pkgbits.SectionType, idx, pkgbits.SyncTypeIdx)
 		r.dict = dict
 
 		typ = r.doTyp()
@@ -337,7 +312,11 @@ func (r *reader) doTyp() (res types.Type) {
 		return name.Type()
 
 	case pkgbits.TypeTypeParam:
-		return r.dict.tparams[r.Len()]
+		n := r.Len()
+		if n < len(r.dict.rtbounds) {
+			return r.dict.rtparams[n]
+		}
+		return r.dict.tparams[n-len(r.dict.rtbounds)]
 
 	case pkgbits.TypeArray:
 		len := int64(r.Uint64())
@@ -427,32 +406,34 @@ func (r *reader) interfaceType() *types.Interface {
 func (r *reader) signature(recv *types.Var, rtparams, tparams []*types.TypeParam) *types.Signature {
 	r.Sync(pkgbits.SyncSignature)
 
-	params := r.params()
-	results := r.params()
+	params := r.params(types.ParamVar)
+	results := r.params(types.ResultVar)
 	variadic := r.Bool()
 
 	return types.NewSignatureType(recv, rtparams, tparams, params, results, variadic)
 }
 
-func (r *reader) params() *types.Tuple {
+func (r *reader) params(kind types.VarKind) *types.Tuple {
 	r.Sync(pkgbits.SyncParams)
 
 	params := make([]*types.Var, r.Len())
 	for i := range params {
-		params[i] = r.param()
+		params[i] = r.param(kind)
 	}
 
 	return types.NewTuple(params...)
 }
 
-func (r *reader) param() *types.Var {
+func (r *reader) param(kind types.VarKind) *types.Var {
 	r.Sync(pkgbits.SyncParam)
 
 	pos := r.pos()
 	pkg, name := r.localIdent()
 	typ := r.typ()
 
-	return types.NewParam(pos, pkg, name, typ)
+	param := types.NewParam(pos, pkg, name, typ)
+	param.SetKind(kind) // ∈ {Recv,Param,Result}Var
+	return param
 }
 
 // @@@ Objects
@@ -460,9 +441,11 @@ func (r *reader) param() *types.Var {
 func (r *reader) obj() (types.Object, []types.Type) {
 	r.Sync(pkgbits.SyncObject)
 
-	assert(!r.Bool())
+	if r.Version().Has(pkgbits.DerivedFuncInstance) {
+		assert(!r.Bool())
+	}
 
-	pkg, name := r.p.objIdx(r.Reloc(pkgbits.RelocObj))
+	pkg, name := r.p.objIdx(r.Reloc(pkgbits.SectionObj))
 	obj := pkgScope(pkg).Lookup(name)
 
 	targs := make([]types.Type, r.Len())
@@ -479,7 +462,7 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 	var objName string
 	var tag pkgbits.CodeObj
 	{
-		rname := pr.tempReader(pkgbits.RelocName, idx, pkgbits.SyncObject1)
+		rname := pr.tempReader(pkgbits.SectionName, idx, pkgbits.SyncObject1)
 
 		objPkg, objName = rname.qualifiedIdent()
 		assert(objName != "")
@@ -498,10 +481,16 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 		return objPkg, objName
 	}
 
+	// TODO(mark): This, like the above splitVargenSuffix, is not ideal.
+	// Ignore generic methods promoted to global scope.
+	if strings.Contains(objName, ".") {
+		return objPkg, objName
+	}
+
 	if objPkg.Scope().Lookup(objName) == nil {
 		dict := pr.objDictIdx(idx)
 
-		r := pr.newReader(pkgbits.RelocObj, idx, pkgbits.SyncObject1)
+		r := pr.newReader(pkgbits.SectionObj, idx, pkgbits.SyncObject1)
 		r.dict = dict
 
 		declare := func(obj types.Object) {
@@ -514,8 +503,12 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 
 		case pkgbits.ObjAlias:
 			pos := r.pos()
+			var tparams []*types.TypeParam
+			if r.Version().Has(pkgbits.AliasTypeParamNames) {
+				tparams = r.typeParamNames(false)
+			}
 			typ := r.typ()
-			declare(types.NewTypeName(pos, objPkg, objName, typ))
+			declare(newAliasTypeName(pos, objPkg, objName, typ, tparams))
 
 		case pkgbits.ObjConst:
 			pos := r.pos()
@@ -525,7 +518,10 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 
 		case pkgbits.ObjFunc:
 			pos := r.pos()
-			tparams := r.typeParamNames()
+			if r.Version().Has(pkgbits.GenericMethods) {
+				assert(!r.Bool()) // generic methods are read in their defining type
+			}
+			tparams := r.typeParamNames(false)
 			sig := r.signature(nil, nil, tparams)
 			declare(types.NewFunc(pos, objPkg, objName, sig))
 
@@ -536,48 +532,96 @@ func (pr *pkgReader) objIdx(idx pkgbits.Index) (*types.Package, string) {
 			named := types.NewNamed(obj, nil, nil)
 			declare(obj)
 
-			named.SetTypeParams(r.typeParamNames())
+			named.SetTypeParams(r.typeParamNames(false))
 
-			rhs := r.typ()
-			pk := r.p
-			pk.laterFor(named, func() {
-				// First be sure that the rhs is initialized, if it needs to be initialized.
-				delete(pk.laterFors, named) // prevent cycles
-				if i, ok := pk.laterFors[rhs]; ok {
-					f := pk.laterFns[i]
-					pk.laterFns[i] = func() {} // function is running now, so replace it with a no-op
-					f()                        // initialize RHS
-				}
-				underlying := rhs.Underlying()
+			underlying := r.typ().Underlying()
 
-				// If the underlying type is an interface, we need to
-				// duplicate its methods so we can replace the receiver
-				// parameter's type (#49906).
-				if iface, ok := underlying.(*types.Interface); ok && iface.NumExplicitMethods() != 0 {
-					methods := make([]*types.Func, iface.NumExplicitMethods())
-					for i := range methods {
-						fn := iface.ExplicitMethod(i)
-						sig := fn.Type().(*types.Signature)
+			// If the underlying type is an interface, we need to
+			// duplicate its methods so we can replace the receiver
+			// parameter's type (#49906).
+			if iface, ok := underlying.(*types.Interface); ok && iface.NumExplicitMethods() != 0 {
+				methods := make([]*types.Func, iface.NumExplicitMethods())
+				for i := range methods {
+					fn := iface.ExplicitMethod(i)
+					sig := fn.Signature()
 
-						recv := types.NewVar(fn.Pos(), fn.Pkg(), "", named)
-						methods[i] = types.NewFunc(fn.Pos(), fn.Pkg(), fn.Name(), types.NewSignature(recv, sig.Params(), sig.Results(), sig.Variadic()))
-					}
-
-					embeds := make([]types.Type, iface.NumEmbeddeds())
-					for i := range embeds {
-						embeds[i] = iface.EmbeddedType(i)
-					}
-
-					newIface := types.NewInterfaceType(methods, embeds)
-					r.p.ifaces = append(r.p.ifaces, newIface)
-					underlying = newIface
+					recv := types.NewVar(fn.Pos(), fn.Pkg(), "", named)
+					recv.SetKind(types.RecvVar)
+					methods[i] = types.NewFunc(fn.Pos(), fn.Pkg(), fn.Name(), types.NewSignature(recv, sig.Params(), sig.Results(), sig.Variadic()))
 				}
 
-				named.SetUnderlying(underlying)
-			})
+				embeds := make([]types.Type, iface.NumEmbeddeds())
+				for i := range embeds {
+					embeds[i] = iface.EmbeddedType(i)
+				}
 
-			for i, n := 0, r.Len(); i < n; i++ {
-				named.AddMethod(r.method())
+				newIface := types.NewInterfaceType(methods, embeds)
+				r.p.ifaces = append(r.p.ifaces, newIface)
+				underlying = newIface
+			}
+
+			named.SetUnderlying(underlying)
+
+			if r.Version().Has(pkgbits.GenericMethods) {
+				// V4 (go1.27.0) emitted all non-generic methods
+				// before all generic ones, discarding source
+				// order: a bug (go.dev/issue/81188).
+				// V5 (go1.27.x) fixes it by emitting an explicit
+				// index along with each method.
+				type indexedMethod struct {
+					index int // (or -1 in V4)
+					fn    *types.Func
+				}
+
+				var methods []indexedMethod
+
+				// ordinary methods
+				for range r.Len() {
+					idx, m := r.method()
+					methods = append(methods, indexedMethod{idx, m})
+				}
+
+				// generic methods
+				for range r.Len() {
+					// Careful: objIdx is used to read in package-scoped declarations, which
+					// methods are not. Instead, decode it here. This makes it easier to
+					// associate it with the type and avoids the main objIdx loop.
+					idx := r.Reloc(pkgbits.SectionObj)
+
+					r := pr.tempReader(pkgbits.SectionObj, idx, pkgbits.SyncObject1)
+					r.dict = pr.objDictIdx(idx)
+
+					pos := r.pos()
+					assert(r.Bool()) // generic method
+					pkg, name := r.selector()
+					rtparams := r.typeParamNames(true)
+					recv := r.param(types.RecvVar)
+					methodIdx := -1
+					if r.Version().Has(pkgbits.PreserveMethodOrder) {
+						methodIdx = r.Len()
+					}
+					tparams := r.typeParamNames(false)
+					sig := r.signature(recv, rtparams, tparams)
+
+					pr.retireReader(r)
+					methods = append(methods, indexedMethod{methodIdx, types.NewFunc(pos, pkg, name, sig)})
+				}
+
+				if r.Version().Has(pkgbits.PreserveMethodOrder) {
+					slices.SortFunc(methods, func(a, b indexedMethod) int {
+						return cmp.Compare(a.index, b.index)
+					})
+				}
+
+				for _, m := range methods {
+					named.AddMethod(m.fn)
+				}
+
+			} else {
+				for range r.Len() {
+					_, m := r.method()
+					named.AddMethod(m)
+				}
 			}
 
 		case pkgbits.ObjVar:
@@ -595,20 +639,34 @@ func (pr *pkgReader) objDictIdx(idx pkgbits.Index) *readerDict {
 	var dict readerDict
 
 	{
-		r := pr.tempReader(pkgbits.RelocObjDict, idx, pkgbits.SyncObject1)
+		r := pr.tempReader(pkgbits.SectionObjDict, idx, pkgbits.SyncObject1)
 		if implicits := r.Len(); implicits != 0 {
 			errorf("unexpected object with %v implicit type parameter(s)", implicits)
 		}
 
-		dict.bounds = make([]typeInfo, r.Len())
-		for i := range dict.bounds {
-			dict.bounds[i] = r.typInfo()
+		nreceivers := 0
+		if r.Version().Has(pkgbits.GenericMethods) {
+			nreceivers = r.Len()
+		}
+		nexplicits := r.Len()
+
+		dict.rtbounds = make([]typeInfo, nreceivers)
+		for i := range dict.rtbounds {
+			dict.rtbounds[i] = r.typInfo()
+		}
+
+		dict.tbounds = make([]typeInfo, nexplicits)
+		for i := range dict.tbounds {
+			dict.tbounds[i] = r.typInfo()
 		}
 
 		dict.derived = make([]derivedInfo, r.Len())
 		dict.derivedTypes = make([]types.Type, len(dict.derived))
 		for i := range dict.derived {
-			dict.derived[i] = derivedInfo{r.Reloc(pkgbits.RelocType), r.Bool()}
+			dict.derived[i] = derivedInfo{idx: r.Reloc(pkgbits.SectionType)}
+			if r.Version().Has(pkgbits.DerivedInfoNeeded) {
+				assert(!r.Bool())
+			}
 		}
 
 		pr.retireReader(r)
@@ -618,15 +676,24 @@ func (pr *pkgReader) objDictIdx(idx pkgbits.Index) *readerDict {
 	return &dict
 }
 
-func (r *reader) typeParamNames() []*types.TypeParam {
+func (r *reader) typeParamNames(isGenMeth bool) []*types.TypeParam {
 	r.Sync(pkgbits.SyncTypeParamNames)
 
-	// Note: This code assumes it only processes objects without
-	// implement type parameters. This is currently fine, because
-	// reader is only used to read in exported declarations, which are
-	// always package scoped.
+	// Note: This code assumes there are no implicit type parameters.
+	// This is fine since it only reads exported declarations, which
+	// never have implicits.
 
-	if len(r.dict.bounds) == 0 {
+	var in []typeInfo
+	var out *[]*types.TypeParam
+	if isGenMeth {
+		in = r.dict.rtbounds
+		out = &r.dict.rtparams
+	} else {
+		in = r.dict.tbounds
+		out = &r.dict.tparams
+	}
+
+	if len(in) == 0 {
 		return nil
 	}
 
@@ -635,52 +702,50 @@ func (r *reader) typeParamNames() []*types.TypeParam {
 	// create all the TypeNames and TypeParams, then we construct and
 	// set the bound type.
 
-	r.dict.tparams = make([]*types.TypeParam, len(r.dict.bounds))
-	for i := range r.dict.bounds {
+	// We have to save tparams outside of the closure, because typeParamNames
+	// can be called multiple times with the same dictionary instance.
+	tparams := make([]*types.TypeParam, len(in))
+	*out = tparams
+
+	for i := range in {
 		pos := r.pos()
 		pkg, name := r.localIdent()
 
 		tname := types.NewTypeName(pos, pkg, name, nil)
-		r.dict.tparams[i] = types.NewTypeParam(tname, nil)
+		tparams[i] = types.NewTypeParam(tname, nil)
 	}
 
-	typs := make([]types.Type, len(r.dict.bounds))
-	for i, bound := range r.dict.bounds {
-		typs[i] = r.p.typIdx(bound, r.dict)
+	// The reader dictionary will continue mutating before we have time
+	// to call delayed functions; make a local copy of the constraints.
+	types := make([]types.Type, len(in))
+	for i, info := range in {
+		types[i] = r.p.typIdx(info, r.dict)
 	}
 
-	// TODO(mdempsky): This is subtle, elaborate further.
-	//
-	// We have to save tparams outside of the closure, because
-	// typeParamNames() can be called multiple times with the same
-	// dictionary instance.
-	//
-	// Also, this needs to happen later to make sure SetUnderlying has
-	// been called.
-	//
-	// TODO(mdempsky): Is it safe to have a single "later" slice or do
-	// we need to have multiple passes? See comments on CL 386002 and
-	// go.dev/issue/52104.
-	tparams := r.dict.tparams
+	// This needs to happen later to make sure SetUnderlying has been called.
 	r.p.later(func() {
-		for i, typ := range typs {
+		for i, typ := range types {
 			tparams[i].SetConstraint(typ)
 		}
 	})
 
-	return r.dict.tparams
+	return tparams
 }
 
-func (r *reader) method() *types.Func {
+func (r *reader) method() (int, *types.Func) {
 	r.Sync(pkgbits.SyncMethod)
+	idx := -1
+	if r.Version().Has(pkgbits.PreserveMethodOrder) {
+		idx = r.Len()
+	}
 	pos := r.pos()
 	pkg, name := r.selector()
 
-	rparams := r.typeParamNames()
-	sig := r.signature(r.param(), rparams, nil)
+	rparams := r.typeParamNames(false)
+	sig := r.signature(r.param(types.RecvVar), rparams, nil)
 
 	_ = r.pos() // TODO(mdempsky): Remove; this is a hacker for linker.go.
-	return types.NewFunc(pos, pkg, name, sig)
+	return idx, types.NewFunc(pos, pkg, name, sig)
 }
 
 func (r *reader) qualifiedIdent() (*types.Package, string) { return r.ident(pkgbits.SyncSym) }
@@ -701,4 +766,12 @@ func pkgScope(pkg *types.Package) *types.Scope {
 		return pkg.Scope()
 	}
 	return types.Universe
+}
+
+// newAliasTypeName returns a new TypeName, with a materialized *types.Alias if supported.
+func newAliasTypeName(pos token.Pos, pkg *types.Package, name string, rhs types.Type, tparams []*types.TypeParam) *types.TypeName {
+	tname := types.NewTypeName(pos, pkg, name, nil)
+	a := types.NewAlias(tname, rhs) // form TypeName -> Alias cycle
+	a.SetTypeParams(tparams)
+	return tname
 }

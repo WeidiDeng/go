@@ -50,7 +50,7 @@ package sort
 //		fmt.Printf("Pick an integer from 0 to 100.\n")
 //		answer := sort.Search(100, func(i int) bool {
 //			fmt.Printf("Is your number <= %d? ", i)
-//			fmt.Scanf("%s", &s)
+//			fmt.Scan(&s)
 //			return s != "" && s[0] == 'y'
 //		})
 //		fmt.Printf("Your number is %d.\n", answer)
@@ -99,25 +99,29 @@ func Search(n int, f func(int) bool) int {
 func Find(n int, cmp func(int) int) (i int, found bool) {
 	// The invariants here are similar to the ones in Search.
 	// Define cmp(-1) > 0 and cmp(n) <= 0
-	// Invariant: cmp(i-1) > 0, cmp(j) <= 0
+	// Invariant: cmp(i-1) > 0, cmp(j) <= 0, and found == (j < n && cmp(j) == 0)
 	i, j := 0, n
+	// found only goes from false to true: j only decreases, and cmp is
+	// negative only above the indexes where it is zero, so a later narrowing
+	// of j is at an index where cmp is zero too.
 	for i < j {
 		h := int(uint(i+j) >> 1) // avoid overflow when computing h
 		// i ≤ h < j
-		if cmp(h) > 0 {
+		if c := cmp(h); c > 0 {
 			i = h + 1 // preserves cmp(i-1) > 0
 		} else {
 			j = h // preserves cmp(j) <= 0
+			found = c == 0
 		}
 	}
 	// i == j, cmp(i-1) > 0 and cmp(j) <= 0
-	return i, i < n && cmp(i) == 0
+	return i, found
 }
 
 // Convenience wrappers for common cases.
 
 // SearchInts searches for x in a sorted slice of ints and returns the index
-// as specified by Search. The return value is the index to insert x if x is
+// as specified by [Search]. The return value is the index to insert x if x is
 // not present (it could be len(a)).
 // The slice must be sorted in ascending order.
 func SearchInts(a []int, x int) int {
@@ -125,7 +129,7 @@ func SearchInts(a []int, x int) int {
 }
 
 // SearchFloat64s searches for x in a sorted slice of float64s and returns the index
-// as specified by Search. The return value is the index to insert x if x is not
+// as specified by [Search]. The return value is the index to insert x if x is not
 // present (it could be len(a)).
 // The slice must be sorted in ascending order.
 func SearchFloat64s(a []float64, x float64) int {
@@ -140,11 +144,11 @@ func SearchStrings(a []string, x string) int {
 	return Search(len(a), func(i int) bool { return a[i] >= x })
 }
 
-// Search returns the result of applying SearchInts to the receiver and x.
+// Search returns the result of applying [SearchInts] to the receiver and x.
 func (p IntSlice) Search(x int) int { return SearchInts(p, x) }
 
-// Search returns the result of applying SearchFloat64s to the receiver and x.
+// Search returns the result of applying [SearchFloat64s] to the receiver and x.
 func (p Float64Slice) Search(x float64) int { return SearchFloat64s(p, x) }
 
-// Search returns the result of applying SearchStrings to the receiver and x.
+// Search returns the result of applying [SearchStrings] to the receiver and x.
 func (p StringSlice) Search(x string) int { return SearchStrings(p, x) }

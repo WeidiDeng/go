@@ -74,6 +74,43 @@ func TestGobEncodingNilIntInSlice(t *testing.T) {
 	}
 }
 
+func TestIntGobDecode(t *testing.T) {
+	for _, test := range []struct {
+		buf  []byte
+		want int64
+	}{
+		{nil, 0},
+		{[]byte{}, 0},
+		{[]byte{0x02}, 0},
+		{[]byte{0x03}, 0},
+		{[]byte{0x02, 0}, 0},
+		{[]byte{0x03, 0}, 0},
+		{[]byte{0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0},
+		{[]byte{0x02, 1}, 1},
+		{[]byte{0x03, 1}, -1},
+		{[]byte{0x02, 0, 1}, 1},
+		{[]byte{0x03, 0, 1}, -1},
+	} {
+		for _, initial := range []int64{0, 1, -1} {
+			x := NewInt(initial)
+			if err := x.GobDecode(test.buf); err != nil {
+				t.Errorf("initial %d, GobDecode(%x): %v", initial, test.buf, err)
+				continue
+			}
+			if x.Cmp(NewInt(test.want)) != 0 || !isNormalized(x) {
+				t.Errorf("initial %d, GobDecode(%x) = %s, want normalized %d", initial, test.buf, x, test.want)
+				continue
+			}
+			if test.want == 0 {
+				// A decoded zero must be safe to use in arithmetic.
+				if z := new(Int).Sqrt(x); z.Sign() != 0 {
+					t.Errorf("Sqrt(GobDecode(%x)) = %s, want 0", test.buf, z)
+				}
+			}
+		}
+	}
+}
+
 func TestIntJSONEncoding(t *testing.T) {
 	for _, test := range encodingTests {
 		for _, sign := range []string{"", "+", "-"} {
@@ -130,5 +167,38 @@ func TestIntXMLEncoding(t *testing.T) {
 				t.Errorf("XML encoding of %s failed: got %s want %s", &tx, &rx, &tx)
 			}
 		}
+	}
+}
+
+func TestIntAppendText(t *testing.T) {
+	for _, test := range encodingTests {
+		for _, sign := range []string{"", "+", "-"} {
+			x := sign + test
+			var tx Int
+			tx.SetString(x, 10)
+			buf := make([]byte, 4, 32)
+			b, err := tx.AppendText(buf)
+			if err != nil {
+				t.Errorf("marshaling of %s failed: %s", &tx, err)
+				continue
+			}
+			var rx Int
+			if err := rx.UnmarshalText(b[4:]); err != nil {
+				t.Errorf("unmarshaling of %s failed: %s", &tx, err)
+				continue
+			}
+			if rx.Cmp(&tx) != 0 {
+				t.Errorf("AppendText of %s failed: got %s want %s", &tx, &rx, &tx)
+			}
+		}
+	}
+}
+
+func TestIntAppendTextNil(t *testing.T) {
+	var x *Int
+	buf := make([]byte, 4, 16)
+	data, _ := x.AppendText(buf)
+	if string(data[4:]) != "<nil>" {
+		t.Errorf("got %q, want <nil>", data[4:])
 	}
 }

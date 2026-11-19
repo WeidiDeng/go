@@ -7,6 +7,7 @@
 package types2
 
 import (
+	"cmd/compile/internal/syntax"
 	"go/constant"
 	"strings"
 )
@@ -21,10 +22,11 @@ var Unsafe *Package
 
 var (
 	universeIota       Object
+	universeBool       Type
 	universeByte       Type // uint8 alias, but has name "byte"
 	universeRune       Type // int32 alias, but has name "rune"
-	universeAny        Object
 	universeError      Type
+	universeAny        Object
 	universeComparable Object
 )
 
@@ -65,7 +67,7 @@ var Typ = [...]*Basic{
 	UntypedNil:     {UntypedNil, IsUntyped, "untyped nil"},
 }
 
-var aliases = [...]*Basic{
+var basicAliases = [...]*Basic{
 	{Byte, IsInteger | IsUnsigned, "byte"},
 	{Rune, IsInteger, "rune"},
 }
@@ -74,25 +76,19 @@ func defPredeclaredTypes() {
 	for _, t := range Typ {
 		def(NewTypeName(nopos, nil, t.name, t))
 	}
-	for _, t := range aliases {
+
+	for _, t := range basicAliases {
 		def(NewTypeName(nopos, nil, t.name, t))
 	}
-
-	// type any = interface{}
-	// Note: don't use &emptyInterface for the type of any. Using a unique
-	// pointer allows us to detect any and format it as "any" rather than
-	// interface{}, which clarifies user-facing error messages significantly.
-	def(NewTypeName(nopos, nil, "any", &Interface{complete: true, tset: &topTypeSet}))
 
 	// type error interface{ Error() string }
 	{
 		obj := NewTypeName(nopos, nil, "error", nil)
-		obj.setColor(black)
 		typ := NewNamed(obj, nil, nil)
 
 		// error.Error() string
-		recv := NewVar(nopos, nil, "", typ)
-		res := NewVar(nopos, nil, "", Typ[String])
+		recv := newVar(RecvVar, nopos, nil, "", typ)
+		res := newVar(ResultVar, nopos, nil, "", Typ[String])
 		sig := NewSignatureType(recv, nil, nil, nil, NewTuple(res), false)
 		err := NewFunc(nopos, nil, "Error", sig)
 
@@ -100,20 +96,22 @@ func defPredeclaredTypes() {
 		ityp := &Interface{methods: []*Func{err}, complete: true}
 		computeInterfaceTypeSet(nil, nopos, ityp) // prevent races due to lazy computation of tset
 
-		typ.SetUnderlying(ityp)
+		typ.fromRHS = ityp
+		typ.Underlying()
+		def(obj)
+	}
+
+	// type any = interface{}
+	{
+		obj := NewTypeName(nopos, nil, "any", nil)
+		NewAlias(obj, &emptyInterface)
 		def(obj)
 	}
 
 	// type comparable interface{} // marked as comparable
 	{
 		obj := NewTypeName(nopos, nil, "comparable", nil)
-		obj.setColor(black)
-		typ := NewNamed(obj, nil, nil)
-
-		// interface{} // marked as comparable
-		ityp := &Interface{complete: true, tset: &_TypeSet{nil, allTermlist, true}}
-
-		typ.SetUnderlying(ityp)
+		NewNamed(obj, &Interface{complete: true, tset: &_TypeSet{nil, allTermlist, true}}, nil)
 		def(obj)
 	}
 }
@@ -135,7 +133,7 @@ func defPredeclaredConsts() {
 }
 
 func defPredeclaredNil() {
-	def(&Nil{object{name: "nil", typ: Typ[UntypedNil], color_: black}})
+	def(&Nil{object{name: "nil", typ: Typ[UntypedNil]}})
 }
 
 // A builtinId is the id of a builtin function.
@@ -145,6 +143,7 @@ const (
 	// universe scope
 	_Append builtinId = iota
 	_Cap
+	_Clear
 	_Close
 	_Complex
 	_Copy
@@ -152,6 +151,8 @@ const (
 	_Imag
 	_Len
 	_Make
+	_Max
+	_Min
 	_New
 	_Panic
 	_Print
@@ -175,43 +176,82 @@ const (
 )
 
 var predeclaredFuncs = [...]struct {
-	name     string
-	nargs    int
-	variadic bool
-	kind     exprKind
+	name    string
+	kind    exprKind
+	builtin func(*Checker, *operand, *syntax.CallExpr)
 }{
-	_Append:  {"append", 1, true, expression},
-	_Cap:     {"cap", 1, false, expression},
-	_Close:   {"close", 1, false, statement},
-	_Complex: {"complex", 2, false, expression},
-	_Copy:    {"copy", 2, false, statement},
-	_Delete:  {"delete", 2, false, statement},
-	_Imag:    {"imag", 1, false, expression},
-	_Len:     {"len", 1, false, expression},
-	_Make:    {"make", 1, true, expression},
-	_New:     {"new", 1, false, expression},
-	_Panic:   {"panic", 1, false, statement},
-	_Print:   {"print", 0, true, statement},
-	_Println: {"println", 0, true, statement},
-	_Real:    {"real", 1, false, expression},
-	_Recover: {"recover", 0, false, statement},
+	_Append:  {"append", expression, nil},
+	_Cap:     {"cap", expression, nil},
+	_Clear:   {"clear", statement, nil},
+	_Close:   {"close", statement, nil},
+	_Complex: {"complex", expression, nil},
+	_Copy:    {"copy", statement, nil},
+	_Delete:  {"delete", statement, nil},
+	_Imag:    {"imag", expression, nil},
+	_Len:     {"len", expression, nil},
+	_Make:    {"make", expression, nil},
+	_Max:     {"max", expression, nil},
+	_Min:     {"min", expression, nil},
+	_New:     {"new", expression, nil},
+	_Panic:   {"panic", statement, nil},
+	_Print:   {"print", statement, nil},
+	_Println: {"println", statement, nil},
+	_Real:    {"real", expression, nil},
+	_Recover: {"recover", statement, nil},
 
-	_Add:        {"Add", 2, false, expression},
-	_Alignof:    {"Alignof", 1, false, expression},
-	_Offsetof:   {"Offsetof", 1, false, expression},
-	_Sizeof:     {"Sizeof", 1, false, expression},
-	_Slice:      {"Slice", 2, false, expression},
-	_SliceData:  {"SliceData", 1, false, expression},
-	_String:     {"String", 2, false, expression},
-	_StringData: {"StringData", 1, false, expression},
+	_Add:        {"Add", expression, nil},
+	_Alignof:    {"Alignof", expression, nil},
+	_Offsetof:   {"Offsetof", expression, nil},
+	_Sizeof:     {"Sizeof", expression, nil},
+	_Slice:      {"Slice", expression, nil},
+	_SliceData:  {"SliceData", expression, nil},
+	_String:     {"String", expression, nil},
+	_StringData: {"StringData", expression, nil},
 
-	_Assert: {"assert", 1, false, statement},
-	_Trace:  {"trace", 0, true, statement},
+	_Assert: {"assert", statement, nil},
+	_Trace:  {"trace", statement, nil},
+}
+
+// Setting the builtin field when initializing predeclaredFuncs above
+// leads to an initialization cycle. Keep the builtins in this table
+// and use it to fix up predeclaredFuncs below.
+var builtins = [...]func(*Checker, *operand, *syntax.CallExpr){
+	_Append:  (*Checker)._Append,
+	_Cap:     (*Checker)._Cap,
+	_Clear:   (*Checker)._Clear,
+	_Close:   (*Checker)._Close,
+	_Complex: (*Checker)._Complex,
+	_Copy:    (*Checker)._Copy,
+	_Delete:  (*Checker)._Delete,
+	_Imag:    (*Checker)._Imag,
+	_Len:     (*Checker)._Len,
+	_Make:    (*Checker)._Make,
+	_Max:     (*Checker)._Max,
+	_Min:     (*Checker)._Min,
+	_New:     (*Checker)._New,
+	_Panic:   (*Checker)._Panic,
+	_Print:   (*Checker)._Print,
+	_Println: (*Checker)._Println,
+	_Real:    (*Checker)._Real,
+	_Recover: (*Checker)._Recover,
+
+	_Add:        (*Checker)._Add,
+	_Alignof:    (*Checker)._Alignof,
+	_Offsetof:   (*Checker)._Offsetof,
+	_Sizeof:     (*Checker)._Sizeof,
+	_Slice:      (*Checker)._Slice,
+	_SliceData:  (*Checker)._SliceData,
+	_String:     (*Checker)._String,
+	_StringData: (*Checker)._StringData,
+
+	_Assert: (*Checker)._Assert,
+	_Trace:  (*Checker)._Trace,
 }
 
 func defPredeclaredFuncs() {
 	for i := range predeclaredFuncs {
 		id := builtinId(i)
+		predeclaredFuncs[id].builtin = builtins[id] // fix up predeclaredFuncs
 		if id == _Assert || id == _Trace {
 			continue // only define these in testing environment
 		}
@@ -241,10 +281,11 @@ func init() {
 	defPredeclaredFuncs()
 
 	universeIota = Universe.Lookup("iota")
+	universeBool = Universe.Lookup("bool").Type()
 	universeByte = Universe.Lookup("byte").Type()
 	universeRune = Universe.Lookup("rune").Type()
-	universeAny = Universe.Lookup("any")
 	universeError = Universe.Lookup("error").Type()
+	universeAny = Universe.Lookup("any")
 	universeComparable = Universe.Lookup("comparable")
 }
 
@@ -252,13 +293,13 @@ func init() {
 // a scope. Objects with exported names are inserted in the unsafe package
 // scope; other objects are inserted in the universe scope.
 func def(obj Object) {
-	assert(obj.color() == black)
+	assert(obj.Type() != nil)
 	name := obj.Name()
 	if strings.Contains(name, " ") {
 		return // nothing to do
 	}
 	// fix Obj link for named types
-	if typ, _ := obj.Type().(*Named); typ != nil {
+	if typ := asNamed(obj.Type()); typ != nil {
 		typ.obj = obj.(*TypeName)
 	}
 	// exported identifiers go into package unsafe
@@ -272,7 +313,7 @@ func def(obj Object) {
 		case *Builtin:
 			obj.pkg = Unsafe
 		default:
-			unreachable()
+			panic("unreachable")
 		}
 	}
 	if scope.Insert(obj) != nil {

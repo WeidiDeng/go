@@ -10,6 +10,7 @@
 #include "go_tls.h"
 #include "textflag.h"
 #include "asm_ppc64x.h"
+#include "cgo/abi_ppc64x.h"
 
 // This function calls a C function with the function descriptor in R12
 TEXT callCfunction<>(SB),	NOSPLIT|NOFRAME,$0
@@ -130,15 +131,15 @@ TEXT sigtramp<>(SB),NOSPLIT|NOFRAME|TOPFRAME,$0
 
 	// Save m->libcall. We need to do this because we
 	// might get interrupted by a signal in runtime·asmcgocall.
-	MOVD	(m_libcall+libcall_fn)(R6), R7
+	MOVD	(m_mOS+mOS_libcall+libcall_fn)(R6), R7
 	MOVD	R7, 96(R1)
-	MOVD	(m_libcall+libcall_args)(R6), R7
+	MOVD	(m_mOS+mOS_libcall+libcall_args)(R6), R7
 	MOVD	R7, 104(R1)
-	MOVD	(m_libcall+libcall_n)(R6), R7
+	MOVD	(m_mOS+mOS_libcall+libcall_n)(R6), R7
 	MOVD	R7, 112(R1)
-	MOVD	(m_libcall+libcall_r1)(R6), R7
+	MOVD	(m_mOS+mOS_libcall+libcall_r1)(R6), R7
 	MOVD	R7, 120(R1)
-	MOVD	(m_libcall+libcall_r2)(R6), R7
+	MOVD	(m_mOS+mOS_libcall+libcall_r2)(R6), R7
 	MOVD	R7, 128(R1)
 
 	// save errno, it might be EINTR; stuff we do here might reset it.
@@ -162,15 +163,15 @@ sigtramp:
 
 	// restore libcall
 	MOVD	96(R1), R7
-	MOVD	R7, (m_libcall+libcall_fn)(R6)
+	MOVD	R7, (m_mOS+mOS_libcall+libcall_fn)(R6)
 	MOVD	104(R1), R7
-	MOVD	R7, (m_libcall+libcall_args)(R6)
+	MOVD	R7, (m_mOS+mOS_libcall+libcall_args)(R6)
 	MOVD	112(R1), R7
-	MOVD	R7, (m_libcall+libcall_n)(R6)
+	MOVD	R7, (m_mOS+mOS_libcall+libcall_n)(R6)
 	MOVD	120(R1), R7
-	MOVD	R7, (m_libcall+libcall_r1)(R6)
+	MOVD	R7, (m_mOS+mOS_libcall+libcall_r1)(R6)
 	MOVD	128(R1), R7
-	MOVD	R7, (m_libcall+libcall_r2)(R6)
+	MOVD	R7, (m_mOS+mOS_libcall+libcall_r2)(R6)
 
 	// restore errno
 	MOVD	(m_mOS+mOS_perrno)(R6), R7
@@ -197,8 +198,21 @@ DATA	runtime·tstart+8(SB)/8, $TOC(SB)
 DATA	runtime·tstart+16(SB)/8, $0
 GLOBL	runtime·tstart(SB), NOPTR, $24
 
-TEXT tstart<>(SB),NOSPLIT,$0
-	XOR	 R0, R0 // reset R0
+// runtime.rt0LibGoDesc is a function descriptor to rt0_lib_go,
+// used by libInit to create a new thread on AIX where
+// pthread_create expects a function descriptor, not a raw
+// code address.
+DATA	runtime·rt0LibGoDesc+0(SB)/8, $runtime·rt0_lib_go(SB)
+DATA	runtime·rt0LibGoDesc+8(SB)/8, $TOC(SB)
+DATA	runtime·rt0LibGoDesc+16(SB)/8, $0
+GLOBL	runtime·rt0LibGoDesc(SB), NOPTR, $24
+
+// tstart is the first function executed on a new thread started by
+// pthread_create. It is called with the C calling convention, and
+// libpthreads relies on the callee-saved registers after it returns.
+TEXT tstart<>(SB),NOSPLIT|NOFRAME,$0
+	MOVD	R1, R4 // stack top on entry, above the register save area
+	STACK_AND_SAVE_HOST_TO_GO_ABI(0) // also sets R0 to 0
 
 	// set g
 	MOVD	m_g0(R3), g
@@ -206,17 +220,18 @@ TEXT tstart<>(SB),NOSPLIT,$0
 	MOVD	R3, g_m(g)
 
 	// Layout new m scheduler stack on os stack.
-	MOVD	R1, R3
-	MOVD	R3, (g_stack+stack_hi)(g)
+	MOVD	R1, (g_stack+stack_hi)(g)
+	MOVD	R4, R3
 	SUB	$(const_threadStackSize), R3		// stack size
 	MOVD	R3, (g_stack+stack_lo)(g)
-	ADD	$const__StackGuard, R3
+	ADD	$const_stackGuard, R3
 	MOVD	R3, g_stackguard0(g)
 	MOVD	R3, g_stackguard1(g)
 
 	BL	runtime·mstart(SB)
 
-	MOVD R0, R3
+	UNSTACK_AND_RESTORE_GO_TO_HOST_ABI(0)
+	MOVD	$0, R3
 	RET
 
 

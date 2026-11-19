@@ -9,11 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"internal/coverage/pods"
-	"internal/goexperiment"
 	"internal/testenv"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -21,17 +19,6 @@ import (
 	"sync"
 	"testing"
 )
-
-// testcovdata returns the path to the unit test executable to be used as
-// standin for 'go tool covdata'.
-func testcovdata(t testing.TB) string {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Helper()
-		t.Fatal(err)
-	}
-	return exe
-}
 
 // Top level tempdir for test.
 var testTempDir string
@@ -63,7 +50,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "debug: preserving tmpdir %s\n", topTmpdir)
 	}
 	os.Setenv("CMDCOVDATA_TEST_RUN_MAIN", "true")
-	os.Exit(m.Run())
+	m.Run()
 }
 
 var tdmu sync.Mutex
@@ -91,7 +78,7 @@ func gobuild(t *testing.T, indir string, bargs []string) {
 		}
 		t.Logf("cmd: %s %+v\n", testenv.GoToolPath(t), bargs)
 	}
-	cmd := exec.Command(testenv.GoToolPath(t), bargs...)
+	cmd := testenv.Command(t, testenv.GoToolPath(t), bargs...)
 	cmd.Dir = indir
 	b, err := cmd.CombinedOutput()
 	if len(b) != 0 {
@@ -111,6 +98,8 @@ func emitFile(t *testing.T, dst, src string) {
 		t.Fatalf("writing %q: %v", dst, err)
 	}
 }
+
+const mainPkgPath = "prog"
 
 func buildProg(t *testing.T, prog string, dir string, tag string, flags []string) (string, string) {
 	// Create subdirs.
@@ -133,7 +122,7 @@ func buildProg(t *testing.T, prog string, dir string, tag string, flags []string
 
 	// Emit go.mod.
 	mod := filepath.Join(subdir, "go.mod")
-	modsrc := "\nmodule prog\n\ngo 1.19\n"
+	modsrc := "\nmodule " + mainPkgPath + "\n\ngo 1.19\n"
 	if err := os.WriteFile(mod, []byte(modsrc), 0666); err != nil {
 		t.Fatal(err)
 	}
@@ -160,9 +149,6 @@ const debugWorkDir = false
 
 func TestCovTool(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if !goexperiment.CoverageRedesign {
-		t.Skipf("stubbed out due to goexperiment.CoverageRedesign=false")
-	}
 	dir := tempDir(t)
 	if testing.Short() {
 		t.Skip()
@@ -183,7 +169,7 @@ func TestCovTool(t *testing.T) {
 	s.exepath3, s.exedir3 = buildProg(t, "prog1", dir, "atomic", flags)
 
 	// Reuse unit test executable as tool to be tested.
-	s.tool = testcovdata(t)
+	s.tool = testenv.Executable(t)
 
 	// Create a few coverage output dirs.
 	for i := 0; i < 4; i++ {
@@ -213,7 +199,7 @@ func TestCovTool(t *testing.T) {
 				if m != 0 {
 					exepath = s.exepath3
 				}
-				cmd := exec.Command(exepath, args...)
+				cmd := testenv.Command(t, exepath, args...)
 				cmd.Env = append(cmd.Env, "GOCOVERDIR="+s.outdirs[m*2+k])
 				b, err := cmd.CombinedOutput()
 				if len(b) != 0 {
@@ -290,10 +276,10 @@ func runToolOp(t *testing.T, s state, op string, args []string) []string {
 	if showToolInvocations {
 		t.Logf("%s cmd is: %s %+v", op, s.tool, args)
 	}
-	cmd := exec.Command(s.tool, args...)
+	cmd := testenv.Command(t, s.tool, args...)
 	b, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "## %s output: %s\n", op, string(b))
+		fmt.Fprintf(os.Stderr, "## %s output: %s\n", op, b)
 		t.Fatalf("%q run error: %v", op, err)
 	}
 	output := strings.TrimSpace(string(b))
@@ -306,7 +292,7 @@ func runToolOp(t *testing.T, s state, op string, args []string) []string {
 
 func testDump(t *testing.T, s state) {
 	// Run the dumper on the two dirs we generated.
-	dargs := []string{"-pkg=main", "-live", "-i=" + s.outdirs[0] + "," + s.outdirs[1]}
+	dargs := []string{"-pkg=" + mainPkgPath, "-live", "-i=" + s.outdirs[0] + "," + s.outdirs[1]}
 	lines := runToolOp(t, s, "debugdump", dargs)
 
 	// Sift through the output to make sure it has some key elements.
@@ -320,7 +306,7 @@ func testDump(t *testing.T, s state) {
 		},
 		{
 			"main package",
-			regexp.MustCompile(`^Package path: main\s*$`),
+			regexp.MustCompile(`^Package path: ` + mainPkgPath + `\s*$`),
 		},
 		{
 			"main function",
@@ -338,7 +324,7 @@ func testDump(t *testing.T, s state) {
 			}
 		}
 		if !found {
-			t.Errorf("dump output regexp match failed for %s", testpoint.tag)
+			t.Errorf("dump output regexp match failed for %q", testpoint.tag)
 			bad = true
 		}
 	}
@@ -349,7 +335,7 @@ func testDump(t *testing.T, s state) {
 
 func testPercent(t *testing.T, s state) {
 	// Run the dumper on the two dirs we generated.
-	dargs := []string{"-pkg=main", "-i=" + s.outdirs[0] + "," + s.outdirs[1]}
+	dargs := []string{"-pkg=" + mainPkgPath, "-i=" + s.outdirs[0] + "," + s.outdirs[1]}
 	lines := runToolOp(t, s, "percent", dargs)
 
 	// Sift through the output to make sure it has the needful.
@@ -381,11 +367,12 @@ func testPercent(t *testing.T, s state) {
 		dumplines(lines)
 	}
 }
+
 func testPkgList(t *testing.T, s state) {
 	dargs := []string{"-i=" + s.outdirs[0] + "," + s.outdirs[1]}
 	lines := runToolOp(t, s, "pkglist", dargs)
 
-	want := []string{"main", "prog/dep"}
+	want := []string{mainPkgPath, mainPkgPath + "/dep"}
 	bad := false
 	if len(lines) != 2 {
 		t.Errorf("expect pkglist to return two lines")
@@ -406,7 +393,7 @@ func testPkgList(t *testing.T, s state) {
 
 func testTextfmt(t *testing.T, s state) {
 	outf := s.dir + "/" + "t.txt"
-	dargs := []string{"-pkg=main", "-i=" + s.outdirs[0] + "," + s.outdirs[1],
+	dargs := []string{"-pkg=" + mainPkgPath, "-i=" + s.outdirs[0] + "," + s.outdirs[1],
 		"-o", outf}
 	lines := runToolOp(t, s, "textfmt", dargs)
 
@@ -427,7 +414,7 @@ func testTextfmt(t *testing.T, s state) {
 		dumplines(lines[0:10])
 		t.Errorf("textfmt: want %s got %s", want0, lines[0])
 	}
-	want1 := "prog/prog1.go:13.14,15.2 1 1"
+	want1 := mainPkgPath + "/prog1.go:14.2,15.1 1 1"
 	if lines[1] != want1 {
 		dumplines(lines[0:10])
 		t.Errorf("textfmt: want %s got %s", want1, lines[1])
@@ -558,7 +545,7 @@ func testMergeSimple(t *testing.T, s state, indir1, indir2, tag string) {
 		},
 		{
 			tag:     "third function unit 0",
-			re:      regexp.MustCompile(`^0: L23:C23 -- L24:C12 NS=1 = (\d+)$`),
+			re:      regexp.MustCompile(`^0: L24:C2 -- L24:C12 NS=1 = (\d+)$`),
 			nonzero: true,
 		},
 		{
@@ -568,11 +555,11 @@ func testMergeSimple(t *testing.T, s state, indir1, indir2, tag string) {
 		},
 		{
 			tag:     "third function unit 2",
-			re:      regexp.MustCompile(`^2: L24:C12 -- L26:C3 NS=1 = (\d+)$`),
+			re:      regexp.MustCompile(`^2: L25:C3 -- L26:C1 NS=1 = (\d+)$`),
 			nonzero: true,
 		},
 	}
-	flags := []string{"-live", "-pkg=main"}
+	flags := []string{"-live", "-pkg=" + mainPkgPath}
 	runDumpChecks(t, s, outdir, flags, testpoints)
 }
 
@@ -586,7 +573,7 @@ func testMergeSelect(t *testing.T, s state, indir1, indir2 string, tag string) {
 	// based on package.
 	ins := fmt.Sprintf("-i=%s,%s", indir1, indir2)
 	out := fmt.Sprintf("-o=%s", outdir)
-	margs := []string{"-pkg=prog/dep", ins, out}
+	margs := []string{"-pkg=" + mainPkgPath + "/dep", ins, out}
 	lines := runToolOp(t, s, "merge", margs)
 	if len(lines) != 0 {
 		t.Errorf("merge run produced %d lines of unexpected output", len(lines))
@@ -601,9 +588,9 @@ func testMergeSelect(t *testing.T, s state, indir1, indir2 string, tag string) {
 		t.Fatalf("dump run produced no output")
 	}
 	want := map[string]int{
-		"Package path: prog/dep": 0,
-		"Func: Dep1":             0,
-		"Func: PDep":             0,
+		"Package path: " + mainPkgPath + "/dep": 0,
+		"Func: Dep1":                            0,
+		"Func: PDep":                            0,
 	}
 	bad := false
 	for _, line := range lines {
@@ -642,7 +629,7 @@ func testMergeCombinePrograms(t *testing.T, s state) {
 		if k != 0 {
 			args = append(args, "foo", "bar")
 		}
-		cmd := exec.Command(s.exepath2, args...)
+		cmd := testenv.Command(t, s.exepath2, args...)
 		cmd.Env = append(cmd.Env, "GOCOVERDIR="+runout[k])
 		b, err := cmd.CombinedOutput()
 		if len(b) != 0 {
@@ -670,7 +657,7 @@ func testMergeCombinePrograms(t *testing.T, s state) {
 		t.Errorf("merge run produced unexpected output: %v", lines)
 	}
 
-	// We expect the merge tool to produce exacty two files: a meta
+	// We expect the merge tool to produce exactly two files: a meta
 	// data file and a counter file. If we get more than just this one
 	// pair, something went wrong.
 	podlist, err := pods.CollectPods([]string{moutdir}, true)
@@ -697,7 +684,7 @@ func testMergeCombinePrograms(t *testing.T, s state) {
 		},
 	}
 
-	flags := []string{"-live", "-pkg=main"}
+	flags := []string{"-live", "-pkg=" + mainPkgPath}
 	runDumpChecks(t, s, moutdir, flags, testpoints)
 }
 
@@ -718,7 +705,7 @@ func testSubtract(t *testing.T, s state) {
 	}
 
 	// Dump the files in the subtract output dir and examine the result.
-	dargs := []string{"-pkg=main", "-live", "-i=" + soutdir}
+	dargs := []string{"-pkg=" + mainPkgPath, "-live", "-i=" + soutdir}
 	lines = runToolOp(t, s, "debugdump", dargs)
 	if len(lines) == 0 {
 		t.Errorf("dump run produced no output")
@@ -740,7 +727,7 @@ func testSubtract(t *testing.T, s state) {
 		},
 		{
 			tag:  "third function unit 0",
-			re:   regexp.MustCompile(`^0: L23:C23 -- L24:C12 NS=1 = (\d+)$`),
+			re:   regexp.MustCompile(`^0: L24:C2 -- L24:C12 NS=1 = (\d+)$`),
 			zero: true,
 		},
 		{
@@ -750,7 +737,7 @@ func testSubtract(t *testing.T, s state) {
 		},
 		{
 			tag:  "third function unit 2",
-			re:   regexp.MustCompile(`^2: L24:C12 -- L26:C3 NS=1 = (\d+)$`),
+			re:   regexp.MustCompile(`^2: L25:C3 -- L26:C1 NS=1 = (\d+)$`),
 			zero: true,
 		},
 	}
@@ -775,7 +762,7 @@ func testIntersect(t *testing.T, s state, indir1, indir2, tag string) {
 	}
 
 	// Dump the files in the subtract output dir and examine the result.
-	dargs := []string{"-pkg=main", "-live", "-i=" + ioutdir}
+	dargs := []string{"-pkg=" + mainPkgPath, "-live", "-i=" + ioutdir}
 	lines = runToolOp(t, s, "debugdump", dargs)
 	if len(lines) == 0 {
 		t.Errorf("dump run produced no output")
@@ -806,23 +793,37 @@ func testCounterClash(t *testing.T, s state) {
 
 	// Try to merge covdata0 (from prog1.go -countermode=set) with
 	// covdata1 (from prog1.go -countermode=atomic"). This should
-	// produce a counter mode clash error.
+	// work properly, but result in multiple meta-data files.
 	ins := fmt.Sprintf("-i=%s,%s", s.outdirs[0], s.outdirs[3])
 	out := fmt.Sprintf("-o=%s", ccoutdir)
 	args := append([]string{}, "merge", ins, out, "-pcombine")
 	if debugtrace {
 		t.Logf("cc merge command is %s %v\n", s.tool, args)
 	}
-	cmd := exec.Command(s.tool, args...)
+	cmd := testenv.Command(t, s.tool, args...)
 	b, err := cmd.CombinedOutput()
 	t.Logf("%% output: %s\n", string(b))
+	if err != nil {
+		t.Fatalf("clash merge failed: %v", err)
+	}
+
+	// Ask for a textual report from the two dirs. Here we have
+	// to report the mode clash.
+	out = "-o=" + filepath.Join(ccoutdir, "file.txt")
+	args = append([]string{}, "textfmt", ins, out)
+	if debugtrace {
+		t.Logf("clash textfmt command is %s %v\n", s.tool, args)
+	}
+	cmd = testenv.Command(t, s.tool, args...)
+	b, err = cmd.CombinedOutput()
+	t.Logf("%% output: %s\n", string(b))
 	if err == nil {
-		t.Fatalf("clash merge passed unexpectedly")
+		t.Fatalf("expected mode clash")
 	}
 	got := string(b)
 	want := "counter mode clash while reading meta-data"
 	if !strings.Contains(got, want) {
-		t.Errorf("counter clash merge: wanted %s got %s", want, got)
+		t.Errorf("counter clash textfmt: wanted %s got %s", want, got)
 	}
 }
 
@@ -882,7 +883,7 @@ func testEmpty(t *testing.T, s state) {
 		if false {
 			t.Logf("cmd is %s %v\n", s.tool, args)
 		}
-		cmd := exec.Command(s.tool, args...)
+		cmd := testenv.Command(t, s.tool, args...)
 		b, err := cmd.CombinedOutput()
 		t.Logf("%% output: %s\n", string(b))
 		if err != nil {
@@ -926,7 +927,7 @@ func testCommandLineErrors(t *testing.T, s state, outdir string) {
 		if false {
 			t.Logf("cmd is %s %v\n", s.tool, args)
 		}
-		cmd := exec.Command(s.tool, args...)
+		cmd := testenv.Command(t, s.tool, args...)
 		b, err := cmd.CombinedOutput()
 		if err == nil {
 			t.Logf("%% output: %s\n", string(b))

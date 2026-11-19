@@ -5,7 +5,8 @@
 // This program generates Go code that applies rewrite rules to a Value.
 // The generated code implements a function of type func (v *Value) bool
 // which reports whether if did something.
-// Ideas stolen from Swift: http://www.hpl.hp.com/techreports/Compaq-DEC/WRL-2000-2.html
+// Ideas stolen from the Swift Java compiler:
+// https://bitsavers.org/pdf/dec/tech_reports/WRL-2000-2.pdf
 
 package main
 
@@ -24,6 +25,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +51,7 @@ import (
 // special rules: trailing ellipsis "..." (in the outermost sexpr?) must match on both sides of a rule.
 //                trailing three underscore "___" in the outermost match sexpr indicate the presence of
 //                   extra ignored args that need not appear in the replacement
+//                if the right-hand side is in {}, then it is code used to generate the result.
 
 // extra conditions is just a chunk of Go that evaluates to a boolean. It may use
 // variables declared in the matching tsexpr. The variable "v" is predefined to be
@@ -92,8 +95,11 @@ func genSplitLoadRules(arch arch) { genRulesSuffix(arch, "splitload") }
 func genLateLowerRules(arch arch) { genRulesSuffix(arch, "latelower") }
 
 func genRulesSuffix(arch arch, suff string) {
+	var readers []NamedReader
 	// Open input file.
-	text, err := os.Open(arch.name + suff + ".rules")
+	var text io.Reader
+	name := arch.name + suff + ".rules"
+	text, err := os.Open(name)
 	if err != nil {
 		if suff == "" {
 			// All architectures must have a plain rules file.
@@ -102,18 +108,35 @@ func genRulesSuffix(arch arch, suff string) {
 		// Some architectures have bonus rules files that others don't share. That's fine.
 		return
 	}
+	readers = append(readers, NamedReader{name, text})
+
+	// Check for file of SIMD rules to add
+	if suff == "" {
+		simdname := "simd" + arch.name + ".rules"
+		simdtext, err := os.Open(simdname)
+		if err == nil {
+			readers = append(readers, NamedReader{simdname, simdtext})
+		}
+		// SVE shares the ARM64 backend; add its generated rules too.
+		if arch.name == "ARM64" {
+			sveName := "simdARM64SVE.rules"
+			if sveText, err := os.Open(sveName); err == nil {
+				readers = append(readers, NamedReader{sveName, sveText})
+			}
+		}
+	}
 
 	// oprules contains a list of rules for each block and opcode
 	blockrules := map[string][]Rule{}
 	oprules := map[string][]Rule{}
 
 	// read rule file
-	scanner := bufio.NewScanner(text)
+	scanner := MultiScannerFromReaders(readers)
 	rule := ""
 	var lineno int
 	var ruleLineno int // line number of "=>"
 	for scanner.Scan() {
-		lineno++
+		lineno = scanner.Line()
 		line := scanner.Text()
 		if i := strings.Index(line, "//"); i >= 0 {
 			// Remove comments. Note that this isn't string safe, so
@@ -140,7 +163,7 @@ func genRulesSuffix(arch arch, suff string) {
 			break // continuing the line can't help, and it will only make errors worse
 		}
 
-		loc := fmt.Sprintf("%s%s.rules:%d", arch.name, suff, ruleLineno)
+		loc := fmt.Sprintf("%s:%d", scanner.Name(), ruleLineno)
 		for _, rule2 := range expandOr(rule) {
 			r := Rule{Rule: rule2, Loc: loc}
 			if rawop := strings.Split(rule2, " ")[0][1:]; isBlock(rawop, arch) {
@@ -160,7 +183,7 @@ func genRulesSuffix(arch arch, suff string) {
 		log.Fatalf("scanner failed: %v\n", err)
 	}
 	if balance(rule) != 0 {
-		log.Fatalf("%s.rules:%d: unbalanced rule: %v\n", arch.name, lineno, rule)
+		log.Fatalf("%s:%d: unbalanced rule: %v\n", scanner.Name(), lineno, rule)
 	}
 
 	// Order all the ops.
@@ -181,15 +204,15 @@ func genRulesSuffix(arch arch, suff string) {
 			if strings.Contains(oprules[op][0].Rule, "=>") && opByName(arch, op).aux != opByName(arch, eop).aux {
 				panic(fmt.Sprintf("can't use ... for ops that have different aux types: %s and %s", op, eop))
 			}
-			swc := &Case{Expr: exprf("%s", op)}
-			swc.add(stmtf("v.Op = %s", eop))
+			swc := &Case{Expr: exprf("%s%s", splitOpPrefix, op)}
+			swc.add(stmtf("v.Op = %s%s", splitOpPrefix, eop))
 			swc.add(stmtf("return true"))
 			sw.add(swc)
 			continue
 		}
 
-		swc := &Case{Expr: exprf("%s", op)}
-		swc.add(stmtf("return rewriteValue%s%s_%s(v)", arch.name, suff, op))
+		swc := &Case{Expr: exprf("%s%s", splitOpPrefix, op)}
+		swc.add(stmtf("return %s(v)", rewriteFuncName("Value", arch.name, suff, "_"+op)))
 		sw.add(swc)
 	}
 	if len(sw.List) > 0 { // skip if empty
@@ -217,7 +240,7 @@ func genRulesSuffix(arch arch, suff string) {
 		}
 		fn.add(declReserved("b", "v.Block"))
 		fn.add(declReserved("config", "b.Func.Config"))
-		fn.add(declReserved("fe", "b.Func.fe"))
+		fn.add(declReserved("fe", "b.Func."+simpleTitle("fe")))
 		fn.add(declReserved("typ", "&b.Func.Config.Types"))
 		for _, rule := range rules {
 			if rr != nil && !rr.CanFail {
@@ -274,7 +297,7 @@ func genRulesSuffix(arch arch, suff string) {
 	buf := new(bytes.Buffer)
 	fprint(buf, genFile)
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "", buf, parser.ParseComments)
+	file, err := parser.ParseFile(fset, "", buf, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		filename := fmt.Sprintf("%s_broken.go", arch.name)
 		if err := os.WriteFile(filename, buf.Bytes(), 0644); err != nil {
@@ -320,7 +343,9 @@ func genRulesSuffix(arch arch, suff string) {
 	file = astutil.Apply(file, pre, post).(*ast.File)
 
 	// Write the well-formatted source to file
-	f, err := os.Create("../rewrite" + arch.name + suff + ".go")
+	outName := rewritesDir(arch.name, suff) + "rewrite" + arch.name + suff + ".go"
+	mkdirOutFile(outName)
+	f, err := os.Create(outFile(outName))
 	if err != nil {
 		log.Fatalf("can't write output: %v", err)
 	}
@@ -538,6 +563,13 @@ func (u *unusedInspector) node(node ast.Node) {
 			}
 		}
 	case *ast.BasicLit:
+	case *ast.CompositeLit:
+		for _, e := range node.Elts {
+			u.node(e)
+		}
+	case *ast.KeyValueExpr:
+		u.node(node.Key)
+		u.node(node.Value)
 	case *ast.ValueSpec:
 		u.exprs(node.Values)
 	default:
@@ -576,23 +608,30 @@ func fprint(w io.Writer, n Node) {
 	case *File:
 		file := n
 		seenRewrite := make(map[[3]string]string)
-		fmt.Fprintf(w, "// Code generated from _gen/%s%s.rules; DO NOT EDIT.\n", n.Arch.name, n.Suffix)
-		fmt.Fprintf(w, "// generated with: cd _gen; go run .\n")
-		fmt.Fprintf(w, "\npackage ssa\n")
-		for _, path := range append([]string{
+		fmt.Fprintf(w, "// Code generated from _gen/%s%s.rules using 'go generate'; DO NOT EDIT.\n", n.Arch.name, n.Suffix)
+		fmt.Fprintf(w, "\npackage %s\n", rewritesPkg(n.Arch.name, n.Suffix))
+		additionalImports := slices.Clip(n.Arch.imports)
+		additionalImports = append(additionalImports, "cmd/compile/internal/ssa/ssaop")
+		additionalImports = append(additionalImports, splitCorePath)
+
+		allImports := append([]string{
 			"fmt",
 			"internal/buildcfg",
 			"math",
+			"math/bits",
 			"cmd/internal/obj",
 			"cmd/compile/internal/base",
 			"cmd/compile/internal/types",
-		}, n.Arch.imports...) {
+			"cmd/compile/internal/ir",
+			"cmd/compile/internal/ssa/block",
+		}, additionalImports...)
+		for _, path := range allImports {
 			fmt.Fprintf(w, "import %q\n", path)
 		}
 		for _, f := range n.List {
 			f := f.(*Func)
-			fmt.Fprintf(w, "func rewrite%s%s%s%s(", f.Kind, n.Arch.name, n.Suffix, f.Suffix)
-			fmt.Fprintf(w, "%c *%s) bool {\n", strings.ToLower(f.Kind)[0], f.Kind)
+			fmt.Fprintf(w, "func %s(", rewriteFuncName(f.Kind, n.Arch.name, n.Suffix, f.Suffix))
+			fmt.Fprintf(w, "%c *%s%s) bool {\n", strings.ToLower(f.Kind)[0], splitCorePrefix, f.Kind)
 			if f.Kind == "Value" && f.ArgLen > 0 {
 				for i := f.ArgLen - 1; i >= 0; i-- {
 					fmt.Fprintf(w, "v_%d := v.Args[%d]\n", i, i)
@@ -818,7 +857,7 @@ func exprf(format string, a ...interface{}) ast.Expr {
 func stmtf(format string, a ...interface{}) Statement {
 	src := fmt.Sprintf(format, a...)
 	fsrc := "package p\nfunc _() {\n" + src + "\n}\n"
-	file, err := parser.ParseFile(token.NewFileSet(), "", fsrc, 0)
+	file, err := parser.ParseFile(token.NewFileSet(), "", fsrc, parser.SkipObjectResolution)
 	if err != nil {
 		log.Fatalf("stmt parse error on %q: %v", src, err)
 	}
@@ -831,6 +870,7 @@ var reservedNames = map[string]bool{
 	"config": true, // b.Func.Config
 	"fe":     true, // b.Func.fe
 	"typ":    true, // &b.Func.Config.Types
+	"op":     true, // op.OpAMD64MOVBQZX
 }
 
 // declf constructs a simple "name := value" declaration,
@@ -852,7 +892,7 @@ func declReserved(name, value string) *Declare {
 	if !reservedNames[name] {
 		panic(fmt.Sprintf("declReserved call does not use a reserved name: %q", name))
 	}
-	return &Declare{name, exprf(value)}
+	return &Declare{name, exprf("%s", value)}
 }
 
 // breakf constructs a simple "if cond { break }" statement, using exprf for its
@@ -879,7 +919,7 @@ func genBlockRewrite(rule Rule, arch arch, data blockData) *RuleRewrite {
 			if vname == "" {
 				vname = fmt.Sprintf("v_%v", i)
 			}
-			rr.add(declf(rr.Loc, vname, cname))
+			rr.add(declf(rr.Loc, vname, "%s", cname))
 			p, op := genMatch0(rr, arch, expr, vname, nil, false) // TODO: pass non-nil cnt?
 			if op != "" {
 				check := fmt.Sprintf("%s.Op == %s", cname, op)
@@ -894,7 +934,7 @@ func genBlockRewrite(rule Rule, arch arch, data blockData) *RuleRewrite {
 			}
 			pos[i] = p
 		} else {
-			rr.add(declf(rr.Loc, arg, cname))
+			rr.add(declf(rr.Loc, arg, "%s", cname))
 			pos[i] = arg + ".Pos"
 		}
 	}
@@ -911,10 +951,11 @@ func genBlockRewrite(rule Rule, arch arch, data blockData) *RuleRewrite {
 		if e.dclType == "" {
 			log.Fatalf("op %s has no declared type for %s", data.name, e.field)
 		}
+		conv := convFunc(unTitle(e.field) + "To" + title(e.dclType))
 		if !token.IsIdentifier(e.name) || rr.declared(e.name) {
-			rr.add(breakf("%sTo%s(b.%s) != %s", unTitle(e.field), title(e.dclType), e.field, e.name))
+			rr.add(breakf("%s(b.%s) != %s", conv, e.field, e.name))
 		} else {
-			rr.add(declf(rr.Loc, e.name, "%sTo%s(b.%s)", unTitle(e.field), title(e.dclType), e.field))
+			rr.add(declf(rr.Loc, e.name, "%s(b.%s)", conv, e.field))
 		}
 	}
 	if rr.Cond != "" {
@@ -967,20 +1008,20 @@ func genBlockRewrite(rule Rule, arch arch, data blockData) *RuleRewrite {
 	case 0:
 		rr.add(stmtf("b.Reset(%s)", blockName))
 	case 1:
-		rr.add(stmtf("b.resetWithControl(%s, %s)", blockName, genControls[0]))
+		rr.add(stmtf("b.%s(%s, %s)", simpleTitle("resetWithControl"), blockName, genControls[0]))
 	case 2:
-		rr.add(stmtf("b.resetWithControl2(%s, %s, %s)", blockName, genControls[0], genControls[1]))
+		rr.add(stmtf("b.%s(%s, %s, %s)", simpleTitle("resetWithControl2"), blockName, genControls[0], genControls[1]))
 	default:
 		log.Fatalf("too many controls: %d", outdata.controls)
 	}
 
 	if auxint != "" {
 		// Make sure auxint value has the right type.
-		rr.add(stmtf("b.AuxInt = %sToAuxInt(%s)", unTitle(outdata.auxIntType()), auxint))
+		rr.add(stmtf("b.AuxInt = %s(%s)", convFunc(unTitle(outdata.auxIntType())+"ToAuxInt"), auxint))
 	}
 	if aux != "" {
 		// Make sure aux value has the right type.
-		rr.add(stmtf("b.Aux = %sToAux(%s)", unTitle(outdata.auxType()), aux))
+		rr.add(stmtf("b.Aux = %s(%s)", convFunc(unTitle(outdata.auxType())+"ToAux"), aux))
 	}
 
 	succChanged := false
@@ -996,13 +1037,17 @@ func genBlockRewrite(rule Rule, arch arch, data blockData) *RuleRewrite {
 		if succs[0] != newsuccs[1] || succs[1] != newsuccs[0] {
 			log.Fatalf("can only handle swapped successors in %s", rule)
 		}
-		rr.add(stmtf("b.swapSuccessors()"))
+		rr.add(stmtf("b.%s()", simpleTitle("swapSuccessors")))
 	}
 
 	if *genLog {
 		rr.add(stmtf("logRule(%q)", rule.Loc))
 	}
 	return rr
+}
+
+func convFunc(name string) string {
+	return splitCorePrefix + simpleTitle(name)
 }
 
 // genMatch returns the variable whose source position should be used for the
@@ -1018,7 +1063,7 @@ func genMatch0(rr *RuleRewrite, arch arch, match, v string, cnt map[string]int, 
 	}
 	op, oparch, typ, auxint, aux, args := parseValue(match, arch, rr.Loc)
 
-	checkOp = fmt.Sprintf("Op%s%s", oparch, op.name)
+	checkOp = fmt.Sprintf("%sOp%s%s", splitOpPrefix, oparch, op.name)
 
 	if op.faultOnNilArg0 || op.faultOnNilArg1 {
 		// Prefer the position of an instruction which could fault.
@@ -1055,18 +1100,18 @@ func genMatch0(rr *RuleRewrite, arch arch, match, v string, cnt map[string]int, 
 		if !token.IsIdentifier(e.name) || rr.declared(e.name) {
 			switch e.field {
 			case "Aux":
-				rr.add(breakf("auxTo%s(%s.%s) != %s", title(e.dclType), v, e.field, e.name))
+				rr.add(breakf("%s(%s.%s) != %s", convFunc("auxTo"+title(e.dclType)), v, e.field, e.name))
 			case "AuxInt":
-				rr.add(breakf("auxIntTo%s(%s.%s) != %s", title(e.dclType), v, e.field, e.name))
+				rr.add(breakf("%s(%s.%s) != %s", convFunc("auxIntTo"+title(e.dclType)), v, e.field, e.name))
 			case "Type":
 				rr.add(breakf("%s.%s != %s", v, e.field, e.name))
 			}
 		} else {
 			switch e.field {
 			case "Aux":
-				rr.add(declf(rr.Loc, e.name, "auxTo%s(%s.%s)", title(e.dclType), v, e.field))
+				rr.add(declf(rr.Loc, e.name, "%s(%s.%s)", convFunc("auxTo"+title(e.dclType)), v, e.field))
 			case "AuxInt":
-				rr.add(declf(rr.Loc, e.name, "auxIntTo%s(%s.%s)", title(e.dclType), v, e.field))
+				rr.add(declf(rr.Loc, e.name, "%s(%s.%s)", convFunc("auxIntTo"+title(e.dclType)), v, e.field))
 			case "Type":
 				rr.add(declf(rr.Loc, e.name, "%s.%s", v, e.field))
 			}
@@ -1180,6 +1225,11 @@ func genResult(rr *RuleRewrite, arch arch, result, pos string) {
 		rr.add(stmtf("b = %s", s[0]))
 		result = s[1]
 	}
+	if result[0] == '{' {
+		// Arbitrary code used to make the result
+		rr.add(stmtf("v.%s(%s)", simpleTitle("copyOf"), result[1:len(result)-1]))
+		return
+	}
 	cse := make(map[string]string)
 	genResult0(rr, arch, result, true, move, pos, cse)
 }
@@ -1195,7 +1245,7 @@ func genResult0(rr *RuleRewrite, arch arch, result string, top, move bool, pos s
 			// It in not safe in general to move a variable between blocks
 			// (and particularly not a phi node).
 			// Introduce a copy.
-			rr.add(stmtf("v.copyOf(%s)", result))
+			rr.add(stmtf("v.%s(%s)", simpleTitle("copyOf"), result))
 		}
 		return result
 	}
@@ -1215,7 +1265,7 @@ func genResult0(rr *RuleRewrite, arch arch, result string, top, move bool, pos s
 
 	v := "v"
 	if top && !move {
-		rr.add(stmtf("v.reset(Op%s%s)", oparch, op.name))
+		rr.add(stmtf("v.%s(%sOp%s%s)", simpleTitle("reset"), splitOpPrefix, oparch, op.name))
 		if typeOverride {
 			rr.add(stmtf("v.Type = %s", typ))
 		}
@@ -1229,20 +1279,20 @@ func genResult0(rr *RuleRewrite, arch arch, result string, top, move bool, pos s
 			v = resname
 		}
 		rr.Alloc++
-		rr.add(declf(rr.Loc, v, "b.NewValue0(%s, Op%s%s, %s)", pos, oparch, op.name, typ))
+		rr.add(declf(rr.Loc, v, "b.NewValue0(%s, %sOp%s%s, %s)", pos, splitOpPrefix, oparch, op.name, typ))
 		if move && top {
 			// Rewrite original into a copy
-			rr.add(stmtf("v.copyOf(%s)", v))
+			rr.add(stmtf("v.%s(%s)", simpleTitle("copyOf"), v))
 		}
 	}
 
 	if auxint != "" {
 		// Make sure auxint value has the right type.
-		rr.add(stmtf("%s.AuxInt = %sToAuxInt(%s)", v, unTitle(op.auxIntType()), auxint))
+		rr.add(stmtf("%s.AuxInt = %s(%s)", v, convFunc(unTitle(op.auxIntType())+"ToAuxInt"), auxint))
 	}
 	if aux != "" {
 		// Make sure aux value has the right type.
-		rr.add(stmtf("%s.Aux = %sToAux(%s)", v, unTitle(op.auxType()), aux))
+		rr.add(stmtf("%s.Aux = %s(%s)", v, convFunc(unTitle(op.auxType())+"ToAux"), aux))
 	}
 	all := new(strings.Builder)
 	for i, arg := range args {
@@ -1256,8 +1306,10 @@ func genResult0(rr *RuleRewrite, arch arch, result string, top, move bool, pos s
 	case 0:
 	case 1:
 		rr.add(stmtf("%s.AddArg(%s)", v, all.String()))
-	default:
+	case 2, 3, 4, 5, 6:
 		rr.add(stmtf("%s.AddArg%d(%s)", v, len(args), all.String()))
+	default:
+		rr.add(stmtf("%s.AddArgs(%s)", v, all.String()))
 	}
 
 	if cse != nil {
@@ -1298,6 +1350,12 @@ outer:
 				d++
 			case d > 0 && s[i] == close:
 				d--
+			case s[i] == ':':
+				// ignore spaces after colons
+				nonsp = true
+				for i+1 < len(s) && (s[i+1] == ' ' || s[i+1] == '\t') {
+					i++
+				}
 			default:
 				nonsp = true
 			}
@@ -1332,7 +1390,7 @@ func extract(val string) (op, typ, auxint, aux string, args []string) {
 	val = val[1 : len(val)-1] // remove ()
 
 	// Split val up into regions.
-	// Split by spaces/tabs, except those contained in (), {}, [], or <>.
+	// Split by spaces/tabs, except those contained in (), {}, [], or <> or after colon.
 	s := split(val)
 
 	// Extract restrictions and args.
@@ -1400,7 +1458,7 @@ func parseValue(val string, arch arch, loc string) (op opData, oparch, typ, auxi
 	if op.name == "" {
 		// Failed to find the op.
 		// Run through everything again with strict=false
-		// to generate useful diagnosic messages before failing.
+		// to generate useful diagnostic messages before failing.
 		for _, x := range genericOps {
 			match(x, false, "generic")
 		}
@@ -1423,7 +1481,8 @@ func parseValue(val string, arch arch, loc string) (op opData, oparch, typ, auxi
 func opHasAuxInt(op opData) bool {
 	switch op.aux {
 	case "Bool", "Int8", "Int16", "Int32", "Int64", "Int128", "UInt8", "Float32", "Float64",
-		"SymOff", "CallOff", "SymValAndOff", "TypSize", "ARM64BitField", "FlagConstant", "CCop":
+		"SymOff", "CallOff", "SymValAndOff", "TypSize", "ARM64BitField", "FlagConstant", "CCop",
+		"PanicBoundsC", "PanicBoundsCC", "ARM64ConditionalParams", "SizeAndAlign":
 		return true
 	}
 	return false
@@ -1432,7 +1491,7 @@ func opHasAuxInt(op opData) bool {
 func opHasAux(op opData) bool {
 	switch op.aux {
 	case "String", "Sym", "SymOff", "Call", "CallOff", "SymValAndOff", "Typ", "TypSize",
-		"S390XCCMask", "S390XRotateParams":
+		"S390XCCMask", "S390XRotateParams", "PanicBoundsC", "PanicBoundsCC", "SizeAndAlign":
 		return true
 	}
 	return false
@@ -1455,18 +1514,18 @@ func splitNameExpr(arg string) (name, expr string) {
 		// colon is inside the parens, such as in "(Foo x:(Bar))".
 		return "", arg
 	}
-	return arg[:colon], arg[colon+1:]
+	return arg[:colon], strings.TrimSpace(arg[colon+1:])
 }
 
 func getBlockInfo(op string, arch arch) (name string, data blockData) {
 	for _, b := range genericBlocks {
 		if b.name == op {
-			return "Block" + op, b
+			return "block.Block" + op, b
 		}
 	}
 	for _, b := range arch.blocks {
 		if b.name == op {
-			return "Block" + arch.name + op, b
+			return "block.Block" + arch.name + op, b
 		}
 	}
 	log.Fatalf("could not find block data for %s", op)
@@ -1621,11 +1680,11 @@ func varCount1(loc, m string, cnt map[string]int) {
 // normalizeWhitespace replaces 2+ whitespace sequences with a single space.
 func normalizeWhitespace(x string) string {
 	x = strings.Join(strings.Fields(x), " ")
-	x = strings.Replace(x, "( ", "(", -1)
-	x = strings.Replace(x, " )", ")", -1)
-	x = strings.Replace(x, "[ ", "[", -1)
-	x = strings.Replace(x, " ]", "]", -1)
-	x = strings.Replace(x, ")=>", ") =>", -1)
+	x = strings.ReplaceAll(x, "( ", "(")
+	x = strings.ReplaceAll(x, " )", ")")
+	x = strings.ReplaceAll(x, "[ ", "[")
+	x = strings.ReplaceAll(x, " ]", "]")
+	x = strings.ReplaceAll(x, ")=>", ") =>")
 	return x
 }
 
@@ -1769,7 +1828,7 @@ func (op opData) auxType() string {
 	case "String":
 		return "string"
 	case "Sym":
-		// Note: a Sym can be an *obj.LSym, a *gc.Node, or nil.
+		// Note: a Sym can be an *obj.LSym, a *ir.Name, or nil.
 		return "Sym"
 	case "SymOff":
 		return "Sym"
@@ -1787,6 +1846,12 @@ func (op opData) auxType() string {
 		return "s390x.CCMask"
 	case "S390XRotateParams":
 		return "s390x.RotateParams"
+	case "PanicBoundsC":
+		return "PanicBoundsC"
+	case "PanicBoundsCC":
+		return "PanicBoundsCC"
+	case "SizeAndAlign":
+		return "int64"
 	default:
 		return "invalid"
 	}
@@ -1827,6 +1892,12 @@ func (op opData) auxIntType() string {
 		return "flagConstant"
 	case "ARM64BitField":
 		return "arm64BitField"
+	case "ARM64ConditionalParams":
+		return "arm64ConditionalParams"
+	case "PanicBoundsC", "PanicBoundsCC":
+		return "int64"
+	case "SizeAndAlign":
+		return "int64"
 	default:
 		return "invalid"
 	}

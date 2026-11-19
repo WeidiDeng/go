@@ -188,3 +188,62 @@ func BenchmarkDeepValueSameGoRoutine(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkErrOK(b *testing.B) {
+	ctx, cancel := WithCancel(Background())
+	defer cancel()
+	for b.Loop() {
+		if err := ctx.Err(); err != nil {
+			b.Fatalf("ctx.Err() = %v", err)
+		}
+	}
+}
+
+func BenchmarkErrCanceled(b *testing.B) {
+	ctx, cancel := WithCancel(Background())
+	cancel()
+	for b.Loop() {
+		if err := ctx.Err(); err == nil {
+			b.Fatalf("ctx.Err() = %v", err)
+		}
+	}
+}
+
+func BenchmarkErrOKParallel(b *testing.B) {
+	ctx, cancel := WithCancel(Background())
+	defer cancel()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := ctx.Err(); err != nil {
+				b.Fatalf("ctx.Err() = %v", err)
+			}
+		}
+	})
+}
+
+func BenchmarkErrCanceledParallel(b *testing.B) {
+	ctx, cancel := WithCancel(Background())
+	cancel()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := ctx.Err(); err == nil {
+				b.Fatalf("ctx.Err() = %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkErrCanceledParallelDistinct gives each goroutine its own canceled
+// context, so the contexts share nothing with each other. Any contention here
+// is contention on state shared by every canceled context in the program.
+func BenchmarkErrCanceledParallelDistinct(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		ctx, cancel := WithCancel(Background())
+		cancel()
+		for pb.Next() {
+			if err := ctx.Err(); err == nil {
+				b.Fatalf("ctx.Err() = %v", err)
+			}
+		}
+	})
+}

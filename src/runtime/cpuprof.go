@@ -14,7 +14,7 @@ package runtime
 
 import (
 	"internal/abi"
-	"runtime/internal/sys"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -62,10 +62,17 @@ var cpuprof cpuProfile
 // If hz <= 0, SetCPUProfileRate turns off profiling.
 // If the profiler is on, the rate cannot be changed without first turning it off.
 //
-// Most clients should use the runtime/pprof package or
-// the testing package's -test.cpuprofile flag instead of calling
+// Most clients should use the [runtime/pprof] package or
+// the [testing] package's -test.cpuprofile flag instead of calling
 // SetCPUProfileRate directly.
 func SetCPUProfileRate(hz int) {
+	setCPUProfileRate(hz, true)
+}
+
+// setCPUProfileRate sets the CPU profiling rate to hz. Setting a non-zero rate
+// when the rate is already non-zero is a no-op. An error is printed in this case
+// if warn is true.
+func setCPUProfileRate(hz int, warn bool) {
 	// Clamp hz to something reasonable.
 	if hz < 0 {
 		hz = 0
@@ -77,7 +84,9 @@ func SetCPUProfileRate(hz int) {
 	lock(&cpuprof.lock)
 	if hz > 0 {
 		if cpuprof.on || cpuprof.log != nil {
-			print("runtime: cannot set cpu profile rate until previous profile has finished.\n")
+			if warn {
+				print("runtime: cannot set cpu profile rate until previous profile has finished.\n")
+			}
 			unlock(&cpuprof.lock)
 			return
 		}
@@ -202,16 +211,34 @@ func (p *cpuProfile) addExtra() {
 // The details of generating that format have changed,
 // so this functionality has been removed.
 //
-// Deprecated: Use the runtime/pprof package,
-// or the handlers in the net/http/pprof package,
-// or the testing package's -test.cpuprofile flag instead.
+// Deprecated: Use the [runtime/pprof] package,
+// or the handlers in the [net/http/pprof] package,
+// or the [testing] package's -test.cpuprofile flag instead.
 func CPUProfile() []byte {
 	panic("CPUProfile no longer available")
 }
 
-//go:linkname runtime_pprof_runtime_cyclesPerSecond runtime/pprof.runtime_cyclesPerSecond
-func runtime_pprof_runtime_cyclesPerSecond() int64 {
-	return tickspersecond()
+// pprof_setCPUProfileRate is provided to runtime/pprof.StartCPUProfile,
+// to enable CPU profiling without logging an error if the user has already
+// configured the profiling rate.
+//
+//go:linkname pprof_setCPUProfileRate
+func pprof_setCPUProfileRate(hz int) {
+	setCPUProfileRate(hz, false)
+}
+
+// runtime/pprof.runtime_cyclesPerSecond should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/grafana/pyroscope-go/godeltaprof
+//   - github.com/pyroscope-io/godeltaprof
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname pprof_cyclesPerSecond runtime/pprof.runtime_cyclesPerSecond
+func pprof_cyclesPerSecond() int64 {
+	return ticksPerSecond()
 }
 
 // readProfile, provided to runtime/pprof, returns the next chunk of
@@ -222,12 +249,24 @@ func runtime_pprof_runtime_cyclesPerSecond() int64 {
 // The returned data contains a whole number of records, and tags contains
 // exactly one entry per record.
 //
+// runtime_pprof_readProfile should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/pyroscope-io/pyroscope
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
 //go:linkname runtime_pprof_readProfile runtime/pprof.readProfile
 func runtime_pprof_readProfile() ([]uint64, []unsafe.Pointer, bool) {
 	lock(&cpuprof.lock)
 	log := cpuprof.log
 	unlock(&cpuprof.lock)
-	data, tags, eof := log.read(profBufBlocking)
+	readMode := profBufBlocking
+	if GOOS == "darwin" || GOOS == "ios" {
+		readMode = profBufNonBlocking // For #61768; on Darwin notes are not async-signal-safe.  See sigNoteSetup in os_darwin.go.
+	}
+	data, tags, eof := log.read(readMode)
 	if len(data) == 0 && eof {
 		lock(&cpuprof.lock)
 		cpuprof.log = nil

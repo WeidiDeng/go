@@ -18,9 +18,9 @@ func fp() *[3]int
 var mp map[int]*[3]int
 
 var (
-	_ = [3]int{1, 2, 3}[:] // ERROR "slice of unaddressable value"
-	_ = m[0][:]            // ERROR "slice of unaddressable value"
-	_ = f()[:]             // ERROR "slice of unaddressable value"
+	_ = [3]int{1, 2, 3}[:] // ERROR "cannot slice unaddressable value"
+	_ = m[0][:]            // ERROR "cannot slice unaddressable value"
+	_ = f()[:]             // ERROR "cannot slice unaddressable value"
 
 	_ = 301[:]  // ERROR "cannot slice|attempt to slice object that is not"
 	_ = 3.1[:]  // ERROR "cannot slice|attempt to slice object that is not"
@@ -44,8 +44,8 @@ type Ti int
 
 var (
 	_ = &T{0, 0, "", nil}               // ok
-	_ = &T{i: 0, f: 0, s: "", next: {}} // ERROR "missing type in composite literal|omit types within composite literal"
-	_ = &T{0, 0, "", {}}                // ERROR "missing type in composite literal|omit types within composite literal"
+	_ = &T{i: 0, f: 0, s: "", next: {}} // ok since Go 1.28
+	_ = &T{0, 0, "", {}}                // ok since Go 1.28
 	_ = TP{i: 0, f: 0, s: ""}           // ERROR "invalid composite literal type TP"
 	_ = &Ti{}                           // ERROR "invalid composite literal type Ti|expected.*type for composite literal"
 )

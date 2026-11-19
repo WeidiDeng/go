@@ -14,7 +14,7 @@ import (
 // Gob codec version. Permits backward-compatible changes to the encoding.
 const intGobVersion byte = 1
 
-// GobEncode implements the gob.GobEncoder interface.
+// GobEncode implements the [encoding/gob.GobEncoder] interface.
 func (x *Int) GobEncode() ([]byte, error) {
 	if x == nil {
 		return nil, nil
@@ -29,7 +29,7 @@ func (x *Int) GobEncode() ([]byte, error) {
 	return buf[i:], nil
 }
 
-// GobDecode implements the gob.GobDecoder interface.
+// GobDecode implements the [encoding/gob.GobDecoder] interface.
 func (z *Int) GobDecode(buf []byte) error {
 	if len(buf) == 0 {
 		// Other side sent a nil or default value.
@@ -40,20 +40,22 @@ func (z *Int) GobDecode(buf []byte) error {
 	if b>>1 != intGobVersion {
 		return fmt.Errorf("Int.GobDecode: encoding version %d not supported", b>>1)
 	}
-	z.neg = b&1 != 0
 	z.abs = z.abs.setBytes(buf[1:])
+	z.neg = len(z.abs) > 0 && b&1 != 0 // 0 has no sign
 	return nil
 }
 
-// MarshalText implements the encoding.TextMarshaler interface.
-func (x *Int) MarshalText() (text []byte, err error) {
-	if x == nil {
-		return []byte("<nil>"), nil
-	}
-	return x.abs.itoa(x.neg, 10), nil
+// AppendText implements the [encoding.TextAppender] interface.
+func (x *Int) AppendText(b []byte) (text []byte, err error) {
+	return x.Append(b, 10), nil
 }
 
-// UnmarshalText implements the encoding.TextUnmarshaler interface.
+// MarshalText implements the [encoding.TextMarshaler] interface.
+func (x *Int) MarshalText() (text []byte, err error) {
+	return x.AppendText(nil)
+}
+
+// UnmarshalText implements the [encoding.TextUnmarshaler] interface.
 func (z *Int) UnmarshalText(text []byte) error {
 	if _, ok := z.setFromScanner(bytes.NewReader(text), 0); !ok {
 		return fmt.Errorf("math/big: cannot unmarshal %q into a *big.Int", text)
@@ -65,7 +67,7 @@ func (z *Int) UnmarshalText(text []byte) error {
 // (programs that explicitly look for these two methods). JSON works
 // fine with the TextMarshaler only.
 
-// MarshalJSON implements the json.Marshaler interface.
+// MarshalJSON implements the [encoding/json.Marshaler] interface.
 func (x *Int) MarshalJSON() ([]byte, error) {
 	if x == nil {
 		return []byte("null"), nil
@@ -73,7 +75,7 @@ func (x *Int) MarshalJSON() ([]byte, error) {
 	return x.abs.itoa(x.neg, 10), nil
 }
 
-// UnmarshalJSON implements the json.Unmarshaler interface.
+// UnmarshalJSON implements the [encoding/json.Unmarshaler] interface.
 func (z *Int) UnmarshalJSON(text []byte) error {
 	// Ignore null, like in the main JSON package.
 	if string(text) == "null" {

@@ -26,7 +26,6 @@ import (
 	"os/exec/internal/fdtest"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -77,6 +76,21 @@ func TestMain(m *testing.M) {
 	pid := os.Getpid()
 	if os.Getenv("GO_EXEC_TEST_PID") == "" {
 		os.Setenv("GO_EXEC_TEST_PID", strconv.Itoa(pid))
+
+		if runtime.GOOS == "windows" {
+			// Normalize environment so that test behavior is consistent.
+			// (The behavior of LookPath varies depending on this variable.)
+			//
+			// Ideally we would test both with the variable set and with it cleared,
+			// but I (bcmills) am not sure that that's feasible: it may already be set
+			// in the Windows registry, and I'm not sure if it is possible to remove
+			// a registry variable in a program's environment.
+			//
+			// Per https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-needcurrentdirectoryforexepathw#remarks,
+			// “the existence of the NoDefaultCurrentDirectoryInExePath environment
+			// variable is checked, and not its value.”
+			os.Setenv("NoDefaultCurrentDirectoryInExePath", "TRUE")
+		}
 
 		code := m.Run()
 		if code == 0 && flag.Lookup("test.run").Value.String() == "" && flag.Lookup("test.list").Value.String() == "" {
@@ -145,40 +159,14 @@ func helperCommandContext(t *testing.T, ctx context.Context, name string, args .
 	helperCommandUsed.LoadOrStore(name, true)
 
 	t.Helper()
-	testenv.MustHaveExec(t)
-
+	exe := testenv.Executable(t)
 	cs := append([]string{name}, args...)
 	if ctx != nil {
-		cmd = exec.CommandContext(ctx, exePath(t), cs...)
+		cmd = exec.CommandContext(ctx, exe, cs...)
 	} else {
-		cmd = exec.Command(exePath(t), cs...)
+		cmd = exec.Command(exe, cs...)
 	}
 	return cmd
-}
-
-// exePath returns the path to the running executable.
-func exePath(t testing.TB) string {
-	exeOnce.Do(func() {
-		// Use os.Executable instead of os.Args[0] in case the caller modifies
-		// cmd.Dir: if the test binary is invoked like "./exec.test", it should
-		// not fail spuriously.
-		exeOnce.path, exeOnce.err = os.Executable()
-	})
-
-	if exeOnce.err != nil {
-		if t == nil {
-			panic(exeOnce.err)
-		}
-		t.Fatal(exeOnce.err)
-	}
-
-	return exeOnce.path
-}
-
-var exeOnce struct {
-	path string
-	err  error
-	sync.Once
 }
 
 var helperCommandUsed sync.Map
@@ -268,7 +256,7 @@ func cmdExit(args ...string) {
 }
 
 func cmdDescribeFiles(args ...string) {
-	f := os.NewFile(3, fmt.Sprintf("fd3"))
+	f := os.NewFile(3, "fd3")
 	ln, err := net.FileListener(f)
 	if err == nil {
 		fmt.Printf("fd3: listener %s\n", ln.Addr())
@@ -641,7 +629,11 @@ func TestPipeLookPathLeak(t *testing.T) {
 		return fds
 	}
 
-	want := openFDs()
+	old := map[uintptr]bool{}
+	for _, fd := range openFDs() {
+		old[fd] = true
+	}
+
 	for i := 0; i < 6; i++ {
 		cmd := exec.Command("something-that-does-not-exist-executable")
 		cmd.StdoutPipe()
@@ -651,9 +643,16 @@ func TestPipeLookPathLeak(t *testing.T) {
 			t.Fatal("unexpected success")
 		}
 	}
-	got := openFDs()
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("set of open file descriptors changed: got %v, want %v", got, want)
+
+	// Since this test is not running in parallel, we don't expect any new file
+	// descriptors to be opened while it runs. However, if there are additional
+	// FDs present at the start of the test (for example, opened by libc), those
+	// may be closed due to a timeout of some sort. Allow those to go away, but
+	// check that no new FDs are added.
+	for _, fd := range openFDs() {
+		if !old[fd] {
+			t.Errorf("leaked file descriptor %v", fd)
+		}
 	}
 }
 
@@ -684,7 +683,10 @@ func TestExtraFiles(t *testing.T) {
 
 	// This test runs with cgo disabled. External linking needs cgo, so
 	// it doesn't work if external linking is required.
-	testenv.MustInternalLink(t)
+	//
+	// N.B. go build below explicitly doesn't pass through
+	// -asan/-msan/-race, so we don't care about those.
+	testenv.MustInternalLink(t, testenv.NoSpecialBuildTypes)
 
 	if runtime.GOOS == "windows" {
 		t.Skipf("skipping test on %q", runtime.GOOS)
@@ -742,7 +744,7 @@ func TestExtraFiles(t *testing.T) {
 	tempdir := t.TempDir()
 	exe := filepath.Join(tempdir, "read3.exe")
 
-	c := exec.Command(testenv.GoToolPath(t), "build", "-o", exe, "read3.go")
+	c := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", exe, "read3.go")
 	// Build the test without cgo, so that C library functions don't
 	// open descriptors unexpectedly. See issue 25628.
 	c.Env = append(os.Environ(), "CGO_ENABLED=0")
@@ -1028,6 +1030,9 @@ func TestDedupEnvEcho(t *testing.T) {
 }
 
 func TestEnvNULCharacter(t *testing.T) {
+	if runtime.GOOS == "plan9" {
+		t.Skip("plan9 explicitly allows NUL in the environment")
+	}
 	cmd := helperCommand(t, "echoenv", "FOO", "BAR")
 	cmd.Env = append(cmd.Environ(), "FOO=foo\x00BAR=bar")
 	out, err := cmd.CombinedOutput()
@@ -1151,7 +1156,7 @@ func cmdHang(args ...string) {
 	pid := os.Getpid()
 
 	if *subsleep != 0 {
-		cmd := exec.Command(exePath(nil), "hang", subsleep.String(), "-read=true", "-probe="+probe.String())
+		cmd := exec.Command(testenv.Executable(nil), "hang", subsleep.String(), "-read=true", "-probe="+probe.String())
 		cmd.Stdin = os.Stdin
 		cmd.Stderr = os.Stderr
 		out, err := cmd.StdoutPipe()
@@ -1169,6 +1174,7 @@ func cmdHang(args ...string) {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "%d: started %d: %v\n", pid, cmd.Process.Pid, cmd)
+		go cmd.Wait() // Release resources if cmd happens not to outlive this process.
 	}
 
 	if *exitOnInterrupt {
@@ -1315,7 +1321,7 @@ func TestWaitInterrupt(t *testing.T) {
 	})
 
 	// With a very long WaitDelay and no Cancel function, we should wait for the
-	// process to exit even if the command's Context is cancelled.
+	// process to exit even if the command's Context is canceled.
 	t.Run("WaitDelay", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skipf("skipping: os.Interrupt is not implemented on Windows")
@@ -1344,7 +1350,7 @@ func TestWaitInterrupt(t *testing.T) {
 		// context expired, a successful exit is valid (even if late) and does
 		// not merit a non-nil error.
 		if err != nil {
-			t.Errorf("Wait: %v; want %v", err, ctx.Err())
+			t.Errorf("Wait: %v; want nil", err)
 		}
 		if ps := cmd.ProcessState; !ps.Exited() {
 			t.Errorf("cmd did not exit: %v", ps)
@@ -1353,7 +1359,7 @@ func TestWaitInterrupt(t *testing.T) {
 		}
 	})
 
-	// If the context is cancelled and the Cancel function sends os.Kill,
+	// If the context is canceled and the Cancel function sends os.Kill,
 	// the process should be terminated immediately, and its output
 	// pipes should be closed (causing Wait to return) after WaitDelay
 	// even if a child process is still writing to them.
@@ -1372,8 +1378,8 @@ func TestWaitInterrupt(t *testing.T) {
 		// The child process should be reported as failed,
 		// and the grandchild will exit (or die by SIGPIPE) once the
 		// stderr pipe is closed.
-		if ee := new(*exec.ExitError); !errors.As(err, ee) {
-			t.Errorf("Wait error = %v; want %T", err, *ee)
+		if ee, ok := errors.AsType[*exec.ExitError](err); !ok {
+			t.Errorf("Wait error = %v; want %T", err, ee)
 		}
 	})
 
@@ -1417,8 +1423,8 @@ func TestWaitInterrupt(t *testing.T) {
 
 		// This command ignores SIGINT, sleeping until it is killed.
 		// Wait should return the usual error for a killed process.
-		if ee := new(*exec.ExitError); !errors.As(err, ee) {
-			t.Errorf("Wait error = %v; want %T", err, *ee)
+		if ee, ok := errors.AsType[*exec.ExitError](err); !ok {
+			t.Errorf("Wait error = %v; want %T", err, ee)
 		}
 	})
 
@@ -1465,7 +1471,7 @@ func TestWaitInterrupt(t *testing.T) {
 		t.Logf("stderr:\n%s", cmd.Stderr)
 		t.Logf("[%d] %v", cmd.Process.Pid, err)
 
-		if ee := new(*exec.ExitError); !errors.As(err, ee) {
+		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 			t.Errorf("Wait error = %v; want %v", err, ctx.Err())
 		}
 
@@ -1608,8 +1614,8 @@ func TestCancelErrors(t *testing.T) {
 		// This test should kill the child process after 1ms,
 		// To maximize compatibility with existing uses of exec.CommandContext, the
 		// resulting error should be an exec.ExitError without additional wrapping.
-		if ee, ok := err.(*exec.ExitError); !ok {
-			t.Errorf("Wait error = %v; want %T", err, *ee)
+		if _, ok := err.(*exec.ExitError); !ok {
+			t.Errorf("Wait error = %v; want *exec.ExitError", err)
 		}
 	})
 
@@ -1693,4 +1699,165 @@ func TestCancelErrors(t *testing.T) {
 			t.Errorf("Wait error = %v; want exit status 1", err)
 		}
 	})
+}
+
+// TestConcurrentExec is a regression test for https://go.dev/issue/61080.
+//
+// Forking multiple child processes concurrently would sometimes hang on darwin.
+// (This test hung on a gomote with -count=100 after only a few iterations.)
+func TestConcurrentExec(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// This test will spawn nHangs subprocesses that hang reading from stdin,
+	// and nExits subprocesses that exit immediately.
+	//
+	// When issue #61080 was present, a long-lived "hang" subprocess would
+	// occasionally inherit the fork/exec status pipe from an "exit" subprocess,
+	// causing the parent process (which expects to see an EOF on that pipe almost
+	// immediately) to unexpectedly block on reading from the pipe.
+	var (
+		nHangs       = runtime.GOMAXPROCS(0)
+		nExits       = runtime.GOMAXPROCS(0)
+		hangs, exits sync.WaitGroup
+	)
+	hangs.Add(nHangs)
+	exits.Add(nExits)
+
+	// ready is done when the goroutines have done as much work as possible to
+	// prepare to create subprocesses. It isn't strictly necessary for the test,
+	// but helps to increase the repro rate by making it more likely that calls to
+	// syscall.StartProcess for the "hang" and "exit" goroutines overlap.
+	var ready sync.WaitGroup
+	ready.Add(nHangs + nExits)
+
+	for i := 0; i < nHangs; i++ {
+		go func() {
+			defer hangs.Done()
+
+			cmd := helperCommandContext(t, ctx, "pipetest")
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				ready.Done()
+				t.Error(err)
+				return
+			}
+			cmd.Cancel = stdin.Close
+			ready.Done()
+
+			ready.Wait()
+			if err := cmd.Start(); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					t.Error(err)
+				}
+				return
+			}
+
+			cmd.Wait()
+		}()
+	}
+
+	for i := 0; i < nExits; i++ {
+		go func() {
+			defer exits.Done()
+
+			cmd := helperCommandContext(t, ctx, "exit", "0")
+			ready.Done()
+
+			ready.Wait()
+			if err := cmd.Run(); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+
+	exits.Wait()
+	cancel()
+	hangs.Wait()
+}
+
+// TestPathRace tests that [Cmd.String] can be called concurrently
+// with [Cmd.Start].
+func TestPathRace(t *testing.T) {
+	cmd := helperCommand(t, "exit", "0")
+
+	done := make(chan struct{})
+	go func() {
+		out, err := cmd.CombinedOutput()
+		t.Logf("%v: %v\n%s", cmd, err, out)
+		close(done)
+	}()
+
+	t.Logf("running in background: %v", cmd)
+	<-done
+}
+
+func TestAbsPathExec(t *testing.T) {
+	testenv.MustHaveExec(t)
+	testenv.MustHaveGoBuild(t) // must have GOROOT/bin/{go,gofmt}
+
+	// A simple exec of a full path should work.
+	// Go 1.22 broke this on Windows, requiring ".exe"; see #66586.
+	exe := filepath.Join(testenv.GOROOT(t), "bin/gofmt")
+	cmd := exec.Command(exe)
+	if cmd.Path != exe {
+		t.Errorf("exec.Command(%#q) set Path=%#q", exe, cmd.Path)
+	}
+	err := cmd.Run()
+	if err != nil {
+		t.Errorf("using exec.Command(%#q): %v", exe, err)
+	}
+
+	cmd = &exec.Cmd{Path: exe}
+	err = cmd.Run()
+	if err != nil {
+		t.Errorf("using exec.Cmd{Path: %#q}: %v", cmd.Path, err)
+	}
+
+	cmd = &exec.Cmd{Path: "gofmt", Dir: "/"}
+	err = cmd.Run()
+	if err == nil {
+		t.Errorf("using exec.Cmd{Path: %#q}: unexpected success", cmd.Path)
+	}
+
+	// A simple exec after modifying Cmd.Path should work.
+	// This broke on Windows. See go.dev/issue/68314.
+	t.Run("modified", func(t *testing.T) {
+		if exec.Command(filepath.Join(testenv.GOROOT(t), "bin/go")).Run() == nil {
+			// The implementation of the test case below relies on the go binary
+			// exiting with a non-zero exit code when run without any arguments.
+			// In the unlikely case that changes, we need to use another binary.
+			t.Fatal("test case needs updating to verify fix for go.dev/issue/68314")
+		}
+		exe1 := filepath.Join(testenv.GOROOT(t), "bin/go")
+		exe2 := filepath.Join(testenv.GOROOT(t), "bin/gofmt")
+		cmd := exec.Command(exe1)
+		cmd.Path = exe2
+		cmd.Args = []string{cmd.Path}
+		err := cmd.Run()
+		if err != nil {
+			t.Error("ran wrong binary")
+		}
+	})
+}
+
+// Calling Start twice is an error, regardless of outcome.
+func TestStart_twice(t *testing.T) {
+	testenv.MustHaveExec(t)
+
+	cmd := exec.Command("/bin/nonesuch")
+	if err := cmd.Start(); err == nil {
+		t.Fatalf("running invalid command succeeded")
+	}
+	err := cmd.Start()
+	got := fmt.Sprint(err)
+	want := "exec: already started"
+	if got != want {
+		t.Fatalf("Start call returned err %q, want %q", got, want)
+	}
+}
+
+func TestNoStringPanic(t *testing.T) {
+	if s := fmt.Sprintf("%v", &exec.Cmd{}); strings.Contains(s, "PANIC") {
+		t.Fatalf("got %q, want no panic", s)
+	}
 }

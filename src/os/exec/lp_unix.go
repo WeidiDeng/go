@@ -8,7 +8,6 @@ package exec
 
 import (
 	"errors"
-	"internal/godebug"
 	"internal/syscall/unix"
 	"io/fs"
 	"os"
@@ -42,18 +41,14 @@ func findExecutable(file string) error {
 	return fs.ErrPermission
 }
 
-// LookPath searches for an executable named file in the
-// directories named by the PATH environment variable.
-// If file contains a slash, it is tried directly and the PATH is not consulted.
-// Otherwise, on success, the result is an absolute path.
-//
-// In older versions of Go, LookPath could return a path relative to the current directory.
-// As of Go 1.19, LookPath will instead return that path along with an error satisfying
-// errors.Is(err, ErrDot). See the package documentation for more details.
-func LookPath(file string) (string, error) {
+func lookPath(file string) (string, error) {
 	// NOTE(rsc): I wish we could use the Plan 9 behavior here
 	// (only bypass the path if file begins with / or ./ or ../)
 	// but that would not match all the Unix shells.
+
+	if err := validateLookPath(file); err != nil {
+		return "", &Error{file, err}
+	}
 
 	if strings.Contains(file, "/") {
 		err := findExecutable(file)
@@ -70,11 +65,20 @@ func LookPath(file string) (string, error) {
 		}
 		path := filepath.Join(dir, file)
 		if err := findExecutable(path); err == nil {
-			if !filepath.IsAbs(path) && godebug.Get("execerrdot") != "0" {
-				return path, &Error{file, ErrDot}
+			if !filepath.IsAbs(path) {
+				if execerrdot.Value() != "0" {
+					return path, &Error{file, ErrDot}
+				}
+				execerrdot.IncNonDefault()
 			}
 			return path, nil
 		}
 	}
 	return "", &Error{file, ErrNotFound}
+}
+
+// lookExtensions is a no-op on non-Windows platforms, since
+// they do not restrict executables to specific extensions.
+func lookExtensions(path, dir string) (string, error) {
+	return path, nil
 }

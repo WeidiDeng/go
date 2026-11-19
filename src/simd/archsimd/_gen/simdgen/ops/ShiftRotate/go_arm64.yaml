@@ -1,0 +1,231 @@
+!sum
+
+# Scale (shift by vector)
+- go: Scale
+  signed: true
+  asm: "VSSHL"
+  in:
+  - &int
+    go: $t
+    base: int
+  - go: $t
+    name: y
+  out:
+  - *int
+
+- go: Scale
+  signed: false
+  asm: "VUSHL"
+  in:
+  - &uint
+    go: $t
+    base: uint
+  - go: $t
+    base: uint
+    overwriteBase: int
+    name: y
+  out:
+  - *uint
+
+# The scale operand is always an Int8 vector. SQSHL/UQSHL use only the low
+# byte of each element of the scale register, so x[i] is scaled by the int8
+# element that lines up with x[i]'s lowest byte.
+- go: ScaleSaturated
+  signed: true
+  asm: "VSQSHL"
+  in:
+  - *int
+  - go: $t
+    base: int
+    overwriteElementBits: 8
+    name: scale
+  out:
+  - *int
+
+- go: ScaleSaturated
+  signed: false
+  asm: "VUQSHL"
+  in:
+  - *uint
+  - go: $t
+    base: uint
+    overwriteBase: int
+    overwriteElementBits: 8
+    name: scale
+  out:
+  - *uint
+
+# Shift right by constant
+- go: shiftAllRightConst
+  signed: true
+  asm: "VSSHR"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - &imm
+    class: immediate
+    immOffset: 0
+  - *int
+  out:
+  - *int
+
+- go: shiftAllRightConst
+  signed: false
+  asm: "VUSHR"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - *imm
+  - *uint
+  out:
+  - *uint
+
+# Shift left by constant
+- go: shiftAllLeftConst
+  signed: true
+  asm: "VSHL"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - *imm
+  - *int
+  out:
+  - *int
+
+- go: shiftAllLeftConst
+  signed: false
+  asm: "VSHL"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - *imm
+  - *uint
+  out:
+  - *uint
+
+# Shift left saturated by constant
+- go: shiftLeftSaturatedConst
+  signed: true
+  asm: "VSQSHL"
+  ssaVariant: "const"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - *imm
+  - *int
+  out:
+  - *int
+
+- go: shiftLeftSaturatedConst
+  signed: false
+  asm: "VUQSHL"
+  ssaVariant: "const"
+  asmRules:
+  - !string "a==0 => x"
+  in:
+  - *imm
+  - *uint
+  out:
+  - *uint
+
+# Shift all lanes in vector x by the same unsigned scalar amount y.
+# ShiftAll* with a constant amount are lowered to the immediate shifts (or to
+# zero for a left shift by at least the element width). Otherwise they fall
+# back to the Shift intrinsic using sign to specify shift direction, e.g.:
+#   x.Shift(Zero.SetElem(0, -y).Broadcast1ToN()) for shift right
+#   x.Shift(Zero.SetElem(0,  y).Broadcast1ToN()) for shift left
+- go: ShiftAllLeft
+  signed: true
+  asm: "VSSHL"
+  lowerRules:
+  - !string "(%g x (MOVDconst [c])) && uint64(c) < %b => (VSHL%a [uint8(c)] x)"
+  - !string "(%g x (MOVDconst [c])) => (VMOVI16B [0])"
+  - !string "(%g x y) => (VSSHL%a x (VDUP%sbcast [0] (VMOV%sins [0] x (CSEL <typ.UInt64> [ssaop.OpARM64LessThanU] y (MOVDconst [127]) (CMPconst [127] y)))))"
+  in:
+  - *int
+  - &scalarShiftSigned
+    go: $t
+    base: int
+    treatLikeAScalarOfSize: 64
+    name: shift
+  out:
+  - *int
+
+- go: ShiftAllLeft
+  signed: false
+  asm: "VUSHL"
+  lowerRules:
+  - !string "(%g x (MOVDconst [c])) && uint64(c) < %b => (VSHL%a [uint8(c)] x)"
+  - !string "(%g x (MOVDconst [c])) => (VMOVI16B [0])"
+  - !string "(%g x y) => (VUSHL%a x (VDUP%sbcast [0] (VMOV%sins [0] x (CSEL <typ.UInt64> [ssaop.OpARM64LessThanU] y (MOVDconst [127]) (CMPconst [127] y)))))"
+  in:
+  - *uint
+  - &scalarShiftUnsigned
+    go: $t
+    base: uint
+    treatLikeAScalarOfSize: 64
+    overwriteBase: int
+    name: shift
+  out:
+  - *uint
+
+- go: ShiftAllRight
+  signed: true
+  asm: "VSSHL"
+  lowerRules:
+  - !string "(%g x (MOVDconst [c])) => (VSSHR%a [uint8(min(uint64(c), %b))] x)"
+  - !string "(%g x y) => (VSSHL%a x (VDUP%sbcast [0] (VMOV%sins [0] x (NEG <typ.Int64> (CSEL <typ.UInt64> [ssaop.OpARM64LessThanU] y (MOVDconst [127]) (CMPconst [127] y))))))"
+  in:
+  - *int
+  - *scalarShiftSigned
+  out:
+  - *int
+
+- go: ShiftAllRight
+  signed: false
+  asm: "VUSHL"
+  lowerRules:
+  - !string "(%g x (MOVDconst [c])) => (VUSHR%a [uint8(min(uint64(c), %b))] x)"
+  - !string "(%g x y) => (VUSHL%a x (VDUP%sbcast [0] (VMOV%sins [0] x (NEG <typ.Int64> (CSEL <typ.UInt64> [ssaop.OpARM64LessThanU] y (MOVDconst [127]) (CMPconst [127] y))))))"
+  in:
+  - *uint
+  - *scalarShiftUnsigned
+  out:
+  - *uint
+
+- go: shiftRightNarrowConst
+  asm: "VSHRN"
+  hiHalfAsm: "VSHRN2"
+  peepholeRules:
+  - !string "(%h [0] x) => (VXTN%a x)"
+  in:
+  - *imm
+  - go: $t
+    base: uint
+  out:
+  - go: $u
+    base: uint
+
+- go: shiftLeftWidenLoConst
+  signed: false
+  asm: "VUSHLL"
+  hiHalfAsm: "VUSHLL2"
+  in:
+  - *imm
+  - go: $t
+    base: uint
+  out:
+  - go: $u
+    base: uint
+
+- go: shiftLeftWidenLoConst
+  signed: true
+  asm: "VSSHLL"
+  hiHalfAsm: "VSSHLL2"
+  in:
+  - *imm
+  - go: $t
+    base: int
+  out:
+  - go: $u
+    base: int

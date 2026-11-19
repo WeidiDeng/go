@@ -19,7 +19,7 @@ func (t Time) appendFormatRFC3339(b []byte, nanos bool) []byte {
 	_, offset, abs := t.locabs()
 
 	// Format date.
-	year, month, day, _ := absDate(abs, true)
+	year, month, day := abs.days().date()
 	b = appendInt(b, year, 4)
 	b = append(b, '-')
 	b = appendInt(b, int(month), 2)
@@ -29,7 +29,7 @@ func (t Time) appendFormatRFC3339(b []byte, nanos bool) []byte {
 	b = append(b, 'T')
 
 	// Format time.
-	hour, min, sec := absClock(abs)
+	hour, min, sec := abs.clock()
 	b = appendInt(b, hour, 2)
 	b = append(b, ':')
 	b = appendInt(b, min, 2)
@@ -155,7 +155,8 @@ func parseRFC3339[bytes []byte | string](s bytes, local *Location) (Time, bool) 
 func parseStrictRFC3339(b []byte) (Time, error) {
 	t, ok := parseRFC3339(b, Local)
 	if !ok {
-		if _, err := Parse(RFC3339, string(b)); err != nil {
+		t, err := Parse(RFC3339, string(b))
+		if err != nil {
 			return Time{}, err
 		}
 
@@ -164,6 +165,10 @@ func parseStrictRFC3339(b []byte) (Time, error) {
 		// See https://go.dev/issue/54580.
 		num2 := func(b []byte) byte { return 10*(b[0]-'0') + (b[1] - '0') }
 		switch {
+		// TODO(https://go.dev/issue/54580): Strict parsing is disabled for now.
+		// Enable this again with a GODEBUG opt-out.
+		case true:
+			return t, nil
 		case b[len("2006-01-02T")+1] == ':': // hour must be two digits
 			return Time{}, &ParseError{RFC3339, string(b), "15", string(b[len("2006-01-02T"):][:1]), ""}
 		case b[len("2006-01-02T15:04:05")] == ',': // sub-second separator must be a period

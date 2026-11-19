@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"internal/testenv"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,11 +21,14 @@ func TestUndefinedRelocErrors(t *testing.T) {
 
 	// When external linking, symbols may be defined externally, so we allow
 	// undefined symbols and let external linker resolve. Skip the test.
-	testenv.MustInternalLink(t)
+	//
+	// N.B. go build below explicitly doesn't pass through
+	// -asan/-msan/-race, so we don't care about those.
+	testenv.MustInternalLink(t, testenv.NoSpecialBuildTypes)
 
 	t.Parallel()
 
-	out, err := exec.Command(testenv.GoToolPath(t), "build", "./testdata/issue10978").CombinedOutput()
+	out, err := testenv.Command(t, testenv.GoToolPath(t), "build", "./testdata/issue10978").CombinedOutput()
 	if err == nil {
 		t.Fatal("expected build to fail")
 	}
@@ -66,6 +68,9 @@ func TestUndefinedRelocErrors(t *testing.T) {
 		case n > 0:
 			t.Errorf("unmatched error: %s (x%d)", want, n)
 		case n < 0:
+			if runtime.GOOS == "android" && runtime.GOARCH == "arm64" {
+				testenv.SkipFlaky(t, 58807)
+			}
 			t.Errorf("extra errors: %s (x%d)", want, -n)
 		}
 	}
@@ -113,7 +118,7 @@ func TestArchiveBuildInvokeWithExec(t *testing.T) {
 
 	ldf := fmt.Sprintf("-ldflags=-v -tmpdir=%s", dir)
 	argv := []string{"build", "-buildmode=c-archive", "-o", arfile, ldf, srcfile}
-	out, err := exec.Command(testenv.GoToolPath(t), argv...).CombinedOutput()
+	out, err := testenv.Command(t, testenv.GoToolPath(t), argv...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("build failure: %s\n%s\n", err, string(out))
 	}
@@ -134,7 +139,7 @@ func TestArchiveBuildInvokeWithExec(t *testing.T) {
 
 func TestLargeTextSectionSplitting(t *testing.T) {
 	switch runtime.GOARCH {
-	case "ppc64", "ppc64le":
+	case "ppc64", "ppc64le", "arm":
 	case "arm64":
 		if runtime.GOOS == "darwin" {
 			break
@@ -155,13 +160,13 @@ func TestLargeTextSectionSplitting(t *testing.T) {
 	// is arbitrary; we just need something sufficiently large that uses
 	// external linking.
 	exe := filepath.Join(dir, "go.exe")
-	out, err := exec.Command(testenv.GoToolPath(t), "build", "-o", exe, "-ldflags=-linkmode=external -debugtextsize=1048576", "cmd/go").CombinedOutput()
+	out, err := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", exe, "-ldflags=-linkmode=external -debugtextsize=1048576", "cmd/go").CombinedOutput()
 	if err != nil {
 		t.Fatalf("build failure: %s\n%s\n", err, string(out))
 	}
 
 	// Check that we did split text sections.
-	out, err = exec.Command(testenv.GoToolPath(t), "tool", "nm", exe).CombinedOutput()
+	out, err = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", exe).CombinedOutput()
 	if err != nil {
 		t.Fatalf("nm failure: %s\n%s\n", err, string(out))
 	}
@@ -170,9 +175,116 @@ func TestLargeTextSectionSplitting(t *testing.T) {
 	}
 
 	// Result should be runnable.
-	_, err = exec.Command(exe, "version").CombinedOutput()
+	_, err = testenv.Command(t, exe, "version").CombinedOutput()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTextSectionSplitOverAligned checks that text section splitting copes
+// with functions aligned more strictly than Funcalign (issue 82517).
+func TestTextSectionSplitOverAligned(t *testing.T) {
+	// funcAsm is one assembly function: an optional PCALIGN, a load and
+	// store of sink (for a relocation), filler, and a return of the
+	// function's index.
+	var funcAsm, filler string
+	switch runtime.GOARCH {
+	case "arm64":
+		if runtime.GOOS != "darwin" {
+			t.Skipf("text section splitting is not done in %s/%s", runtime.GOOS, runtime.GOARCH)
+		}
+		funcAsm = `
+TEXT ·f%[1]d(SB), NOSPLIT, $0-8
+%[2]s
+	MOVD	$·sink(SB), R1
+	MOVD	(R1), R2
+	ADD	$1, R2
+	MOVD	R2, (R1)
+%[3]s
+	MOVD	$%[1]d, R0
+	MOVD	R0, ret+0(FP)
+	RET
+`
+		filler = "\tNOOP\n"
+	case "ppc64", "ppc64le":
+		funcAsm = `
+TEXT ·f%[1]d(SB), NOSPLIT, $0-8
+%[2]s
+	MOVD	$·sink(SB), R3
+	MOVD	0(R3), R4
+	ADD	$1, R4
+	MOVD	R4, 0(R3)
+%[3]s
+	MOVD	$%[1]d, R3
+	MOVD	R3, ret+0(FP)
+	RET
+`
+		filler = "\tADD\t$1, R5\n"
+	default:
+		// arm also splits text sections, but its assembler has no
+		// PCALIGN, so its functions can't be over-aligned.
+		t.Skipf("no over-aligned text section splitting on %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Interleave 64-byte-aligned and plain functions, each about 8KiB
+	// long (1MiB in all), so that some split text sections start at a
+	// plain function and contain an over-aligned one.
+	const n = 128
+	var goSrc, asmSrc bytes.Buffer
+	goSrc.WriteString("package main\n\nvar sink int\n\n")
+	asmSrc.WriteString("#include \"textflag.h\"\n")
+	for i := range n {
+		fmt.Fprintf(&goSrc, "func f%d() int\n", i)
+		align := ""
+		if i%2 == 0 {
+			align = "\tPCALIGN\t$64"
+		}
+		fmt.Fprintf(&asmSrc, funcAsm, i, align, strings.Repeat(filler, 2000))
+	}
+	goSrc.WriteString("\nvar fs = []func() int{")
+	for i := range n {
+		fmt.Fprintf(&goSrc, "f%d, ", i)
+	}
+	fmt.Fprintf(&goSrc, `}
+
+func main() {
+	s := 0
+	for _, f := range fs {
+		s += f()
+	}
+	if s != %d || sink != %d {
+		panic(s)
+	}
+}
+`, n*(n-1)/2, n)
+	for name, src := range map[string][]byte{
+		"go.mod":                         []byte("module overaligned\n"),
+		"main.go":                        goSrc.Bytes(),
+		"funcs_" + runtime.GOARCH + ".s": asmSrc.Bytes(),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), src, 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Several split sizes, so the test doesn't depend on one boundary
+	// happening to land in the right place. Much smaller sizes exceed
+	// the Mach-O limit on sections in __TEXT.
+	for _, size := range []int{256 << 10, 320 << 10, 384 << 10} {
+		exe := filepath.Join(dir, fmt.Sprintf("split%d.exe", size))
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-o", exe,
+			fmt.Sprintf("-ldflags=-linkmode=external -debugtextsize=%d", size))
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build with -debugtextsize=%d: %v\n%s", size, err, out)
+		}
+		if out, err := testenv.Command(t, exe).CombinedOutput(); err != nil {
+			t.Fatalf("run with -debugtextsize=%d: %v\n%s", size, err, out)
+		}
 	}
 }
 
@@ -194,6 +306,49 @@ func TestWindowsBuildmodeCSharedASLR(t *testing.T) {
 	})
 }
 
+func TestWindowsBuildmodeCSharedTrailingDotOutput(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping windows only test")
+	}
+
+	t.Parallel()
+	testenv.MustHaveGoBuild(t)
+	testenv.MustHaveCGO(t)
+	testenv.MustHaveBuildMode(t, "c-shared")
+
+	dir := t.TempDir()
+	srcfile := filepath.Join(dir, "test.go")
+	objfile := filepath.Join(dir, "mypackage.")
+	linktmp := filepath.Join(dir, "linktmp")
+	if err := os.Mkdir(linktmp, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(srcfile, []byte(`package main
+import "C"
+
+//export Hello
+func Hello() {}
+
+func main() {}
+`), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	argv := []string{"build", "-buildmode=c-shared", "-o", objfile, "-ldflags", "-tmpdir=" + linktmp, srcfile}
+	out, err := testenv.Command(t, testenv.GoToolPath(t), argv...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("build failure: %s\n%s\n", err, string(out))
+	}
+
+	def, err := os.ReadFile(filepath.Join(linktmp, "export_file.def"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte("LIBRARY \"mypackage.\"\n"); !bytes.HasPrefix(def, want) {
+		t.Fatalf("export_file.def begins with %q, want %q", def, want)
+	}
+}
+
 func testWindowsBuildmodeCSharedASLR(t *testing.T, useASLR bool) {
 	t.Parallel()
 	testenv.MustHaveGoBuild(t)
@@ -210,7 +365,7 @@ func testWindowsBuildmodeCSharedASLR(t *testing.T, useASLR bool) {
 		argv = append(argv, "-ldflags", "-aslr=false")
 	}
 	argv = append(argv, "-o", objfile, srcfile)
-	out, err := exec.Command(testenv.GoToolPath(t), argv...).CombinedOutput()
+	out, err := testenv.Command(t, testenv.GoToolPath(t), argv...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("build failure: %s\n%s\n", err, string(out))
 	}
@@ -302,7 +457,34 @@ package main
 import "runtime"
 import "runtime/pprof"
 func main() {
-        _ = pprof.Profiles()
+	_ = pprof.Profiles()
+	println(runtime.MemProfileRate)
+}
+`,
+			"524288",
+		},
+		{
+			"with_memprofile_runtime_pprof_writeheap",
+			`
+package main
+import "io"
+import "runtime"
+import "runtime/pprof"
+func main() {
+	_ = pprof.WriteHeapProfile(io.Discard)
+	println(runtime.MemProfileRate)
+}
+`,
+			"524288",
+		},
+		{
+			"with_memprofile_runtime_pprof_lookupheap",
+			`
+package main
+import "runtime"
+import "runtime/pprof"
+func main() {
+	_ = pprof.Lookup("heap")
 	println(runtime.MemProfileRate)
 }
 `,
@@ -322,7 +504,6 @@ func main() {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			tempDir := t.TempDir()
@@ -330,7 +511,7 @@ func main() {
 			if err := os.WriteFile(src, []byte(tt.prog), 0644); err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command(testenv.GoToolPath(t), "run", src)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "run", src)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatal(err)
@@ -340,5 +521,100 @@ func main() {
 				t.Errorf("got %q; want %q", got, tt.wantOut)
 			}
 		})
+	}
+}
+
+func TestRISCVTrampolines(t *testing.T) {
+	// Don't build library for non-standard target in short mode.
+	if testing.Short() && (runtime.GOOS != "linux" || runtime.GOARCH != "riscv64") {
+		t.Skipf("skipping on %s/%s in short mode", runtime.GOOS, runtime.GOARCH)
+	}
+
+	testenv.MustHaveGoBuild(t)
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "x.s")
+
+	// Calling b from a or c should not use trampolines, however
+	// calling from d to a will require one.
+	buf := new(bytes.Buffer)
+	fmt.Fprintf(buf, "TEXT a(SB),$0-0\n")
+	for i := 0; i < 1<<17; i++ {
+		fmt.Fprintf(buf, "\tADD $0, X5, X0\n")
+	}
+	fmt.Fprintf(buf, "\tCALL b(SB)\n")
+	fmt.Fprintf(buf, "\tRET\n")
+	fmt.Fprintf(buf, "TEXT b(SB),$0-0\n")
+	fmt.Fprintf(buf, "\tRET\n")
+	fmt.Fprintf(buf, "TEXT c(SB),$0-0\n")
+	fmt.Fprintf(buf, "\tCALL b(SB)\n")
+	fmt.Fprintf(buf, "\tRET\n")
+	fmt.Fprintf(buf, "TEXT ·d(SB),0,$0-0\n")
+	for i := 0; i < 1<<17; i++ {
+		fmt.Fprintf(buf, "\tADD $0, X5, X0\n")
+	}
+	fmt.Fprintf(buf, "\tCALL a(SB)\n")
+	fmt.Fprintf(buf, "\tCALL c(SB)\n")
+	fmt.Fprintf(buf, "\tRET\n")
+	if err := os.WriteFile(tmpFile, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("Failed to write assembly file: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module riscvtramp"), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v\n", err)
+	}
+	main := `package main
+func main() {
+	d()
+}
+
+func d()
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "x.go"), []byte(main), 0644); err != nil {
+		t.Fatalf("failed to write main: %v\n", err)
+	}
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "build", "-ldflags=-linkmode=internal")
+	cmd.Dir = tmpDir
+	cmd.Env = append(os.Environ(), "GOARCH=riscv64", "GOOS=linux")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Build failed: %v, output: %s", err, out)
+	}
+
+	// Check what trampolines exist.
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "nm", filepath.Join(tmpDir, "riscvtramp"))
+	cmd.Env = append(os.Environ(), "GOARCH=riscv64", "GOOS=linux")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("nm failure: %s\n%s\n", err, string(out))
+	}
+	if !bytes.Contains(out, []byte(" T a-tramp0")) {
+		t.Errorf("Trampoline a-tramp0 is missing")
+	}
+	if bytes.Contains(out, []byte(" T b-tramp0")) {
+		t.Errorf("Trampoline b-tramp0 exists unnecessarily")
+	}
+}
+
+func TestRounding(t *testing.T) {
+	testCases := []struct {
+		input    int64
+		quantum  int64
+		expected int64
+	}{
+		{0x30000000, 0x2000, 0x30000000}, // Already aligned
+		{0x30002000, 0x2000, 0x30002000}, // Exactly on boundary
+		{0x30001234, 0x2000, 0x30002000},
+		{0x30001000, 0x2000, 0x30002000},
+		{0x30001fff, 0x2000, 0x30002000},
+	}
+
+	for _, tc := range testCases {
+		result := Rnd(tc.input, tc.quantum)
+		if result != tc.expected {
+			t.Errorf("Rnd(0x%x, 0x%x) = 0x%x, expected 0x%x",
+				tc.input, tc.quantum, result, tc.expected)
+		}
 	}
 }

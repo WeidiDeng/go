@@ -21,16 +21,16 @@ package runtime
 
 import (
 	"internal/cpu"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
 // Asynchronous semaphore for sync.Mutex.
 
-// A semaRoot holds a balanced tree of sudog with distinct addresses (s.elem).
-// Each of those sudog may in turn point (through s.waitlink) to a list
-// of other sudogs waiting on the same address.
-// The operations on the inner lists of sudogs with the same address
+// A semaRoot holds a balanced tree of waitingG with distinct addresses (wg.elem).
+// Each of those waitingG may in turn point (through wg.waitlink) to a list
+// of other waitingGs waiting on the same address.
+// The operations on the inner lists of waitingGs with the same address
 // are all O(1). The scanning of the top-level semaRoot list is O(log n),
 // where n is the number of distinct addresses with goroutines blocked
 // on them that hash to the given semaRoot.
@@ -39,7 +39,7 @@ import (
 // BenchmarkSemTable/OneAddrCollision/* for a benchmark that exercises this.
 type semaRoot struct {
 	lock  mutex
-	treap *sudog        // root of balanced tree of unique waiters.
+	treap *waitingG     // root of balanced tree of unique waiters.
 	nwait atomic.Uint32 // Number of waiters. Read w/o the lock.
 }
 
@@ -57,6 +57,15 @@ func (t *semTable) rootFor(addr *uint32) *semaRoot {
 	return &t[(uintptr(unsafe.Pointer(addr))>>3)%semTabSize].root
 }
 
+// sync_runtime_Semacquire should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - gvisor.dev/gvisor
+//   - github.com/sagernet/gvisor
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
 //go:linkname sync_runtime_Semacquire sync.runtime_Semacquire
 func sync_runtime_Semacquire(addr *uint32) {
 	semacquire1(addr, false, semaBlockProfile, 0, waitReasonSemacquire)
@@ -67,13 +76,22 @@ func poll_runtime_Semacquire(addr *uint32) {
 	semacquire1(addr, false, semaBlockProfile, 0, waitReasonSemacquire)
 }
 
+// sync_runtime_Semrelease should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - gvisor.dev/gvisor
+//   - github.com/sagernet/gvisor
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
 //go:linkname sync_runtime_Semrelease sync.runtime_Semrelease
 func sync_runtime_Semrelease(addr *uint32, handoff bool, skipframes int) {
 	semrelease1(addr, handoff, skipframes)
 }
 
-//go:linkname sync_runtime_SemacquireMutex sync.runtime_SemacquireMutex
-func sync_runtime_SemacquireMutex(addr *uint32, lifo bool, skipframes int) {
+//go:linkname internal_sync_runtime_SemacquireMutex internal/sync.runtime_SemacquireMutex
+func internal_sync_runtime_SemacquireMutex(addr *uint32, lifo bool, skipframes int) {
 	semacquire1(addr, lifo, semaBlockProfile|semaMutexProfile, skipframes, waitReasonSyncMutexLock)
 }
 
@@ -87,16 +105,30 @@ func sync_runtime_SemacquireRWMutex(addr *uint32, lifo bool, skipframes int) {
 	semacquire1(addr, lifo, semaBlockProfile|semaMutexProfile, skipframes, waitReasonSyncRWMutexLock)
 }
 
+//go:linkname sync_runtime_SemacquireWaitGroup sync.runtime_SemacquireWaitGroup
+func sync_runtime_SemacquireWaitGroup(addr *uint32, synctestDurable bool) {
+	reason := waitReasonSyncWaitGroupWait
+	if synctestDurable {
+		reason = waitReasonSynctestWaitGroupWait
+	}
+	semacquire1(addr, false, semaBlockProfile, 0, reason)
+}
+
 //go:linkname poll_runtime_Semrelease internal/poll.runtime_Semrelease
 func poll_runtime_Semrelease(addr *uint32) {
 	semrelease(addr)
 }
 
-func readyWithTime(s *sudog, traceskip int) {
-	if s.releasetime != 0 {
-		s.releasetime = cputicks()
+//go:linkname internal_sync_runtime_Semrelease internal/sync.runtime_Semrelease
+func internal_sync_runtime_Semrelease(addr *uint32, handoff bool, skipframes int) {
+	semrelease1(addr, handoff, skipframes)
+}
+
+func readyWithTime(wg *waitingG, traceskip int) {
+	if wg.releasetime != 0 {
+		wg.releasetime = cputicks()
 	}
-	goready(s.g, traceskip)
+	goready(wg.g, traceskip)
 }
 
 type semaProfileFlags int
@@ -128,21 +160,21 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 	//	enqueue itself as a waiter
 	//	sleep
 	//	(waiter descriptor is dequeued by signaler)
-	s := acquireSudog()
+	wg := acquireWaitingG(waitingGTypeSema)
 	root := semtable.rootFor(addr)
 	t0 := int64(0)
-	s.releasetime = 0
-	s.acquiretime = 0
-	s.ticket = 0
+	wg.releasetime = 0
+	wg.acquiretime = 0
+	wg.ticket = 0
 	if profile&semaBlockProfile != 0 && blockprofilerate > 0 {
 		t0 = cputicks()
-		s.releasetime = -1
+		wg.releasetime = -1
 	}
 	if profile&semaMutexProfile != 0 && mutexprofilerate > 0 {
 		if t0 == 0 {
 			t0 = cputicks()
 		}
-		s.acquiretime = t0
+		wg.acquiretime = t0
 	}
 	for {
 		lockWithRank(&root.lock, lockRankRoot)
@@ -156,16 +188,16 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		}
 		// Any semrelease after the cansemacquire knows we're waiting
 		// (we set nwait above), so go to sleep.
-		root.queue(addr, s, lifo)
-		goparkunlock(&root.lock, reason, traceEvGoBlockSync, 4+skipframes)
-		if s.ticket != 0 || cansemacquire(addr) {
+		root.queue(addr, wg, lifo)
+		goparkunlock(&root.lock, reason, traceBlockSync, 4+skipframes)
+		if wg.ticket != 0 || cansemacquire(addr) {
 			break
 		}
 	}
-	if s.releasetime > 0 {
-		blockevent(s.releasetime-t0, 3+skipframes)
+	if wg.releasetime > 0 {
+		blockevent(wg.releasetime-t0, 3+skipframes)
 	}
-	releaseSudog(s)
+	releaseWaitingG(wg)
 }
 
 func semrelease(addr *uint32) {
@@ -191,28 +223,51 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		unlock(&root.lock)
 		return
 	}
-	s, t0 := root.dequeue(addr)
-	if s != nil {
+	wg, t0, tailtime := root.dequeue(addr)
+	if wg != nil {
 		root.nwait.Add(-1)
 	}
 	unlock(&root.lock)
-	if s != nil { // May be slow or even yield, so unlock first
-		acquiretime := s.acquiretime
+	if wg != nil { // May be slow or even yield, so unlock first
+		acquiretime := wg.acquiretime
 		if acquiretime != 0 {
-			mutexevent(t0-acquiretime, 3+skipframes)
+			// Charge contention that this (delayed) unlock caused.
+			// If there are N more goroutines waiting beyond the
+			// one that's waking up, charge their delay as well, so that
+			// contention holding up many goroutines shows up as
+			// more costly than contention holding up a single goroutine.
+			// It would take O(N) time to calculate how long each goroutine
+			// has been waiting, so instead we charge avg(head-wait, tail-wait)*N.
+			// head-wait is the longest wait and tail-wait is the shortest.
+			// (When we do a lifo insertion, we preserve this property by
+			// copying the old head's acquiretime into the inserted new head.
+			// In that case the overall average may be slightly high, but that's fine:
+			// the average of the ends is only an approximation to the actual
+			// average anyway.)
+			// The root.dequeue above changed the head and tail acquiretime
+			// to the current time, so the next unlock will not re-count this contention.
+			dt0 := t0 - acquiretime
+			dt := dt0
+			if wg.waiters != 0 {
+				dtail := t0 - tailtime
+				dt += (dtail + dt0) / 2 * int64(wg.waiters)
+			}
+			mutexevent(dt, 3+skipframes)
 		}
-		if s.ticket != 0 {
+		if wg.ticket != 0 {
 			throw("corrupted semaphore ticket")
 		}
 		if handoff && cansemacquire(addr) {
-			s.ticket = 1
+			wg.ticket = 1
 		}
-		readyWithTime(s, 5+skipframes)
-		if s.ticket == 1 && getg().m.locks == 0 {
+		readyWithTime(wg, 5+skipframes)
+		if wg.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0 {
 			// Direct G handoff
+			//
 			// readyWithTime has added the waiter G as runnext in the
 			// current P; we now call the scheduler so that we start running
 			// the waiter G immediately.
+			//
 			// Note that waiter inherits our time slice: this is desirable
 			// to avoid having a highly contended semaphore hog the P
 			// indefinitely. goyield is like Gosched, but it emits a
@@ -222,9 +277,12 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 			// the non-starving case it is possible for a different waiter
 			// to acquire the semaphore while we are yielding/scheduling,
 			// and this would be wasteful. We wait instead to enter starving
-			// regime, and then we start to do direct handoffs of ticket and
-			// P.
+			// regime, and then we start to do direct handoffs of ticket and P.
+			//
 			// See issue 33747 for discussion.
+			//
+			// We don't handoff directly if we're holding locks or on the
+			// system stack, since it's not safe to enter the scheduler.
 			goyield()
 		}
 	}
@@ -242,166 +300,194 @@ func cansemacquire(addr *uint32) bool {
 	}
 }
 
-// queue adds s to the blocked goroutines in semaRoot.
-func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
-	s.g = getg()
-	s.elem = unsafe.Pointer(addr)
-	s.next = nil
-	s.prev = nil
+// queue adds wg to the blocked goroutines in semaRoot.
+func (root *semaRoot) queue(addr *uint32, wg *waitingG, lifo bool) {
+	wg.g = getg()
+	wg.elem.set(unsafe.Pointer(addr))
+	// Storing this pointer so that we can trace the semaphore address
+	// from the blocked goroutine when checking for goroutine leaks.
+	wg.g.waiting = wg
+	wg.next = nil
+	wg.prev = nil
+	wg.waiters = 0
 
-	var last *sudog
+	var last *waitingG
 	pt := &root.treap
 	for t := *pt; t != nil; t = *pt {
-		if t.elem == unsafe.Pointer(addr) {
+		if uintptr(unsafe.Pointer(addr)) == t.elem.uintptr() {
 			// Already have addr in list.
 			if lifo {
-				// Substitute s in t's place in treap.
-				*pt = s
-				s.ticket = t.ticket
-				s.acquiretime = t.acquiretime
-				s.parent = t.parent
-				s.prev = t.prev
-				s.next = t.next
-				if s.prev != nil {
-					s.prev.parent = s
+				// Substitute wg in t's place in treap.
+				*pt = wg
+				wg.ticket = t.ticket
+				wg.acquiretime = t.acquiretime // preserve head acquiretime as oldest time
+				wg.parent = t.parent
+				wg.prev = t.prev
+				wg.next = t.next
+				if wg.prev != nil {
+					wg.prev.parent = wg
 				}
-				if s.next != nil {
-					s.next.parent = s
+				if wg.next != nil {
+					wg.next.parent = wg
 				}
-				// Add t first in s's wait list.
-				s.waitlink = t
-				s.waittail = t.waittail
-				if s.waittail == nil {
-					s.waittail = t
+				// Add t first in wg's wait list.
+				wg.waitlink = t
+				wg.waittail = t.waittail
+				if wg.waittail == nil {
+					wg.waittail = t
+				}
+				wg.waiters = t.waiters
+				if wg.waiters+1 != 0 {
+					wg.waiters++
 				}
 				t.parent = nil
 				t.prev = nil
 				t.next = nil
 				t.waittail = nil
 			} else {
-				// Add s to end of t's wait list.
+				// Add wg to end of t's wait list.
 				if t.waittail == nil {
-					t.waitlink = s
+					t.waitlink = wg
 				} else {
-					t.waittail.waitlink = s
+					t.waittail.waitlink = wg
 				}
-				t.waittail = s
-				s.waitlink = nil
+				t.waittail = wg
+				wg.waitlink = nil
+				if t.waiters+1 != 0 {
+					t.waiters++
+				}
 			}
 			return
 		}
 		last = t
-		if uintptr(unsafe.Pointer(addr)) < uintptr(t.elem) {
+		if uintptr(unsafe.Pointer(addr)) < t.elem.uintptr() {
 			pt = &t.prev
 		} else {
 			pt = &t.next
 		}
 	}
 
-	// Add s as new leaf in tree of unique addrs.
+	// Add wg as new leaf in tree of unique addrs.
 	// The balanced tree is a treap using ticket as the random heap priority.
 	// That is, it is a binary tree ordered according to the elem addresses,
 	// but then among the space of possible binary trees respecting those
 	// addresses, it is kept balanced on average by maintaining a heap ordering
-	// on the ticket: s.ticket <= both s.prev.ticket and s.next.ticket.
+	// on the ticket: wg.ticket <= both wg.prev.ticket and wg.next.ticket.
 	// https://en.wikipedia.org/wiki/Treap
 	// https://faculty.washington.edu/aragon/pubs/rst89.pdf
 	//
-	// s.ticket compared with zero in couple of places, therefore set lowest bit.
+	// wg.ticket compared with zero in couple of places, therefore set lowest bit.
 	// It will not affect treap's quality noticeably.
-	s.ticket = fastrand() | 1
-	s.parent = last
-	*pt = s
+	wg.ticket = cheaprand() | 1
+	wg.parent = last
+	*pt = wg
 
 	// Rotate up into tree according to ticket (priority).
-	for s.parent != nil && s.parent.ticket > s.ticket {
-		if s.parent.prev == s {
-			root.rotateRight(s.parent)
+	for wg.parent != nil && wg.parent.ticket > wg.ticket {
+		if wg.parent.prev == wg {
+			root.rotateRight(wg.parent)
 		} else {
-			if s.parent.next != s {
+			if wg.parent.next != wg {
 				panic("semaRoot queue")
 			}
-			root.rotateLeft(s.parent)
+			root.rotateLeft(wg.parent)
 		}
 	}
 }
 
 // dequeue searches for and finds the first goroutine
 // in semaRoot blocked on addr.
-// If the sudog was being profiled, dequeue returns the time
+// If the waitingG was being profiled, dequeue returns the time
 // at which it was woken up as now. Otherwise now is 0.
-func (root *semaRoot) dequeue(addr *uint32) (found *sudog, now int64) {
-	ps := &root.treap
-	s := *ps
-	for ; s != nil; s = *ps {
-		if s.elem == unsafe.Pointer(addr) {
+// If there are additional entries in the wait list, dequeue
+// returns tailtime set to the last entry's acquiretime.
+// Otherwise tailtime is found.acquiretime.
+func (root *semaRoot) dequeue(addr *uint32) (found *waitingG, now, tailtime int64) {
+	pwg := &root.treap
+	wg := *pwg
+
+	for ; wg != nil; wg = *pwg {
+		if uintptr(unsafe.Pointer(addr)) == wg.elem.uintptr() {
 			goto Found
 		}
-		if uintptr(unsafe.Pointer(addr)) < uintptr(s.elem) {
-			ps = &s.prev
+
+		if uintptr(unsafe.Pointer(addr)) < wg.elem.uintptr() {
+			pwg = &wg.prev
 		} else {
-			ps = &s.next
+			pwg = &wg.next
 		}
 	}
-	return nil, 0
+	return nil, 0, 0
 
 Found:
 	now = int64(0)
-	if s.acquiretime != 0 {
+	if wg.acquiretime != 0 {
 		now = cputicks()
 	}
-	if t := s.waitlink; t != nil {
-		// Substitute t, also waiting on addr, for s in root tree of unique addrs.
-		*ps = t
-		t.ticket = s.ticket
-		t.parent = s.parent
-		t.prev = s.prev
+	if t := wg.waitlink; t != nil {
+		// Substitute t, also waiting on addr, for wg in root tree of unique addrs.
+		*pwg = t
+		t.ticket = wg.ticket
+		t.parent = wg.parent
+		t.prev = wg.prev
 		if t.prev != nil {
 			t.prev.parent = t
 		}
-		t.next = s.next
+		t.next = wg.next
 		if t.next != nil {
 			t.next.parent = t
 		}
 		if t.waitlink != nil {
-			t.waittail = s.waittail
+			t.waittail = wg.waittail
 		} else {
 			t.waittail = nil
 		}
+		t.waiters = wg.waiters
+		if t.waiters > 1 {
+			t.waiters--
+		}
+		// Set head and tail acquire time to 'now',
+		// because the caller will take care of charging
+		// the delays before now for all entries in the list.
 		t.acquiretime = now
-		s.waitlink = nil
-		s.waittail = nil
+		tailtime = wg.waittail.acquiretime
+		wg.waittail.acquiretime = now
+		wg.waitlink = nil
+		wg.waittail = nil
 	} else {
-		// Rotate s down to be leaf of tree for removal, respecting priorities.
-		for s.next != nil || s.prev != nil {
-			if s.next == nil || s.prev != nil && s.prev.ticket < s.next.ticket {
-				root.rotateRight(s)
+		// Rotate wg down to be leaf of tree for removal, respecting priorities.
+		for wg.next != nil || wg.prev != nil {
+			if wg.next == nil || wg.prev != nil && wg.prev.ticket < wg.next.ticket {
+				root.rotateRight(wg)
 			} else {
-				root.rotateLeft(s)
+				root.rotateLeft(wg)
 			}
 		}
-		// Remove s, now a leaf.
-		if s.parent != nil {
-			if s.parent.prev == s {
-				s.parent.prev = nil
+		// Remove wg, now a leaf.
+		if wg.parent != nil {
+			if wg.parent.prev == wg {
+				wg.parent.prev = nil
 			} else {
-				s.parent.next = nil
+				wg.parent.next = nil
 			}
 		} else {
 			root.treap = nil
 		}
+		tailtime = wg.acquiretime
 	}
-	s.parent = nil
-	s.elem = nil
-	s.next = nil
-	s.prev = nil
-	s.ticket = 0
-	return s, now
+	// Goroutine is no longer blocked. Clear the waiting pointer.
+	wg.g.waiting = nil
+	wg.parent = nil
+	wg.elem.set(nil)
+	wg.next = nil
+	wg.prev = nil
+	wg.ticket = 0
+	return wg, now, tailtime
 }
 
 // rotateLeft rotates the tree rooted at node x.
 // turning (x a (y b c)) into (y (x a b) c).
-func (root *semaRoot) rotateLeft(x *sudog) {
+func (root *semaRoot) rotateLeft(x *waitingG) {
 	// p -> (x a (y b c))
 	p := x.parent
 	y := x.next
@@ -429,7 +515,7 @@ func (root *semaRoot) rotateLeft(x *sudog) {
 
 // rotateRight rotates the tree rooted at node y.
 // turning (y (x a b) c) into (x a (y b c)).
-func (root *semaRoot) rotateRight(y *sudog) {
+func (root *semaRoot) rotateRight(y *waitingG) {
 	// p -> (y (x a b) c)
 	p := y.parent
 	x := y.prev
@@ -474,8 +560,8 @@ type notifyList struct {
 
 	// List of parked waiters.
 	lock mutex
-	head *sudog
-	tail *sudog
+	head *waitingG
+	tail *waitingG
 }
 
 // less checks if a < b, considering a & b running counts that may overflow the
@@ -509,26 +595,34 @@ func notifyListWait(l *notifyList, t uint32) {
 	}
 
 	// Enqueue itself.
-	s := acquireSudog()
-	s.g = getg()
-	s.ticket = t
-	s.releasetime = 0
+	wg := acquireWaitingG(waitingGTypeCond)
+	wg.g = getg()
+	// Storing this pointer so that we can trace the condvar address
+	// from the blocked goroutine when checking for goroutine leaks.
+	wg.elem.set(unsafe.Pointer(l))
+	wg.g.waiting = wg
+	wg.ticket = t
+	wg.releasetime = 0
 	t0 := int64(0)
 	if blockprofilerate > 0 {
 		t0 = cputicks()
-		s.releasetime = -1
+		wg.releasetime = -1
 	}
 	if l.tail == nil {
-		l.head = s
+		l.head = wg
 	} else {
-		l.tail.next = s
+		l.tail.next = wg
 	}
-	l.tail = s
-	goparkunlock(&l.lock, waitReasonSyncCondWait, traceEvGoBlockCond, 3)
+	l.tail = wg
+	goparkunlock(&l.lock, waitReasonSyncCondWait, traceBlockCondWait, 3)
 	if t0 != 0 {
-		blockevent(s.releasetime-t0, 2)
+		blockevent(wg.releasetime-t0, 2)
 	}
-	releaseSudog(s)
+	// Goroutine is no longer blocked. Clear up its waiting pointer,
+	// and clean up the waitingG before releasing it.
+	wg.g.waiting = nil
+	wg.elem.set(nil)
+	releaseWaitingG(wg)
 }
 
 // notifyListNotifyAll notifies all entries in the list.
@@ -544,7 +638,7 @@ func notifyListNotifyAll(l *notifyList) {
 	// Pull the list out into a local variable, waiters will be readied
 	// outside the lock.
 	lockWithRank(&l.lock, lockRankNotifyList)
-	s := l.head
+	wg := l.head
 	l.head = nil
 	l.tail = nil
 
@@ -556,11 +650,15 @@ func notifyListNotifyAll(l *notifyList) {
 	unlock(&l.lock)
 
 	// Go through the local list and ready all waiters.
-	for s != nil {
-		next := s.next
-		s.next = nil
-		readyWithTime(s, 4)
-		s = next
+	for wg != nil {
+		next := wg.next
+		wg.next = nil
+		if wg.g.bubble != nil && getg().bubble != wg.g.bubble {
+			println("semaphore wake of synctest goroutine", wg.g.goid, "from outside bubble")
+			fatal("semaphore wake of synctest goroutine from outside bubble")
+		}
+		readyWithTime(wg, 4)
+		wg = next
 	}
 }
 
@@ -599,9 +697,9 @@ func notifyListNotifyOne(l *notifyList) {
 	// be too long. This applies even when the g is missing:
 	// it hasn't yet gotten to sleep and has lost the race to
 	// the (few) other g's that we find on the list.
-	for p, s := (*sudog)(nil), l.head; s != nil; p, s = s, s.next {
-		if s.ticket == t {
-			n := s.next
+	for p, wg := (*waitingG)(nil), l.head; wg != nil; p, wg = wg, wg.next {
+		if wg.ticket == t {
+			n := wg.next
 			if p != nil {
 				p.next = n
 			} else {
@@ -611,8 +709,12 @@ func notifyListNotifyOne(l *notifyList) {
 				l.tail = p
 			}
 			unlock(&l.lock)
-			s.next = nil
-			readyWithTime(s, 4)
+			wg.next = nil
+			if wg.g.bubble != nil && getg().bubble != wg.g.bubble {
+				println("semaphore wake of synctest goroutine", wg.g.goid, "from outside bubble")
+				fatal("semaphore wake of synctest goroutine from outside bubble")
+			}
+			readyWithTime(wg, 4)
 			return
 		}
 	}
@@ -627,7 +729,7 @@ func notifyListCheck(sz uintptr) {
 	}
 }
 
-//go:linkname sync_nanotime sync.runtime_nanotime
-func sync_nanotime() int64 {
+//go:linkname internal_sync_nanotime internal/sync.runtime_nanotime
+func internal_sync_nanotime() int64 {
 	return nanotime()
 }

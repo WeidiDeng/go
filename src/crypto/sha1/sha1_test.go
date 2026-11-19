@@ -9,12 +9,15 @@ package sha1
 import (
 	"bytes"
 	"crypto/internal/boring"
-	"crypto/rand"
+	"crypto/internal/cryptotest"
 	"encoding"
 	"fmt"
 	"hash"
 	"io"
+	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type sha1Test struct {
@@ -59,6 +62,9 @@ var golden = []sha1Test{
 }
 
 func TestGolden(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha1", testGolden)
+}
+func testGolden(t *testing.T) {
 	for i := 0; i < len(golden); i++ {
 		g := golden[i]
 		s := fmt.Sprintf("%x", Sum([]byte(g.in)))
@@ -73,7 +79,7 @@ func TestGolden(t *testing.T) {
 				io.WriteString(c, g.in)
 				sum = c.Sum(nil)
 			case 2:
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.Sum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 				sum = c.Sum(nil)
@@ -81,7 +87,7 @@ func TestGolden(t *testing.T) {
 				if boring.Enabled {
 					continue
 				}
-				io.WriteString(c, g.in[0:len(g.in)/2])
+				io.WriteString(c, g.in[:len(g.in)/2])
 				c.(*digest).ConstantTimeSum(nil)
 				io.WriteString(c, g.in[len(g.in)/2:])
 				sum = c.(*digest).ConstantTimeSum(nil)
@@ -96,6 +102,9 @@ func TestGolden(t *testing.T) {
 }
 
 func TestGoldenMarshal(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha1", testGoldenMarshal)
+}
+func testGoldenMarshal(t *testing.T) {
 	h := New()
 	h2 := New()
 	for _, g := range golden {
@@ -110,8 +119,20 @@ func TestGoldenMarshal(t *testing.T) {
 			continue
 		}
 
+		stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+		if err != nil {
+			t.Errorf("could not marshal: %v", err)
+			continue
+		}
+		stateAppend = stateAppend[4:]
+
 		if string(state) != g.halfState {
 			t.Errorf("sha1(%q) state = %+q, want %+q", g.in, state, g.halfState)
+			continue
+		}
+
+		if string(stateAppend) != g.halfState {
+			t.Errorf("sha1(%q) stateAppend = %+q, want %+q", g.in, stateAppend, g.halfState)
 			continue
 		}
 
@@ -140,23 +161,6 @@ func TestBlockSize(t *testing.T) {
 	c := New()
 	if got := c.BlockSize(); got != BlockSize {
 		t.Errorf("BlockSize = %d; want %d", got, BlockSize)
-	}
-}
-
-// Tests that blockGeneric (pure Go) and block (in assembly for some architectures) match.
-func TestBlockGeneric(t *testing.T) {
-	if boring.Enabled {
-		t.Skip("BoringCrypto doesn't expose digest")
-	}
-	for i := 1; i < 30; i++ { // arbitrary factor
-		gen, asm := New().(*digest), New().(*digest)
-		buf := make([]byte, BlockSize*i)
-		rand.Read(buf)
-		blockGeneric(gen, buf)
-		block(asm, buf)
-		if *gen != *asm {
-			t.Errorf("For %#v block and blockGeneric resulted in different states", buf)
-		}
 	}
 }
 
@@ -197,8 +201,10 @@ func safeSum(h hash.Hash) (sum []byte, err error) {
 }
 
 func TestLargeHashes(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha1", testLargeHashes)
+}
+func testLargeHashes(t *testing.T) {
 	for i, test := range largeUnmarshalTests {
-
 		h := New()
 		if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary([]byte(test.state)); err != nil {
 			t.Errorf("test %d could not unmarshal: %v", i, err)
@@ -218,9 +224,7 @@ func TestLargeHashes(t *testing.T) {
 }
 
 func TestAllocations(t *testing.T) {
-	if boring.Enabled {
-		t.Skip("BoringCrypto doesn't allocate the same way as stdlib")
-	}
+	cryptotest.SkipTestAllocations(t)
 	in := []byte("hello, world!")
 	out := make([]byte, 0, Size)
 	h := New()
@@ -234,17 +238,48 @@ func TestAllocations(t *testing.T) {
 	}
 }
 
+func TestSHA1Hash(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha1", func(t *testing.T) {
+		cryptotest.TestHash(t, New)
+	})
+}
+
+func TestExtraMethods(t *testing.T) {
+	h := maybeCloner(New())
+	cryptotest.NoExtraMethods(t, &h, "ConstantTimeSum",
+		"MarshalBinary", "UnmarshalBinary", "AppendBinary")
+}
+
+func maybeCloner(h hash.Hash) any {
+	if c, ok := h.(hash.Cloner); ok {
+		return &c
+	}
+	return &h
+}
+
+func TestOutOfBoundsRead(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha1", func(t *testing.T) {
+		start, end := cryptotest.BoundarySlices(t, 1000)
+		for i := range len(start) + 1 {
+			Sum(start[:i])
+			Sum(start[len(start)-i:])
+			Sum(end[:i])
+			Sum(end[len(end)-i:])
+		}
+	})
+}
+
 var bench = New()
-var buf = make([]byte, 8192)
 
 func benchmarkSize(b *testing.B, size int) {
+	buf := make([]byte, size)
 	sum := make([]byte, bench.Size())
 	b.Run("New", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(size))
 		for i := 0; i < b.N; i++ {
 			bench.Reset()
-			bench.Write(buf[:size])
+			bench.Write(buf)
 			bench.Sum(sum[:0])
 		}
 	})
@@ -252,7 +287,7 @@ func benchmarkSize(b *testing.B, size int) {
 		b.ReportAllocs()
 		b.SetBytes(int64(size))
 		for i := 0; i < b.N; i++ {
-			Sum(buf[:size])
+			Sum(buf)
 		}
 	})
 }
@@ -271,4 +306,53 @@ func BenchmarkHash1K(b *testing.B) {
 
 func BenchmarkHash8K(b *testing.B) {
 	benchmarkSize(b, 8192)
+}
+
+func BenchmarkHash256K(b *testing.B) {
+	benchmarkSize(b, 256*1024)
+}
+
+func BenchmarkHash1M(b *testing.B) {
+	benchmarkSize(b, 1024*1024)
+}
+
+var sinkSTW []byte
+
+// BenchmarkSTW reports how long a garbage collection had to wait while a hash
+// ran alongside it, as gcwait-ns/op. Assembly is not preemptible, so a call
+// that covers the whole input blocks every goroutine in the process for as
+// long as it runs; bounding the call gives the collector a way in between
+// chunks. Run with GOMAXPROCS>=2 so the two actually overlap.
+func BenchmarkSTW(b *testing.B) {
+	buf := make([]byte, 64<<20)
+	var total time.Duration
+	var iters int
+	b.SetBytes(int64(len(buf)))
+	for b.Loop() {
+		done := make(chan struct{})
+		var began atomic.Int64
+		go func() {
+			defer close(done)
+			began.Store(time.Now().UnixNano())
+			h := New()
+			h.Write(buf)
+			sinkSTW = h.Sum(nil)
+		}()
+		start := time.Now()
+		runtime.GC() // one per iteration, so the mean is well defined
+		end := time.Now()
+		<-done
+
+		// Count the iteration only if the hash had started before the
+		// collection finished. Otherwise there was nothing to overlap and the
+		// sample says nothing about preemptibility.
+		if t := began.Load(); t != 0 && t < end.UnixNano() {
+			total += end.Sub(start)
+			iters++
+		}
+	}
+	if iters == 0 {
+		b.Skip("no iteration overlapped a collection")
+	}
+	b.ReportMetric(float64(total.Nanoseconds())/float64(iters), "gcwait-ns/op")
 }

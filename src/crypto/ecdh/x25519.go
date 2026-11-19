@@ -5,8 +5,11 @@
 package ecdh
 
 import (
-	"crypto/internal/edwards25519/field"
-	"crypto/internal/randutil"
+	"bytes"
+	"crypto/internal/fips140/edwards25519"
+	"crypto/internal/fips140/edwards25519/field"
+	"crypto/internal/fips140only"
+	"crypto/internal/rand"
 	"errors"
 	"io"
 )
@@ -17,7 +20,7 @@ var (
 	x25519SharedSecretSize = 32
 )
 
-// X25519 returns a Curve which implements the X25519 function over Curve25519
+// X25519 returns a [Curve] which implements the X25519 function over Curve25519
 // (RFC 7748, Section 5).
 //
 // Multiple invocations of this function will return the same value, so it can
@@ -32,55 +35,84 @@ func (c *x25519Curve) String() string {
 	return "X25519"
 }
 
-func (c *x25519Curve) GenerateKey(rand io.Reader) (*PrivateKey, error) {
+func (c *x25519Curve) GenerateKey(r io.Reader) (*PrivateKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
+	r = rand.CustomReader(r)
 	key := make([]byte, x25519PrivateKeySize)
-	randutil.MaybeReadByte(rand)
-	if _, err := io.ReadFull(rand, key); err != nil {
+	if _, err := io.ReadFull(r, key); err != nil {
 		return nil, err
 	}
 	return c.NewPrivateKey(key)
 }
 
 func (c *x25519Curve) NewPrivateKey(key []byte) (*PrivateKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
 	if len(key) != x25519PrivateKeySize {
 		return nil, errors.New("crypto/ecdh: invalid private key size")
 	}
+	publicKey := make([]byte, x25519PublicKeySize)
+	x25519ScalarBaseMult(publicKey, key)
+	// We don't check for the all-zero public key here because the scalar is
+	// never zero because of clamping, and the basepoint is not the identity in
+	// the prime-order subgroup(s).
 	return &PrivateKey{
 		curve:      c,
-		privateKey: append([]byte{}, key...),
+		privateKey: bytes.Clone(key),
+		publicKey:  &PublicKey{curve: c, publicKey: publicKey},
 	}, nil
 }
 
-func (c *x25519Curve) privateKeyToPublicKey(key *PrivateKey) *PublicKey {
-	if key.curve != c {
-		panic("crypto/ecdh: internal error: converting the wrong key type")
-	}
-	k := &PublicKey{
-		curve:     key.curve,
-		publicKey: make([]byte, x25519PublicKeySize),
-	}
-	x25519Basepoint := [32]byte{9}
-	x25519ScalarMult(k.publicKey, key.privateKey, x25519Basepoint[:])
-	return k
-}
-
 func (c *x25519Curve) NewPublicKey(key []byte) (*PublicKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
 	if len(key) != x25519PublicKeySize {
 		return nil, errors.New("crypto/ecdh: invalid public key")
 	}
 	return &PublicKey{
 		curve:     c,
-		publicKey: append([]byte{}, key...),
+		publicKey: bytes.Clone(key),
 	}, nil
 }
 
-func (c *x25519Curve) ECDH(local *PrivateKey, remote *PublicKey) ([]byte, error) {
+func (c *x25519Curve) ecdh(local *PrivateKey, remote *PublicKey) ([]byte, error) {
 	out := make([]byte, x25519SharedSecretSize)
 	x25519ScalarMult(out, local.privateKey, remote.publicKey)
 	if isZero(out) {
 		return nil, errors.New("crypto/ecdh: bad X25519 remote ECDH input: low order point")
 	}
 	return out, nil
+}
+
+func x25519ScalarBaseMult(dst, scalar []byte) {
+	// If BytesMontgomery is available (FIPS 140-3 module v1.28.0+), it's faster
+	// to use edwards25519's precomputed fixed-base scalar multiplication and
+	// then map to Montgomery form.
+	//
+	// We don't need to worry about handling the twist (which X25519 does, and
+	// edwards25519 doesn't) because the basepoint is not on the twist.
+	// Likewise, we don't need to worry about Scalar.SetBytesWithClamping
+	// reducing modulo the prime order of the curve because the basepoint is in
+	// the prime-order subgroup and doesn't need cofactor clearing.
+	p := new(edwards25519.Point)
+	if p, ok := any(p).(interface {
+		BytesMontgomery() []byte
+		ScalarBaseMult(scalar *edwards25519.Scalar) *edwards25519.Point
+	}); ok {
+		s, err := edwards25519.NewScalar().SetBytesWithClamping(scalar)
+		if err != nil {
+			panic("crypto/ecdh: internal error: invalid scalar length")
+		}
+		p.ScalarBaseMult(s)
+		copy(dst, p.BytesMontgomery())
+	} else {
+		x25519Basepoint := [32]byte{9}
+		x25519ScalarMult(dst, scalar, x25519Basepoint[:])
+	}
 }
 
 func x25519ScalarMult(dst, scalar, point []byte) {
@@ -133,4 +165,13 @@ func x25519ScalarMult(dst, scalar, point []byte) {
 	z2.Invert(&z2)
 	x2.Multiply(&x2, &z2)
 	copy(dst[:], x2.Bytes())
+}
+
+// isZero reports whether x is all zeroes in constant time.
+func isZero(x []byte) bool {
+	var acc byte
+	for _, b := range x {
+		acc |= b
+	}
+	return acc == 0
 }

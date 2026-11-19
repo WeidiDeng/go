@@ -1,5 +1,4 @@
 # For issue golang.org/issue/41084
-[short] skip
 
 ! go test -v examplegoexit
 stdout '(?s)--- PASS.*--- FAIL.*'
@@ -17,13 +16,13 @@ import (
 	"runtime"
 )
 
-func ExamplePass() {
+func Example_pass() {
 	fmt.Println("pass")
 	// Output:
 	// pass
 }
 
-func ExampleGoexit() {
+func Example_goexit() {
 	runtime.Goexit()
 	// Output:
 }

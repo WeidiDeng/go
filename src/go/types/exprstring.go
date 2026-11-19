@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
-	"go/internal/typeparams"
 )
 
 // ExprString returns the (possibly shortened) string representation for x.
@@ -53,7 +52,9 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		buf.WriteString(" literal)") // shortened
 
 	case *ast.CompositeLit:
-		WriteExpr(buf, x.Type)
+		if x.Type != nil {
+			WriteExpr(buf, x.Type)
+		}
 		buf.WriteByte('{')
 		if len(x.Elts) > 0 {
 			buf.WriteString("…")
@@ -71,10 +72,10 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		buf.WriteString(x.Sel.Name)
 
 	case *ast.IndexExpr, *ast.IndexListExpr:
-		ix := typeparams.UnpackIndexExpr(x)
-		WriteExpr(buf, ix.X)
+		ix := unpackIndexedExpr(x)
+		WriteExpr(buf, ix.x)
 		buf.WriteByte('[')
-		writeExprList(buf, ix.Indices)
+		writeExprList(buf, ix.indices)
 		buf.WriteByte(']')
 
 	case *ast.SliceExpr:
@@ -105,7 +106,7 @@ func WriteExpr(buf *bytes.Buffer, x ast.Expr) {
 		WriteExpr(buf, x.Fun)
 		buf.WriteByte('(')
 		writeExprList(buf, x.Args)
-		if x.Ellipsis.IsValid() {
+		if hasDots(x) {
 			buf.WriteString("...")
 		}
 		buf.WriteByte(')')

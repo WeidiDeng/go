@@ -34,10 +34,12 @@
 #define SYS_mincore		4217
 #define SYS_gettid		4222
 #define SYS_futex		4238
+#define SYS_futex_time64	4422
 #define SYS_sched_getaffinity	4240
 #define SYS_exit_group		4246
 #define SYS_timer_create	4257
 #define SYS_timer_settime	4258
+#define SYS_timer_settime64	4409
 #define SYS_timer_delete	4261
 #define SYS_clock_gettime	4263
 #define SYS_tgkill		4266
@@ -119,15 +121,14 @@ TEXT runtime·pipe2(SB),NOSPLIT,$0-16
 
 TEXT runtime·usleep(SB),NOSPLIT,$28-4
 	MOVW	usec+0(FP), R3
-	MOVW	R3, R5
 	MOVW	$1000000, R4
 	DIVU	R4, R3
-	MOVW	LO, R3
+	MOVW	LO, R3	// sec = usec / 1e6
 	MOVW	R3, 24(R29)
-	MOVW	$1000, R4
-	MULU	R3, R4
-	MOVW	LO, R4
-	SUBU	R4, R5
+	MOVW	HI, R5	// usec % 1e6
+	MOVW	$1000, R4	// usec to nsec
+	MULU	R4, R5
+	MOVW	LO, R5
 	MOVW	R5, 28(R29)
 
 	// nanosleep(&ts, 0)
@@ -196,12 +197,23 @@ TEXT runtime·timer_create(SB),NOSPLIT,$0-16
 	MOVW	R2, ret+12(FP)
 	RET
 
-TEXT runtime·timer_settime(SB),NOSPLIT,$0-20
+// Linux: kernel/time/posix-timer.c, requiring COMPAT_32BIT_TIME
+TEXT runtime·timer_settime32(SB),NOSPLIT,$0-20
 	MOVW	timerid+0(FP), R4
 	MOVW	flags+4(FP), R5
 	MOVW	new+8(FP), R6
 	MOVW	old+12(FP), R7
 	MOVW	$SYS_timer_settime, R2
+	SYSCALL
+	MOVW	R2, ret+16(FP)
+	RET
+
+TEXT runtime·timer_settime64(SB),NOSPLIT,$0-20
+	MOVW	timerid+0(FP), R4
+	MOVW	flags+4(FP), R5
+	MOVW	new+8(FP), R6
+	MOVW	old+12(FP), R7
+	MOVW	$SYS_timer_settime64, R2
 	SYSCALL
 	MOVW	R2, ret+16(FP)
 	RET
@@ -306,7 +318,32 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-16
 	MOVW	R22, R29
 	RET
 
-TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$12
+TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$104
+	MOVW	R16, 16(R29)
+	MOVW	R17, 20(R29)
+	MOVW	R18, 24(R29)
+	MOVW	R19, 28(R29)
+	MOVW	R20, 32(R29)
+	MOVW	R21, 36(R29)
+	MOVW	R22, 40(R29)
+	MOVW	R23, 44(R29)
+	MOVW	R28, 48(R29)
+	MOVW	g, 52(R29)
+	#ifndef GOMIPS_softfloat
+	MOVF	F20, 56(R29)
+	MOVF	F21, 60(R29)
+	MOVF	F22, 64(R29)
+	MOVF	F23, 68(R29)
+	MOVF	F24, 72(R29)
+	MOVF	F25, 76(R29)
+	MOVF	F26, 80(R29)
+	MOVF	F27, 84(R29)
+	MOVF	F28, 88(R29)
+	MOVF	F29, 92(R29)
+	MOVF	F30, 96(R29)
+	MOVF	F31, 100(R29)
+	#endif
+
 	// this might be called in external code context,
 	// where g is not set.
 	MOVB	runtime·iscgo(SB), R1
@@ -318,6 +355,31 @@ TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$12
 	MOVW	R6, 12(R29)
 	MOVW	$runtime·sigtrampgo(SB), R1
 	JAL	(R1)
+
+	MOVW	16(R29), R16
+	MOVW	20(R29), R17
+	MOVW	24(R29), R18
+	MOVW	28(R29), R19
+	MOVW	32(R29), R20
+	MOVW	36(R29), R21
+	MOVW	40(R29), R22
+	MOVW	44(R29), R23
+	MOVW	48(R29), R28
+	MOVW	52(R29), g
+	#ifndef GOMIPS_softfloat
+	MOVF	56(R29), F20
+	MOVF	60(R29), F21
+	MOVF	64(R29), F22
+	MOVF	68(R29), F23
+	MOVF	72(R29), F24
+	MOVF	76(R29), F25
+	MOVF	80(R29), F26
+	MOVF	84(R29), F27
+	MOVF	88(R29), F28
+	MOVF	92(R29), F29
+	MOVF	96(R29), F30
+	MOVF	100(R29), F31
+	#endif
 	RET
 
 TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
@@ -362,8 +424,10 @@ TEXT runtime·madvise(SB),NOSPLIT,$0-16
 	MOVW	R2, ret+12(FP)
 	RET
 
-// int32 futex(int32 *uaddr, int32 op, int32 val, struct timespec *timeout, int32 *uaddr2, int32 val2);
-TEXT runtime·futex(SB),NOSPLIT,$20-28
+// Linux: kernel/futex/syscalls.c, requiring COMPAT_32BIT_TIME
+// int32 futex(int32 *uaddr, int32 op, int32 val,
+//	struct old_timespec32 *timeout, int32 *uaddr2, int32 val2);
+TEXT runtime·futex_time32(SB),NOSPLIT,$20-28
 	MOVW	addr+0(FP), R4
 	MOVW	op+4(FP), R5
 	MOVW	val+8(FP), R6
@@ -382,6 +446,27 @@ TEXT runtime·futex(SB),NOSPLIT,$20-28
 	MOVW	R2, ret+24(FP)
 	RET
 
+// Linux: kernel/futex/syscalls.c
+// int32 futex(int32 *uaddr, int32 op, int32 val,
+//	struct timespec *timeout, int32 *uaddr2, int32 val2);
+TEXT runtime·futex_time64(SB),NOSPLIT,$20-28
+	MOVW	addr+0(FP), R4
+	MOVW	op+4(FP), R5
+	MOVW	val+8(FP), R6
+	MOVW	ts+12(FP), R7
+
+	MOVW	addr2+16(FP), R8
+	MOVW	val3+20(FP), R9
+
+	MOVW	R8, 16(R29)
+	MOVW	R9, 20(R29)
+
+	MOVW	$SYS_futex_time64, R2
+	SYSCALL
+	BEQ	R7, 2(PC)
+	SUBU	R2, R0, R2	// caller expects negative errno
+	MOVW	R2, ret+24(FP)
+	RET
 
 // int32 clone(int32 flags, void *stk, M *mp, G *gp, void (*fn)(void));
 TEXT runtime·clone(SB),NOSPLIT|NOFRAME,$0-24

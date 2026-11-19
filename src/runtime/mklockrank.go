@@ -41,7 +41,7 @@ const ranks = `
 # Sysmon
 NONE
 < sysmon
-< scavenge, forcegc;
+< scavenge, forcegc, computeMaxProcs, updateMaxProcsG;
 
 # Defer
 NONE < defer;
@@ -50,30 +50,49 @@ NONE < defer;
 NONE <
   sweepWaiters,
   assistQueue,
+  strongFromWeakQueue,
+  cleanupQueue,
   sweep;
 
+# Test only
+NONE < testR, testW;
+
+# vgetrandom
+NONE < vgetrandom;
+
+NONE < timerSend;
+
 # Scheduler, timers, netpoll
-NONE < pollDesc, cpuprof;
+NONE < allocmW, execW, cpuprof, pollCache, pollDesc, wakeableSleep;
+scavenge, sweep, testR, wakeableSleep, timerSend < hchan;
 assistQueue,
+  cleanupQueue,
+  computeMaxProcs,
   cpuprof,
   forcegc,
+  updateMaxProcsG,
+  hchan,
   pollDesc, # pollDesc can interact with timers, which can lock sched.
   scavenge,
+  strongFromWeakQueue,
   sweep,
-  sweepWaiters
-< sched;
+  sweepWaiters,
+  testR,
+  wakeableSleep
+# Above SCHED are things that can call into the scheduler.
+< SCHED
+# Below SCHED is the scheduler implementation.
+< allocmR,
+  execR;
+allocmR, execR, hchan < sched;
 sched < allg, allp;
-allp < timers;
-timers < netpollInit;
 
 # Channels
-scavenge, sweep < hchan;
 NONE < notifyList;
-hchan, notifyList < sudog;
+hchan, notifyList < waitingG;
 
-# RWMutex
-NONE < rwmutexW;
-rwmutexW, sysmon < rwmutexR;
+hchan, pollDesc, wakeableSleep < timers;
+timers, timerSend < timer < netpollInit;
 
 # Semaphores
 NONE < root;
@@ -82,6 +101,21 @@ NONE < root;
 NONE
 < itab
 < reflectOffs;
+
+# Typelinks
+NONE
+< typelinks;
+
+# Synctest
+hchan,
+  notifyList,
+  reflectOffs,
+  root,
+  strongFromWeakQueue,
+  sweepWaiters,
+  timer,
+  timers
+< synctest;
 
 # User arena state
 NONE < userArenaState;
@@ -99,21 +133,35 @@ traceBuf < traceStrings;
 
 # Malloc
 allg,
+  allocmR,
+  allp, # procresize
+  execR, # May grow stack
+  execW, # May allocate after BeforeFork
   hchan,
   notifyList,
   reflectOffs,
-  timers,
+  timer,
   traceStrings,
-  userArenaState
+  typelinks,
+  userArenaState,
+  vgetrandom
 # Above MALLOC are things that can allocate memory.
 < MALLOC
 # Below MALLOC is the malloc implementation.
 < fin,
-  gcBitsArenas,
-  mheapSpecial,
-  mspanSpecial,
   spanSetSpine,
+  mspanSpecial,
+  traceTypeTab,
   MPROF;
+
+# Specials: we're allowed to allocate a special while holding
+# an mspanSpecial lock. Special record allocation can grow the stack,
+# so mheapSpecial must be above STACKGROW.
+mspanSpecial < mheapSpecial;
+
+# We can acquire gcBitsArenas for pinner bits, and
+# it's guarded by mspanSpecial.
+MALLOC, mspanSpecial < gcBitsArenas;
 
 # Memory profiling
 MPROF < profInsert, profBlock, profMemActive;
@@ -121,11 +169,13 @@ profMemActive < profMemFuture;
 
 # Stack allocation and copying
 gcBitsArenas,
+  mheapSpecial,
   netpollInit,
   profBlock,
   profInsert,
   profMemFuture,
   spanSetSpine,
+  synctest,
   fin,
   root
 # Anything that can grow the stack can acquire STACKGROW.
@@ -133,10 +183,10 @@ gcBitsArenas,
 < STACKGROW
 # Below STACKGROW is the stack allocator/copying implementation.
 < gscan;
-gscan, rwmutexR < stackpool;
+gscan < stackpool;
 gscan < stackLarge;
 # Generally, hchan must be acquired before gscan. But in one case,
-# where we suspend a G and then shrink its stack, syncadjustsudogs
+# where we suspend a G and then shrink its stack, syncAdjustWaitingGChan
 # can acquire hchan locks while holding gscan. To allow this case,
 # we use hchanLeaf instead of hchan.
 gscan < hchanLeaf;
@@ -145,12 +195,20 @@ gscan < hchanLeaf;
 defer,
   gscan,
   mspanSpecial,
-  sudog
+  pollCache,
+  waitingG,
+  timer
 # Anything that can have write barriers can acquire WB.
 # Above WB, we can have write barriers.
 < WB
 # Below WB is the write barrier implementation.
 < wbufSpans;
+
+# xRegState allocator
+sched < xRegAlloc;
+
+# spanSPMCs allocator and list
+WB, sched < spanSPMCs;
 
 # Span allocator
 stackLarge,
@@ -159,7 +217,9 @@ stackLarge,
 # Above mheap is anything that can call the span allocator.
 < mheap;
 # Below mheap is the span allocator implementation.
-mheap, mheapSpecial < globalAlloc;
+
+# Fixallocs
+mheap, mheapSpecial, xRegAlloc, spanSPMCs < globalAlloc;
 
 # Execution tracer events (with a P)
 hchan,
@@ -179,6 +239,22 @@ NONE < panic;
 # deadlock is not acquired while holding panic, but it also needs to be
 # below all other locks.
 panic < deadlock;
+# raceFini is only held while exiting.
+panic < raceFini;
+
+# RWMutex internal read lock
+
+allocmR,
+  allocmW
+< allocmRInternal;
+
+execR,
+  execW
+< execRInternal;
+
+testR,
+  testW
+< testRInternal;
 `
 
 // cyclicRanks lists lock ranks that allow multiple locks of the same
@@ -191,7 +267,7 @@ var cyclicRanks = map[string]bool{
 	// select.
 	"hchan": true,
 	// Multiple hchanLeafs are acquired in hchan.sortkey() order in
-	// syncadjustsudogs().
+	// syncAdjustWaitingGChan().
 	"hchanLeaf": true,
 	// The point of the deadlock lock is to deadlock.
 	"deadlock": true,
@@ -251,7 +327,7 @@ func generateGo(w io.Writer, g *dag.Graph) {
 
 package runtime
 
-type lockRank int
+type lockRank int64
 
 `)
 

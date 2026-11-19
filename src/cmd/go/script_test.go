@@ -13,32 +13,40 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"flag"
 	"fmt"
-	"go/build"
 	"internal/testenv"
 	"internal/txtar"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"cmd/go/internal/cfg"
-	"cmd/go/internal/script"
-	"cmd/go/internal/script/scripttest"
+	"cmd/go/internal/gover"
 	"cmd/go/internal/vcweb/vcstest"
+	"cmd/internal/script"
+	"cmd/internal/script/scripttest"
+
+	"golang.org/x/telemetry/counter/countertest"
 )
 
 var testSum = flag.String("testsum", "", `may be tidy, listm, or listall. If set, TestScript generates a go.sum file at the beginning of each test and updates test files if they pass.`)
 
 // TestScript runs the tests in testdata/script/*.txt.
 func TestScript(t *testing.T) {
+	t.Parallel()
+
 	testenv.MustHaveGoBuild(t)
 	testenv.SkipIfShortAndSlow(t)
+
+	if testing.Short() && runtime.GOOS == "plan9" {
+		t.Skipf("skipping test in -short mode on %s", runtime.GOOS)
+	}
 
 	srv, err := vcstest.NewServer()
 	if err != nil {
@@ -79,7 +87,8 @@ func TestScript(t *testing.T) {
 		timeout -= 2 * gracePeriod
 
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+		cause := fmt.Errorf("%s timeout %v: %w", t.Name(), timeout.Round(time.Second), context.DeadlineExceeded)
+		ctx, cancel = context.WithTimeoutCause(ctx, timeout, cause)
 		t.Cleanup(cancel)
 	}
 
@@ -88,12 +97,13 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &script.Engine{
-		Conds: scriptConditions(),
+		Conds: scriptConditions(t),
 		Cmds:  scriptCommands(quitSignal(), gracePeriod),
 		Quiet: !testing.Verbose(),
 	}
 
 	t.Run("README", func(t *testing.T) {
+		t.Parallel()
 		checkScriptReadme(t, engine, env)
 	})
 
@@ -102,7 +112,6 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, file := range files {
-		file := file
 		name := strings.TrimSuffix(filepath.Base(file), ".txt")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -116,7 +125,7 @@ func TestScript(t *testing.T) {
 				defer removeAll(workdir)
 			}
 
-			s, err := script.NewState(ctx, workdir, env)
+			s, err := script.NewState(tbContext(ctx, t), workdir, env)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -126,7 +135,7 @@ func TestScript(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			initScriptDirs(t, s)
+			telemetryDir := initScriptDirs(t, s)
 			if err := s.ExtractFiles(a); err != nil {
 				t.Fatal(err)
 			}
@@ -151,14 +160,36 @@ func TestScript(t *testing.T) {
 				}
 			}
 
-			scripttest.Run(t, engine, s, filepath.Base(file), bytes.NewReader(a.Comment))
+			// Note: Do not use filepath.Base(file) here:
+			// editors that can jump to file:line references in the output
+			// will work better seeing the full path relative to cmd/go
+			// (where the "go test" command is usually run).
+			scripttest.Run(t, engine, s, file, bytes.NewReader(a.Comment))
+			checkCounters(t, telemetryDir)
 		})
 	}
 }
 
-// initScriptState creates the initial directory structure in s for unpacking a
+// testingTBKey is the Context key for a testing.TB.
+type testingTBKey struct{}
+
+// tbContext returns a Context derived from ctx and associated with t.
+func tbContext(ctx context.Context, t testing.TB) context.Context {
+	return context.WithValue(ctx, testingTBKey{}, t)
+}
+
+// tbFromContext returns the testing.TB associated with ctx, if any.
+func tbFromContext(ctx context.Context) (testing.TB, bool) {
+	t := ctx.Value(testingTBKey{})
+	if t == nil {
+		return nil, false
+	}
+	return t.(testing.TB), true
+}
+
+// initScriptDirs creates the initial directory structure in s for unpacking a
 // cmd/go script.
-func initScriptDirs(t testing.TB, s *script.State) {
+func initScriptDirs(t testing.TB, s *script.State) (telemetryDir string) {
 	must := func(err error) {
 		if err != nil {
 			t.Helper()
@@ -169,6 +200,10 @@ func initScriptDirs(t testing.TB, s *script.State) {
 	work := s.Getwd()
 	must(s.Setenv("WORK", work))
 
+	telemetryDir = filepath.Join(work, "telemetry")
+	must(os.MkdirAll(telemetryDir, 0777))
+	must(s.Setenv("TEST_TELEMETRY_DIR", filepath.Join(work, "telemetry")))
+
 	must(os.MkdirAll(filepath.Join(work, "tmp"), 0777))
 	must(s.Setenv(tempEnvName(), filepath.Join(work, "tmp")))
 
@@ -177,6 +212,7 @@ func initScriptDirs(t testing.TB, s *script.State) {
 	gopathSrc := filepath.Join(gopath, "src")
 	must(os.MkdirAll(gopathSrc, 0777))
 	must(s.Chdir(gopathSrc))
+	return telemetryDir
 }
 
 func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
@@ -185,10 +221,6 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 		return nil, err
 	}
 	httpsURL, err := url.Parse(srv.HTTPS.URL)
-	if err != nil {
-		return nil, err
-	}
-	version, err := goVersion()
 	if err != nil {
 		return nil, err
 	}
@@ -207,20 +239,27 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 		"TESTGO_GOHOSTOS=" + goHostOS,
 		"GOPROXY=" + proxyURL,
 		"GOPRIVATE=",
+		"GORACE=atexit_sleep_ms=100", // saves ~10m on darwin race builder, ~1m on 32 core amd64 race builder
 		"GOROOT=" + testGOROOT,
-		"GOROOT_FINAL=" + testGOROOT_FINAL, // causes spurious rebuilds and breaks the "stale" built-in if not propagated
 		"GOTRACEBACK=system",
+		"TESTGONETWORK=panic", // allow only local connections by default; the [net] condition resets this
 		"TESTGO_GOROOT=" + testGOROOT,
+		"TESTGO_EXE=" + testGo,
 		"TESTGO_VCSTEST_HOST=" + httpURL.Host,
 		"TESTGO_VCSTEST_TLS_HOST=" + httpsURL.Host,
 		"TESTGO_VCSTEST_CERT=" + srvCertFile,
+		"TESTGONETWORK=panic", // cleared by the [net] condition
 		"GOSUMDB=" + testSumDBVerifierKey,
+		"TESTGO_SUMDB=" + testSumDBName,
 		"GONOPROXY=",
 		"GONOSUMDB=",
 		"GOVCS=*:all",
 		"devnull=" + os.DevNull,
-		"goversion=" + version,
+		"goversion=" + gover.Local(),
 		"CMDGO_TEST_RUN_MAIN=true",
+		"HGRCPATH=",
+		"GOTOOLCHAIN=auto",
+		"newline=\n",
 	}
 
 	if testenv.Builder() != "" || os.Getenv("GIT_TRACE_CURL") == "1" {
@@ -230,9 +269,6 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 			"GIT_TRACE_CURL=1",
 			"GIT_TRACE_CURL_NO_DATA=1",
 			"GIT_REDACT_COOKIES=o,SSO,GSSO_Uberproxy")
-	}
-	if !testenv.HasExternalNetwork() {
-		env = append(env, "TESTGONETWORK=panic", "TESTGOVCS=panic")
 	}
 	if os.Getenv("CGO_ENABLED") != "" || runtime.GOOS != goHostOS || runtime.GOARCH != goHostArch {
 		// If the actual CGO_ENABLED might not match the cmd/go default, set it
@@ -248,16 +284,6 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 	}
 
 	return env, nil
-}
-
-// goVersion returns the current Go version.
-func goVersion() (string, error) {
-	tags := build.Default.ReleaseTags
-	version := tags[len(tags)-1]
-	if !regexp.MustCompile(`^go([1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(version) {
-		return "", fmt.Errorf("invalid go version %q", version)
-	}
-	return version[2:], nil
 }
 
 var extraEnvKeys = []string{
@@ -342,4 +368,40 @@ func updateSum(t testing.TB, e *script.Engine, s *script.State, archive *txtar.A
 		archive.Files[gosumIdx].Data = newGosumData
 	}
 	return rewrite
+}
+
+func readCounters(t *testing.T, telemetryDir string) map[string]uint64 {
+	localDir := filepath.Join(telemetryDir, "local")
+	dirents, err := os.ReadDir(localDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // The Go command didn't ever run so the local dir wasn't created
+		}
+		t.Fatalf("reading telemetry local dir: %v", err)
+	}
+	totals := map[string]uint64{}
+	for _, dirent := range dirents {
+		if dirent.IsDir() || !strings.HasSuffix(dirent.Name(), ".count") {
+			// not a counter file
+			continue
+		}
+		counters, _, err := countertest.ReadFile(filepath.Join(localDir, dirent.Name()))
+		if err != nil {
+			t.Fatalf("reading counter file: %v", err)
+		}
+		for k, v := range counters {
+			totals[k] += v
+		}
+	}
+
+	return totals
+}
+
+func checkCounters(t *testing.T, telemetryDir string) {
+	counters := readCounters(t, telemetryDir)
+	if _, ok := scriptGoInvoked.Load(testing.TB(t)); ok {
+		if countertest.SupportedPlatform && len(counters) == 0 {
+			t.Fatal("go was invoked but no counters were incremented")
+		}
+	}
 }

@@ -8,9 +8,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"internal/testenv"
 	"io"
+	"math"
 	"reflect"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +71,8 @@ func rawURLRef(ref string) string {
 	return rawRef(urlRef(ref))
 }
 
+const encodeStd = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
 // A nonstandard encoding with a funny padding character, for testing
 var funnyEncoding = NewEncoding(encodeStd).WithPadding(rune('@'))
 
@@ -111,8 +116,33 @@ func TestEncode(t *testing.T) {
 	for _, p := range pairs {
 		for _, tt := range encodingTests {
 			got := tt.enc.EncodeToString([]byte(p.decoded))
-			testEqual(t, "Encode(%q) = %q, want %q", p.decoded,
-				got, tt.conv(p.encoded))
+			testEqual(t, "Encode(%q) = %q, want %q", p.decoded, got, tt.conv(p.encoded))
+			dst := tt.enc.AppendEncode([]byte("lead"), []byte(p.decoded))
+			testEqual(t, `AppendEncode("lead", %q) = %q, want %q`, p.decoded, string(dst), "lead"+tt.conv(p.encoded))
+		}
+	}
+}
+
+var sink string
+
+func TestEncodeToStringAllocs(t *testing.T) {
+	testenv.SkipIfOptimizationOff(t)
+
+	for _, size := range []int{16, 32, 48} {
+		src := make([]byte, size)
+
+		discarded := testing.AllocsPerRun(100, func() {
+			StdEncoding.EncodeToString(src)
+		})
+		if want := 0.0; discarded != want {
+			t.Errorf("size %d, result discarded: %v allocs, want %v", size, discarded, want)
+		}
+
+		kept := testing.AllocsPerRun(100, func() {
+			sink = StdEncoding.EncodeToString(src)
+		})
+		if want := 1.0; kept != want {
+			t.Errorf("size %d, result kept: %v allocs, want %v", size, kept, want)
 		}
 	}
 }
@@ -160,6 +190,17 @@ func TestDecode(t *testing.T) {
 			dbuf, err = tt.enc.DecodeString(encoded)
 			testEqual(t, "DecodeString(%q) = error %v, want %v", encoded, err, error(nil))
 			testEqual(t, "DecodeString(%q) = %q, want %q", encoded, string(dbuf), p.decoded)
+
+			dst, err := tt.enc.AppendDecode([]byte("lead"), []byte(encoded))
+			testEqual(t, "AppendDecode(%q) = error %v, want %v", p.encoded, err, error(nil))
+			testEqual(t, `AppendDecode("lead", %q) = %q, want %q`, p.encoded, string(dst), "lead"+p.decoded)
+
+			dst2, err := tt.enc.AppendDecode(dst[:0:len(p.decoded)], []byte(encoded))
+			testEqual(t, "AppendDecode(%q) = error %v, want %v", p.encoded, err, error(nil))
+			testEqual(t, `AppendDecode("", %q) = %q, want %q`, p.encoded, string(dst2), p.decoded)
+			if len(dst) > 0 && len(dst2) > 0 && &dst[0] != &dst2[0] {
+				t.Errorf("unexpected capacity growth: got %d, want %d", cap(dst2), cap(dst))
+			}
 		}
 	}
 }
@@ -178,6 +219,36 @@ func TestDecoder(t *testing.T) {
 			_, err = decoder.Read(dbuf)
 		}
 		testEqual(t, "Read from %q = %v, want %v", p.encoded, err, io.EOF)
+	}
+}
+
+func TestDecoderChunking(t *testing.T) {
+	// The decoder must behave identically to decoding the whole input at
+	// once, regardless of how the underlying reader chunks the input.
+	// See golang.org/issue/31626.
+	tests := []struct {
+		enc *Encoding
+		in  string
+	}{
+		{StdEncoding, "Rw==bw=="},     // padding inside the stream
+		{StdEncoding, "AAAA####"},     // error offset must not reset per chunk
+		{StdEncoding, "Rw==x"},        // trailing garbage after a padded group
+		{StdEncoding, "Rw===="},       // extra padding after a padded group
+		{StdEncoding, "AAAABBBBCCCC"}, // valid input
+		{StdEncoding, "AAAABB=="},     // valid input with padding
+		{RawStdEncoding, "AAAABB"},    // valid input, no padding
+		{RawStdEncoding, "AAAA#B"},    // invalid byte in final fragment
+	}
+	for _, tt := range tests {
+		want, wantErr := tt.enc.DecodeString(tt.in)
+		for i := 0; i <= len(tt.in); i++ {
+			r := io.MultiReader(strings.NewReader(tt.in[:i]), strings.NewReader(tt.in[i:]))
+			got, gotErr := io.ReadAll(NewDecoder(tt.enc, r))
+			if !bytes.Equal(got, want) || gotErr != wantErr {
+				t.Errorf("Decode(%q) with split at %d = %q, %v; want %q, %v",
+					tt.in, i, got, gotErr, want, wantErr)
+			}
+		}
 	}
 }
 
@@ -262,11 +333,12 @@ func TestDecodeBounds(t *testing.T) {
 }
 
 func TestEncodedLen(t *testing.T) {
-	for _, tt := range []struct {
+	type test struct {
 		enc  *Encoding
 		n    int
-		want int
-	}{
+		want int64
+	}
+	tests := []test{
 		{RawStdEncoding, 0, 0},
 		{RawStdEncoding, 1, 2},
 		{RawStdEncoding, 2, 3},
@@ -278,19 +350,50 @@ func TestEncodedLen(t *testing.T) {
 		{StdEncoding, 3, 4},
 		{StdEncoding, 4, 8},
 		{StdEncoding, 7, 12},
-	} {
-		if got := tt.enc.EncodedLen(tt.n); got != tt.want {
+	}
+	// check overflow
+	switch strconv.IntSize {
+	case 32:
+		tests = append(tests, test{RawStdEncoding, (math.MaxInt-5)/8 + 1, 357913942})
+		tests = append(tests, test{RawStdEncoding, math.MaxInt/4*3 + 2, math.MaxInt})
+	case 64:
+		tests = append(tests, test{RawStdEncoding, (math.MaxInt-5)/8 + 1, 1537228672809129302})
+		tests = append(tests, test{RawStdEncoding, math.MaxInt/4*3 + 2, math.MaxInt})
+	}
+	tests = append(tests, test{StdEncoding, math.MaxInt / 4 * 3, math.MaxInt - 3})
+	for _, tt := range tests {
+		if got := tt.enc.EncodedLen(tt.n); int64(got) != tt.want {
 			t.Errorf("EncodedLen(%d): got %d, want %d", tt.n, got, tt.want)
 		}
 	}
 }
 
-func TestDecodedLen(t *testing.T) {
+func TestEncodedLenOverflow(t *testing.T) {
 	for _, tt := range []struct {
+		enc *Encoding
+		n   int
+	}{
+		{StdEncoding, math.MaxInt/4*3 + 1},
+		{RawStdEncoding, math.MaxInt/4*3 + 3},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("EncodedLen(%d) did not panic", tt.n)
+				}
+			}()
+			tt.enc.EncodedLen(tt.n)
+		}()
+	}
+}
+
+func TestDecodedLen(t *testing.T) {
+	type test struct {
 		enc  *Encoding
 		n    int
-		want int
-	}{
+		want int64
+	}
+	tests := []test{
 		{RawStdEncoding, 0, 0},
 		{RawStdEncoding, 2, 1},
 		{RawStdEncoding, 3, 2},
@@ -299,8 +402,18 @@ func TestDecodedLen(t *testing.T) {
 		{StdEncoding, 0, 0},
 		{StdEncoding, 4, 3},
 		{StdEncoding, 8, 6},
-	} {
-		if got := tt.enc.DecodedLen(tt.n); got != tt.want {
+	}
+	// check overflow
+	switch strconv.IntSize {
+	case 32:
+		tests = append(tests, test{RawStdEncoding, math.MaxInt/6 + 1, 268435456})
+		tests = append(tests, test{RawStdEncoding, math.MaxInt, 1610612735})
+	case 64:
+		tests = append(tests, test{RawStdEncoding, math.MaxInt/6 + 1, 1152921504606846976})
+		tests = append(tests, test{RawStdEncoding, math.MaxInt, 6917529027641081855})
+	}
+	for _, tt := range tests {
+		if got := tt.enc.DecodedLen(tt.n); int64(got) != tt.want {
 			t.Errorf("DecodedLen(%d): got %d, want %d", tt.n, got, tt.want)
 		}
 	}
@@ -363,6 +476,17 @@ func TestNewLineCharacters(t *testing.T) {
 		}
 		if s := string(buf); s != expected {
 			t.Errorf("Decode(%q) = %q, want %q", e, s, expected)
+		}
+	}
+
+	// The stream decoder strips newlines by a different route.
+	for i := range len(bigtest.encoded) + 1 {
+		for _, nl := range []string{"\r", "\n", "\r\n"} {
+			e := bigtest.encoded[:i] + nl + bigtest.encoded[i:]
+			buf, err := io.ReadAll(NewDecoder(StdEncoding, strings.NewReader(e)))
+			if err != nil || string(buf) != bigtest.decoded {
+				t.Errorf("NewDecoder(%q) = %q, %v; want %q", e, buf, err, bigtest.decoded)
+			}
 		}
 	}
 }
@@ -479,10 +603,19 @@ func TestDecoderIssue15656(t *testing.T) {
 	}
 }
 
+func BenchmarkEncode(b *testing.B) {
+	data := make([]byte, 8192)
+	buf := make([]byte, StdEncoding.EncodedLen(len(data)))
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		StdEncoding.Encode(buf, data)
+	}
+}
+
 func BenchmarkEncodeToString(b *testing.B) {
 	data := make([]byte, 8192)
 	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		StdEncoding.EncodeToString(data)
 	}
 }
@@ -500,6 +633,25 @@ func BenchmarkDecodeString(b *testing.B) {
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
 			benchFunc(b, size)
+		})
+	}
+}
+
+func BenchmarkDecoder(b *testing.B) {
+	unwrapped := StdEncoding.EncodeToString(make([]byte, 8192))
+	var wrapped strings.Builder
+	for s := unwrapped; len(s) > 0; s = s[min(76, len(s)):] {
+		wrapped.WriteString(s[:min(76, len(s))] + "\r\n")
+	}
+	for _, input := range []struct{ name, data string }{
+		{"Unwrapped", unwrapped},
+		{"Wrapped", wrapped.String()},
+	} {
+		b.Run(input.name, func(b *testing.B) {
+			b.SetBytes(int64(len(input.data)))
+			for b.Loop() {
+				io.Copy(io.Discard, NewDecoder(StdEncoding, strings.NewReader(input.data)))
+			}
 		})
 	}
 }

@@ -112,9 +112,10 @@ TEXT runtime·usleep(SB),NOSPLIT,$16-4
 	MOVW	$1000000, R3
 	DIVD	R3, R2
 	MOVD	R2, 8(R15)
-	MOVW	$1000, R3
-	MULLD	R2, R3
+	MULLD	R2, R3		// Convert sec to usec and subtract
 	SUB	R3, R4
+	MOVW	$1000, R3
+	MULLD	R3, R4		// Convert remaining usec into nsec.
 	MOVD	R4, 16(R15)
 
 	// nanosleep(&ts, 0)
@@ -225,7 +226,7 @@ TEXT runtime·walltime(SB),NOSPLIT,$32-12
 	MOVD	R4, 24(R15)
 
 	MOVD	R14, R8 		// Backup return address
-	MOVD	$sec+0(FP), R4 	// return parameter caller
+	MOVD	$ret-8(FP), R4 	// caller's SP
 
 	MOVD	R8, m_vdsoPC(R6)
 	MOVD	R4, m_vdsoSP(R6)
@@ -311,7 +312,7 @@ TEXT runtime·nanotime1(SB),NOSPLIT,$32-8
 	MOVD	R4, 24(R15)
 
 	MOVD	R14, R8			// Backup return address
-	MOVD	$ret+0(FP), R4	// caller's SP
+	MOVD	$ret-8(FP), R4	// caller's SP
 
 	MOVD	R8, m_vdsoPC(R6)
 	MOVD	R4, m_vdsoSP(R6)
@@ -412,12 +413,26 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
 	BL	R5
 	RET
 
-TEXT runtime·sigreturn(SB),NOSPLIT,$0-0
-	RET
-
-TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$64
+TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$160
 	// initialize essential registers (just in case)
 	XOR	R0, R0
+
+	MOVD	R6, 32(R15)
+	MOVD	R7, 40(R15)
+	MOVD	R8, 48(R15)
+	MOVD	R9, 56(R15)
+	MOVD	R10, 64(R15)
+	MOVD	R11, 72(R15)
+	MOVD	R12, 80(R15)
+	MOVD	g, 88(R15)
+	FMOVD	F8, 96(R15)
+	FMOVD	F9, 104(R15)
+	FMOVD	F10, 112(R15)
+	FMOVD	F11, 120(R15)
+	FMOVD	F12, 128(R15)
+	FMOVD	F13, 136(R15)
+	FMOVD	F14, 144(R15)
+	FMOVD	F15, 152(R15)
 
 	// this might be called in external code context,
 	// where g is not set.
@@ -430,6 +445,23 @@ TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$64
 	MOVD	R4, 24(R15)
 	MOVD	$runtime·sigtrampgo(SB), R5
 	BL	R5
+
+	MOVD	32(R15), R6
+	MOVD	40(R15), R7
+	MOVD	48(R15), R8
+	MOVD	56(R15), R9
+	MOVD	64(R15), R10
+	MOVD	72(R15), R11
+	MOVD	80(R15), R12
+	MOVD	88(R15), g
+	FMOVD	96(R15), F8
+	FMOVD	104(R15), F9
+	FMOVD	112(R15), F10
+	FMOVD	120(R15), F11
+	FMOVD	128(R15), F12
+	FMOVD	136(R15), F13
+	FMOVD	144(R15), F14
+	FMOVD	152(R15), F15
 	RET
 
 TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
@@ -606,4 +638,54 @@ TEXT runtime·connect(SB),$0-28
 TEXT runtime·socket(SB),$0-20
 	MOVD	$0, 2(R0) // unimplemented, only needed for android; declared in stubs_linux.go
 	MOVW	R0, ret+16(FP)
+	RET
+
+// func vgetrandom1(buf *byte, length uintptr, flags uint32, state uintptr, stateSize uintptr) int
+TEXT runtime·vgetrandom1(SB),NOSPLIT,$16-48
+	MOVD	buf+0(FP), R2
+	MOVD	length+8(FP), R3
+	MOVW	flags+16(FP), R4
+	MOVD	state+24(FP), R5
+	MOVD	stateSize+32(FP), R6
+
+	MOVD	R15, R7
+
+	MOVD	runtime·vdsoGetrandomSym(SB), R1
+	MOVD	g_m(g), R9
+
+	MOVD	m_vdsoPC(R9), R12
+	MOVD	R12, 8(R15)
+	MOVD	m_vdsoSP(R9), R12
+	MOVD	R12, 16(R15)
+	MOVD	R14, m_vdsoPC(R9)
+	MOVD	$buf+0(FP), R12
+	MOVD	R12, m_vdsoSP(R9)
+
+	SUB	$160, R15
+	MOVD	$~7, R12
+	AND	R12, R15
+
+	MOVB	runtime·iscgo(SB), R12
+	CMPBNE	R12, $0, nosaveg
+	MOVD	m_gsignal(R9), R12
+	CMPBEQ	R12, $0, nosaveg
+	CMPBEQ	g, R12, nosaveg
+	MOVD	(g_stack+stack_lo)(R12), R12
+	MOVD	g, (R12)
+
+	BL	R1
+
+	MOVD	$0, (R12)
+	JMP	restore
+
+nosaveg:
+	BL	R1
+
+restore:
+	MOVD	R7, R15
+	MOVD	16(R15), R12
+	MOVD	R12, m_vdsoSP(R9)
+	MOVD	8(R15), R12
+	MOVD	R12, m_vdsoPC(R9)
+	MOVD	R2, ret+40(FP)
 	RET

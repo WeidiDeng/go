@@ -6,11 +6,24 @@ package user
 
 import "sync"
 
+const (
+	userFile  = "/etc/passwd"
+	groupFile = "/etc/group"
+)
+
+var colon = []byte{':'}
+
 // Current returns the current user.
 //
 // The first call will cache the current user information.
 // Subsequent calls will return the cached value and will not reflect
 // changes to the current user.
+//
+// On some systems, if the current user cannot be found in the user
+// database, Current builds the returned user from the process's user and
+// group IDs and from environment variables such as USER and HOME. In that
+// case the returned user does not correspond to an entry in the user
+// database.
 func Current() (*User, error) {
 	cache.Do(func() { cache.u, cache.err = current() })
 	if cache.err != nil {
@@ -28,7 +41,12 @@ var cache struct {
 }
 
 // Lookup looks up a user by username. If the user cannot be found, the
-// returned error is of type UnknownUserError.
+// returned error is of type [UnknownUserError].
+//
+// Lookup first calls [Current]. If that succeeds and the current user's
+// name matches username, Lookup returns the current user without a separate
+// lookup by name. The result may be one that [Current] built from the
+// environment rather than from the user database.
 func Lookup(username string) (*User, error) {
 	if u, err := Current(); err == nil && u.Username == username {
 		return u, err
@@ -37,7 +55,12 @@ func Lookup(username string) (*User, error) {
 }
 
 // LookupId looks up a user by userid. If the user cannot be found, the
-// returned error is of type UnknownUserIdError.
+// returned error is of type [UnknownUserIdError].
+//
+// LookupId first calls [Current]. If that succeeds and the current user's
+// ID matches uid, LookupId returns the current user without a separate
+// lookup by ID. The result may be one that [Current] built from the
+// environment rather than from the user database.
 func LookupId(uid string) (*User, error) {
 	if u, err := Current(); err == nil && u.Uid == uid {
 		return u, err
@@ -46,13 +69,13 @@ func LookupId(uid string) (*User, error) {
 }
 
 // LookupGroup looks up a group by name. If the group cannot be found, the
-// returned error is of type UnknownGroupError.
+// returned error is of type [UnknownGroupError].
 func LookupGroup(name string) (*Group, error) {
 	return lookupGroup(name)
 }
 
 // LookupGroupId looks up a group by groupid. If the group cannot be found, the
-// returned error is of type UnknownGroupIdError.
+// returned error is of type [UnknownGroupIdError].
 func LookupGroupId(gid string) (*Group, error) {
 	return lookupGroupId(gid)
 }

@@ -1,6 +1,6 @@
 // run
 
-// +build !nacl,!js,gc
+//go:build !nacl && !js && !wasip1 && gc
 
 // Copyright 2020 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -18,14 +18,13 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
 )
 
 func main() {
-	tmpDir, err := ioutil.TempDir("", "issue36437")
+	tmpDir, err := os.MkdirTemp("", "issue36437")
 	if err != nil {
 		panic(err)
 	}
@@ -39,7 +38,9 @@ func main() {
 	}
 
 	filename := "non-existent.go"
-	output, err := exec.Command("go", "tool", "compile", filename).CombinedOutput()
+	cmd := exec.Command("go", "tool", "compile", filename)
+	cmd.Dir = tmpDir
+	output, err := cmd.CombinedOutput()
 	got := msgOrErr(output, err)
 
 	regFilenamePos := regexp.MustCompile(filename + ":\\d+")

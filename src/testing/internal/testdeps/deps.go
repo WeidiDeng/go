@@ -26,8 +26,11 @@ import (
 	"time"
 )
 
+// Cover indicates whether coverage is enabled.
+var Cover bool
+
 // TestDeps is an implementation of the testing.testDeps interface,
-// suitable for passing to testing.MainStart.
+// suitable for passing to [testing.MainStart].
 type TestDeps struct{}
 
 var matchPat string
@@ -63,11 +66,33 @@ func (TestDeps) ImportPath() string {
 	return ImportPath
 }
 
+var ModulePath string
+
+func (TestDeps) ModulePath() string {
+	return ModulePath
+}
+
 // testLog implements testlog.Interface, logging actions by package os.
 type testLog struct {
 	mu  sync.Mutex
 	w   *bufio.Writer
 	set bool
+
+	// seen holds entries written since the last chdir. cmd/go hashes
+	// each entry from its op, name and the current directory, so writing
+	// the same entry again adds nothing to the test's inputs. Tests that
+	// stat or read the same files in a loop can otherwise produce logs of
+	// millions of lines, all of which cmd/go reads back and caches.
+	//
+	// Its size is bounded by a constant, so a test that touches millions
+	// of distinct names does not keep them all alive. When full it is
+	// cleared, and entries after that may be written again, which is
+	// harmless.
+	seen map[testLogEntry]bool
+}
+
+type testLogEntry struct {
+	op, name string
 }
 
 func (l *testLog) Getenv(key string) {
@@ -96,6 +121,26 @@ func (l *testLog) add(op, name string) {
 	defer l.mu.Unlock()
 	if l.w == nil {
 		return
+	}
+	if op == "chdir" {
+		// Relative names after this resolve against the new directory.
+		clear(l.seen)
+	} else {
+		e := testLogEntry{op, name}
+		if l.seen[e] {
+			return
+		}
+		const maxSeen = 15000
+		if l.seen == nil {
+			l.seen = make(map[testLogEntry]bool)
+		} else if len(l.seen) >= maxSeen {
+			// Clear the entire map. (Randomly evicting an entry was
+			// found to use more CPU and RSS, presumably because eviction
+			// is costly and vacated entries marked with tombstones can't
+			// always be reused.)
+			clear(l.seen)
+		}
+		l.seen[e] = true
 	}
 	l.w.WriteString(op)
 	l.w.WriteByte(' ')
@@ -196,4 +241,42 @@ func (TestDeps) ResetCoverage() {
 
 func (TestDeps) SnapshotCoverage() {
 	fuzz.SnapshotCoverage()
+}
+
+var CoverMode string
+var Covered string
+var CoverSelectedPackages []string
+
+// These variables below are set at runtime (via code in testmain) to point
+// to the equivalent functions in package internal/coverage/cfile; doing
+// things this way allows us to have tests import internal/coverage/cfile
+// only when -cover is in effect (as opposed to importing for all tests).
+var (
+	CoverSnapshotFunc           func() float64
+	CoverProcessTestDirFunc     func(dir string, cfile string, cm string, cpkg string, w io.Writer, selpkgs []string) error
+	CoverMarkProfileEmittedFunc func(val bool)
+)
+
+func (TestDeps) InitRuntimeCoverage() (mode string, tearDown func(string, string) (string, error), snapcov func() float64) {
+	if CoverMode == "" {
+		return
+	}
+	return CoverMode, coverTearDown, CoverSnapshotFunc
+}
+
+func coverTearDown(coverprofile string, gocoverdir string) (string, error) {
+	var err error
+	if gocoverdir == "" {
+		gocoverdir, err = os.MkdirTemp("", "gocoverdir")
+		if err != nil {
+			return "error setting GOCOVERDIR: bad os.MkdirTemp return", err
+		}
+		defer os.RemoveAll(gocoverdir)
+	}
+	CoverMarkProfileEmittedFunc(true)
+	cmode := CoverMode
+	if err := CoverProcessTestDirFunc(gocoverdir, coverprofile, cmode, Covered, os.Stdout, CoverSelectedPackages); err != nil {
+		return "error generating coverage report", err
+	}
+	return "", nil
 }

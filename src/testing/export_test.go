@@ -5,3 +5,5 @@
 package testing
 
 var PrettyPrint = prettyPrint
+
+var ParallelConflict = parallelConflict

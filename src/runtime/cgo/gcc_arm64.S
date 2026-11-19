@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !goexperiment.cgobindings
+
+.file "gcc_arm64.S"
+
 /*
  * Apple still insists on underscore prefixes for C function names.
  */

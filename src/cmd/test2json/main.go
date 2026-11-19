@@ -35,12 +35,14 @@
 // corresponding to the Go struct:
 //
 //	type TestEvent struct {
-//		Time    time.Time // encodes as an RFC3339-format string
-//		Action  string
-//		Package string
-//		Test    string
-//		Elapsed float64 // seconds
-//		Output  string
+//		Time        time.Time // encodes as an RFC3339-format string
+//		Action      string
+//		Package     string
+//		Test        string
+//		Elapsed     float64 // seconds
+//		Output      string
+//		OutputType  string
+//		FailedBuild string
 //	}
 //
 // The Time field holds the time the event happened.
@@ -48,6 +50,7 @@
 //
 // The Action field is one of a fixed set of action descriptions:
 //
+//	start  - the test binary is about to be executed
 //	run    - the test has started running
 //	pause  - the test has been paused
 //	cont   - the test has continued running
@@ -56,6 +59,8 @@
 //	fail   - the test or benchmark failed
 //	output - the test printed output
 //	skip   - the test was skipped or the package contained no tests
+//
+// Every JSON stream begins with a "start" event.
 //
 // The Package field, if present, specifies the package being tested.
 // When the go command runs parallel tests in -json mode, events from
@@ -76,6 +81,19 @@
 // the concatenation of the Output fields of all output events is the exact
 // output of the test execution.
 //
+// The FailedBuild field is set for Action == "fail" if the test failure was
+// caused by a build failure. It contains the package ID of the package that
+// failed to build. This matches the ImportPath field of the "go list" output,
+// as well as the BuildEvent.ImportPath field as emitted by "go build -json".
+//
+// The OutputType field *may* be set for Action == "output" and indicates the
+// type of output. OutputType will be one of the following:
+//
+//	(blank)        - regular output
+//	frame          - test framing, such as "=== RUN ..." or "--- FAIL: ..."
+//	error          - an error produced by Error(f) or Fatal(f)
+//	error-continue - continuation of a multi-line error
+//
 // When a benchmark runs, it typically produces a single line of output
 // giving timing results. That line is reported in an event with Action == "output"
 // and no Test field. If a benchmark logs output or reports a failure
@@ -86,6 +104,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -93,6 +112,7 @@ import (
 	"os/exec"
 	"os/signal"
 
+	"cmd/internal/telemetry/counter"
 	"cmd/internal/test2json"
 )
 
@@ -112,8 +132,12 @@ func ignoreSignals() {
 }
 
 func main() {
+	counter.Open()
+
 	flag.Usage = usage
 	flag.Parse()
+	counter.Inc("test2json/invocations")
+	counter.CountFlags("test2json/flag:", *flag.CommandLine)
 
 	var mode test2json.Mode
 	if *flagT {
@@ -134,7 +158,12 @@ func main() {
 		err := cmd.Run()
 		if err != nil {
 			if w.n > 0 {
-				// Assume command printed why it failed.
+				// If the command exited with a non-zero status, report it
+				// even if it printed output of its own. This matches the
+				// output produced by "go test -json".
+				if ee, ok := errors.AsType[*exec.ExitError](err); ok && ee.Exited() {
+					fmt.Fprintf(c, "%v\n", err)
+				}
 			} else {
 				fmt.Fprintf(c, "test2json: %v\n", err)
 			}

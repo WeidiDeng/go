@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/textproto"
 	"net/url"
 	"strconv"
@@ -29,7 +30,7 @@ var respExcludeHeader = map[string]bool{
 
 // Response represents the response from an HTTP request.
 //
-// The Client and Transport return Responses from servers once
+// The [Client] and [Transport] return Responses from servers once
 // the response headers have been received. The response body
 // is streamed on demand as the Body field is read.
 type Response struct {
@@ -61,7 +62,10 @@ type Response struct {
 	// a zero-length body. It is the caller's responsibility to
 	// close Body. The default HTTP client's Transport may not
 	// reuse HTTP/1.x "keep-alive" TCP connections if the Body is
-	// not read to completion and closed.
+	// not read to completion and closed; however, manually reading
+	// the body to completion should not be needed in most cases,
+	// as closing the body will also cause the body to be read to
+	// completion asynchronously, up to a conservative limit.
 	//
 	// The Body is automatically dechunked if the server replied
 	// with a "chunked" Transfer-Encoding.
@@ -126,13 +130,13 @@ func (r *Response) Cookies() []*Cookie {
 	return readSetCookies(r.Header)
 }
 
-// ErrNoLocation is returned by Response's Location method
+// ErrNoLocation is returned by the [Response.Location] method
 // when no Location header is present.
 var ErrNoLocation = errors.New("http: no Location header in response")
 
 // Location returns the URL of the response's "Location" header,
 // if present. Relative redirects are resolved relative to
-// the Response's Request. ErrNoLocation is returned if no
+// [Response.Request]. [ErrNoLocation] is returned if no
 // Location header is present.
 func (r *Response) Location() (*url.URL, error) {
 	lv := r.Header.Get("Location")
@@ -146,8 +150,8 @@ func (r *Response) Location() (*url.URL, error) {
 }
 
 // ReadResponse reads and returns an HTTP response from r.
-// The req parameter optionally specifies the Request that corresponds
-// to this Response. If nil, a GET request is assumed.
+// The req parameter optionally specifies the [Request] that corresponds
+// to this [Response]. If nil, a GET request is assumed.
 // Clients must call resp.Body.Close when finished reading resp.Body.
 // After that call, clients can inspect resp.Trailer to find key/value
 // pairs included in the response trailer.
@@ -196,7 +200,7 @@ func ReadResponse(r *bufio.Reader, req *Request) (*Response, error) {
 
 	fixPragmaCacheControl(resp.Header)
 
-	err = readTransfer(resp, r)
+	err = readTransfer(resp, r, math.MaxInt64)
 	if err != nil {
 		return nil, err
 	}

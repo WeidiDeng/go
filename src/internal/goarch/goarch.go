@@ -12,6 +12,8 @@ package goarch
 //
 //go:generate go run gengoarch.go
 
+// ArchFamilyType represents a family of one or more related architectures.
+// For example, ppc64 and ppc64le are both members of the PPC64 family.
 type ArchFamilyType int
 
 const (
@@ -32,6 +34,9 @@ const (
 // It is also the size of the machine's native word size (that is, 4 on 32-bit systems, 8 on 64-bit).
 const PtrSize = 4 << (^uintptr(0) >> 63)
 
+// PtrBits is bit width of a pointer.
+const PtrBits = PtrSize * 8
+
 // ArchFamily is the architecture family (AMD64, ARM, ...)
 const ArchFamily ArchFamilyType = _ArchFamily
 
@@ -45,8 +50,9 @@ const DefaultPhysPageSize = _DefaultPhysPageSize
 // The various PC tables record PC deltas pre-divided by PCQuantum.
 const PCQuantum = _PCQuantum
 
-// Int64Align is the required alignment for a 64-bit integer (4 on 32-bit systems, 8 on 64-bit).
-const Int64Align = PtrSize
+// Int64Align is the required alignment for a 64-bit integer. It is 8 on
+// wasm32 and 64-bit systems, and 4 on other 32-bit systems.
+const Int64Align = PtrSize + 4*IsWasm32
 
 // MinFrameSize is the size of the system-reserved words at the bottom
 // of a frame (just above the architectural stack pointer).

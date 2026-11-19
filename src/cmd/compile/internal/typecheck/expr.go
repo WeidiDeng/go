@@ -6,46 +6,14 @@ package typecheck
 
 import (
 	"fmt"
-	"go/constant"
-	"go/token"
+	"internal/types/errors"
 	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
+	"cmd/internal/src"
 )
-
-// tcAddr typechecks an OADDR node.
-func tcAddr(n *ir.AddrExpr) ir.Node {
-	n.X = Expr(n.X)
-	if n.X.Type() == nil {
-		n.SetType(nil)
-		return n
-	}
-
-	switch n.X.Op() {
-	case ir.OARRAYLIT, ir.OMAPLIT, ir.OSLICELIT, ir.OSTRUCTLIT:
-		n.SetOp(ir.OPTRLIT)
-
-	default:
-		checklvalue(n.X, "take the address of")
-		r := ir.OuterValue(n.X)
-		if r.Op() == ir.ONAME {
-			r := r.(*ir.Name)
-			if ir.Orig(r) != r {
-				base.Fatalf("found non-orig name node %v", r) // TODO(mdempsky): What does this mean?
-			}
-		}
-		n.X = DefaultLit(n.X, nil)
-		if n.X.Type() == nil {
-			n.SetType(nil)
-			return n
-		}
-	}
-
-	n.SetType(types.NewPtr(n.X.Type()))
-	return n
-}
 
 func tcShift(n, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 	if l.Type() == nil || r.Type() == nil {
@@ -99,7 +67,7 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 		// The conversion allocates, so only do it if the concrete type is huge.
 		converted := false
 		if r.Type().Kind() != types.TBLANK {
-			aop, _ = Assignop(l.Type(), r.Type())
+			aop, _ = assignOp(l.Type(), r.Type())
 			if aop != ir.OXXX {
 				if r.Type().IsInterface() && !l.Type().IsInterface() && !types.IsComparable(l.Type()) {
 					base.Errorf("invalid operation: %v (operator %v not defined on %s)", n, op, typekind(l.Type()))
@@ -118,7 +86,7 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 		}
 
 		if !converted && l.Type().Kind() != types.TBLANK {
-			aop, _ = Assignop(r.Type(), l.Type())
+			aop, _ = assignOp(r.Type(), l.Type())
 			if aop != ir.OXXX {
 				if l.Type().IsInterface() && !r.Type().IsInterface() && !types.IsComparable(r.Type()) {
 					base.Errorf("invalid operation: %v (operator %v not defined on %s)", n, op, typekind(r.Type()))
@@ -184,20 +152,13 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 		}
 	}
 
-	if (op == ir.ODIV || op == ir.OMOD) && ir.IsConst(r, constant.Int) {
-		if constant.Sign(r.Val()) == 0 {
-			base.Errorf("division by zero")
-			return l, r, nil
-		}
-	}
-
 	return l, r, t
 }
 
 // The result of tcCompLit MUST be assigned back to n, e.g.
 //
 //	n.Left = tcCompLit(n.Left)
-func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
+func tcCompLit(curfunc *ir.Func, n *ir.CompLitExpr) (res ir.Node) {
 	if base.EnableTrace && base.Flag.LowerT {
 		defer tracePrint("tcCompLit", n)(&res)
 	}
@@ -206,9 +167,6 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 	defer func() {
 		base.Pos = lno
 	}()
-
-	// Save original node (including n.Right)
-	n.SetOrig(ir.Copy(n))
 
 	ir.SetPos(n)
 
@@ -221,11 +179,11 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 		n.SetType(nil)
 
 	case types.TARRAY:
-		typecheckarraylit(t.Elem(), t.NumElem(), n.List, "array literal")
+		typecheckarraylit(curfunc, t.Elem(), t.NumElem(), n.List, "array literal")
 		n.SetOp(ir.OARRAYLIT)
 
 	case types.TSLICE:
-		length := typecheckarraylit(t.Elem(), -1, n.List, "slice literal")
+		length := typecheckarraylit(curfunc, t.Elem(), -1, n.List, "slice literal")
 		n.SetOp(ir.OSLICELIT)
 		n.Len = length
 
@@ -233,18 +191,18 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 		for i3, l := range n.List {
 			ir.SetPos(l)
 			if l.Op() != ir.OKEY {
-				n.List[i3] = Expr(l)
+				n.List[i3] = Expr(curfunc, l)
 				base.Errorf("missing key in map literal")
 				continue
 			}
 			l := l.(*ir.KeyExpr)
 
 			r := l.Key
-			r = Expr(r)
+			r = Expr(curfunc, r)
 			l.Key = AssignConv(r, t.Key(), "map key")
 
 			r = l.Value
-			r = Expr(r)
+			r = Expr(curfunc, r)
 			l.Value = AssignConv(r, t.Elem(), "map value")
 		}
 
@@ -260,7 +218,7 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 			ls := n.List
 			for i, n1 := range ls {
 				ir.SetPos(n1)
-				n1 = Expr(n1)
+				n1 = Expr(curfunc, n1)
 				ls[i] = n1
 				if i >= t.NumFields() {
 					if !errored {
@@ -281,7 +239,7 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 				// walkClosure(), because the instantiated
 				// function is compiled as if in the source
 				// package of the generic function.
-				if !(ir.CurFunc != nil && strings.Index(ir.CurFunc.Nname.Sym().Name, "[") >= 0) {
+				if !(curfunc != nil && strings.Contains(curfunc.Nname.Sym().Name, "[")) {
 					if s != nil && !types.IsExported(s.Name) && s.Pkg != types.LocalPkg {
 						base.Errorf("implicit assignment of unexported field '%s' in %v literal", s.Name, t)
 					}
@@ -309,7 +267,7 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 							base.Errorf("mixture of field:value and value initializers")
 							errored = true
 						}
-						ls[i] = Expr(n)
+						ls[i] = Expr(curfunc, n)
 						continue
 					}
 
@@ -322,7 +280,7 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 				}
 
 				// No pushtype allowed here. Tried and rejected.
-				sk.Value = Expr(sk.Value)
+				sk.Value = Expr(curfunc, sk.Value)
 				sk.Value = AssignConv(sk.Value, sk.Field.Type, "field value")
 				ls[i] = sk
 			}
@@ -354,6 +312,19 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 		return ir.NewStructKeyExpr(kv.Pos(), f, kv.Value)
 	}
 
+	var f *types.Field
+	if p, ambig := dotpath(sym, typ, &f, false); p != nil {
+		if ambig {
+			base.Errorf("ambiguous promoted field '%v' in struct literal of type %v", sym, typ)
+			return nil
+		}
+		if f.IsMethod() {
+			base.Errorf("cannot use method '%v' in struct literal of type %v", sym, typ)
+			return nil
+		}
+		return ir.NewStructKeyExpr(kv.Pos(), f, kv.Value)
+	}
+
 	if ci := Lookdot1(nil, sym, typ, typ.Fields(), 2); ci != nil { // Case-insensitive lookup.
 		if visible(ci.Sym) {
 			base.Errorf("unknown field '%v' in struct literal of type %v (but does have %v)", sym, typ, ci.Sym)
@@ -365,7 +336,6 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 		return nil
 	}
 
-	var f *types.Field
 	p, _ := dotpath(sym, typ, &f, true)
 	if p == nil || f.IsMethod() {
 		base.Errorf("unknown field '%v' in struct literal of type %v", sym, typ)
@@ -377,24 +347,27 @@ func tcStructLitKey(typ *types.Type, kv *ir.KeyExpr) *ir.StructKeyExpr {
 	for ei := len(p) - 1; ei >= 0; ei-- {
 		ep = append(ep, p[ei].field.Sym.Name)
 	}
-	ep = append(ep, sym.Name)
-	base.Errorf("cannot use promoted field %v in struct literal of type %v", strings.Join(ep, "."), typ)
+	ep = append(ep, f.Sym.Name)
+	base.Errorf("unknown field '%v' in struct literal of type %v (but does have %v)", sym, typ, strings.Join(ep, "."))
 	return nil
 }
 
 // tcConv typechecks an OCONV node.
-func tcConv(n *ir.ConvExpr) ir.Node {
+func tcConv(curfunc *ir.Func, n *ir.ConvExpr) ir.Node {
 	types.CheckSize(n.Type()) // ensure width is calculated for backend
-	n.X = Expr(n.X)
+	n.X = Expr(curfunc, n.X)
 	n.X = convlit1(n.X, n.Type(), true, nil)
 	t := n.X.Type()
 	if t == nil || n.Type() == nil {
 		n.SetType(nil)
 		return n
 	}
-	op, why := Convertop(n.X.Op() == ir.OLITERAL, t, n.Type())
+	op, why := convertOp(n.X.Op() == ir.OLITERAL, t, n.Type())
 	if op == ir.OXXX {
-		base.Fatalf("cannot convert %L to type %v%s", n.X, n.Type(), why)
+		// Due to //go:nointerface, we may be stricter than types2 here (#63333).
+		base.ErrorfAt(n.Pos(), errors.InvalidConversion, "cannot convert %L to type %v%s", n.X, n.Type(), why)
+		n.SetType(nil)
+		return n
 	}
 
 	n.SetOp(op)
@@ -416,7 +389,7 @@ func tcConv(n *ir.ConvExpr) ir.Node {
 
 	case ir.OSTR2RUNES:
 		if n.X.Op() == ir.OLITERAL {
-			return stringtoruneslit(n)
+			return stringtoruneslit(curfunc, n)
 		}
 
 	case ir.OBYTES2STR:
@@ -443,10 +416,70 @@ func tcConv(n *ir.ConvExpr) ir.Node {
 	return n
 }
 
+// DotField returns a field selector expression that selects the
+// index'th field of the given expression, which must be of struct or
+// pointer-to-struct type.
+func DotField(pos src.XPos, x ir.Node, index int) *ir.SelectorExpr {
+	op, typ := ir.ODOT, x.Type()
+	if typ.IsPtr() {
+		op, typ = ir.ODOTPTR, typ.Elem()
+	}
+	if !typ.IsStruct() {
+		base.FatalfAt(pos, "DotField of non-struct: %L", x)
+	}
+
+	// TODO(mdempsky): This is the backend's responsibility.
+	types.CalcSize(typ)
+
+	field := typ.Field(index)
+	return dot(pos, field.Type, op, x, field)
+}
+
+func dot(pos src.XPos, typ *types.Type, op ir.Op, x ir.Node, selection *types.Field) *ir.SelectorExpr {
+	n := ir.NewSelectorExpr(pos, op, x, selection.Sym)
+	n.Selection = selection
+	n.SetType(typ)
+	n.SetTypecheck(1)
+	return n
+}
+
+// XDotField returns an expression representing the field selection
+// x.sym. If any implicit field selection are necessary, those are
+// inserted too.
+func XDotField(curfunc *ir.Func, pos src.XPos, x ir.Node, sym *types.Sym) *ir.SelectorExpr {
+	n := Expr(curfunc, ir.NewSelectorExpr(pos, ir.OXDOT, x, sym)).(*ir.SelectorExpr)
+	if n.Op() != ir.ODOT && n.Op() != ir.ODOTPTR {
+		base.FatalfAt(pos, "unexpected result op: %v (%v)", n.Op(), n)
+	}
+	return n
+}
+
+// XDotMethod returns an expression representing the method value
+// x.sym (i.e., x is a value, not a type). If any implicit field
+// selection are necessary, those are inserted too.
+//
+// If callee is true, the result is an ODOTMETH/ODOTINTER, otherwise
+// an OMETHVALUE.
+func XDotMethod(curfunc *ir.Func, pos src.XPos, x ir.Node, sym *types.Sym, callee bool) *ir.SelectorExpr {
+	n := ir.NewSelectorExpr(pos, ir.OXDOT, x, sym)
+	if callee {
+		n = Callee(curfunc, n).(*ir.SelectorExpr)
+		if n.Op() != ir.ODOTMETH && n.Op() != ir.ODOTINTER {
+			base.FatalfAt(pos, "unexpected result op: %v (%v)", n.Op(), n)
+		}
+	} else {
+		n = Expr(curfunc, n).(*ir.SelectorExpr)
+		if n.Op() != ir.OMETHVALUE {
+			base.FatalfAt(pos, "unexpected result op: %v (%v)", n.Op(), n)
+		}
+	}
+	return n
+}
+
 // tcDot typechecks an OXDOT or ODOT node.
-func tcDot(n *ir.SelectorExpr, top int) ir.Node {
+func tcDot(curfunc *ir.Func, n *ir.SelectorExpr, top int) ir.Node {
 	if n.Op() == ir.OXDOT {
-		n = AddImplicitDots(n)
+		n = AddImplicitDots(curfunc, n)
 		n.SetOp(ir.ODOT)
 		if n.X == nil {
 			n.SetType(nil)
@@ -454,7 +487,7 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 		}
 	}
 
-	n.X = typecheck(n.X, ctxExpr|ctxType)
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
 
 	t := n.X.Type()
@@ -465,7 +498,7 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 	}
 
 	if n.X.Op() == ir.OTYPE {
-		return typecheckMethodExpr(n)
+		base.FatalfAt(n.Pos(), "use NewMethodExpr to construct OMETHEXPR")
 	}
 
 	if t.IsPtr() && !t.Elem().IsInterface() {
@@ -484,7 +517,7 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 		return n
 	}
 
-	if Lookdot(n, t, 0) == nil {
+	if Lookdot(curfunc, n, t, 0) == nil {
 		// Legitimate field or method lookup failed, try to explain the error
 		switch {
 		case t.IsEmptyInterface():
@@ -494,12 +527,12 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 			// Pointer to interface is almost always a mistake.
 			base.Errorf("%v undefined (type %v is pointer to interface, not interface)", n, n.X.Type())
 
-		case Lookdot(n, t, 1) != nil:
+		case Lookdot(curfunc, n, t, 1) != nil:
 			// Field or method matches by name, but it is not exported.
 			base.Errorf("%v undefined (cannot refer to unexported field or method %v)", n, n.Sel)
 
 		default:
-			if mt := Lookdot(n, t, 2); mt != nil && visible(mt.Sym) { // Case-insensitive lookup.
+			if mt := Lookdot(curfunc, n, t, 2); mt != nil && visible(mt.Sym) { // Case-insensitive lookup.
 				base.Errorf("%v undefined (type %v has no field or method %v, but does have %v)", n, n.X.Type(), n.Sel, mt.Sym)
 			} else {
 				base.Errorf("%v undefined (type %v has no field or method %v)", n, n.X.Type(), n.Sel)
@@ -517,8 +550,8 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 }
 
 // tcDotType typechecks an ODOTTYPE node.
-func tcDotType(n *ir.TypeAssertExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcDotType(curfunc *ir.Func, n *ir.TypeAssertExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
 	l := n.X
 	t := l.Type()
@@ -535,20 +568,9 @@ func tcDotType(n *ir.TypeAssertExpr) ir.Node {
 	base.AssertfAt(n.Type() != nil, n.Pos(), "missing type: %v", n)
 
 	if n.Type() != nil && !n.Type().IsInterface() {
-		var missing, have *types.Field
-		var ptr int
-		if !implements(n.Type(), t, &missing, &have, &ptr) {
-			if have != nil && have.Sym == missing.Sym {
-				base.Errorf("impossible type assertion:\n\t%v does not implement %v (wrong type for %v method)\n"+
-					"\t\thave %v%S\n\t\twant %v%S", n.Type(), t, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
-			} else if ptr != 0 {
-				base.Errorf("impossible type assertion:\n\t%v does not implement %v (%v method has pointer receiver)", n.Type(), t, missing.Sym)
-			} else if have != nil {
-				base.Errorf("impossible type assertion:\n\t%v does not implement %v (missing %v method)\n"+
-					"\t\thave %v%S\n\t\twant %v%S", n.Type(), t, missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
-			} else {
-				base.Errorf("impossible type assertion:\n\t%v does not implement %v (missing %v method)", n.Type(), t, missing.Sym)
-			}
+		why := ImplementsExplain(n.Type(), t)
+		if why != "" {
+			base.Fatalf("impossible type assertion:\n\t%s", why)
 			n.SetType(nil)
 			return n
 		}
@@ -557,8 +579,8 @@ func tcDotType(n *ir.TypeAssertExpr) ir.Node {
 }
 
 // tcITab typechecks an OITAB node.
-func tcITab(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcITab(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	t := n.X.Type()
 	if t == nil {
 		n.SetType(nil)
@@ -572,12 +594,12 @@ func tcITab(n *ir.UnaryExpr) ir.Node {
 }
 
 // tcIndex typechecks an OINDEX node.
-func tcIndex(n *ir.IndexExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcIndex(curfunc *ir.Func, n *ir.IndexExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
-	n.X = implicitstar(n.X)
+	n.X = implicitstar(curfunc, n.X)
 	l := n.X
-	n.Index = Expr(n.Index)
+	n.Index = Expr(curfunc, n.Index)
 	r := n.Index
 	t := l.Type()
 	if t == nil || r.Type() == nil {
@@ -609,19 +631,6 @@ func tcIndex(n *ir.IndexExpr) ir.Node {
 			return n
 		}
 
-		if !n.Bounded() && ir.IsConst(n.Index, constant.Int) {
-			x := n.Index.Val()
-			if constant.Sign(x) < 0 {
-				base.Errorf("invalid %s index %v (index must be non-negative)", why, n.Index)
-			} else if t.IsArray() && constant.Compare(x, token.GEQ, constant.MakeInt64(t.NumElem())) {
-				base.Errorf("invalid array index %v (out of bounds for %d-element array)", n.Index, t.NumElem())
-			} else if ir.IsConst(n.X, constant.String) && constant.Compare(x, token.GEQ, constant.MakeInt64(int64(len(ir.StringVal(n.X))))) {
-				base.Errorf("invalid string index %v (out of bounds for %d-byte string)", n.Index, len(ir.StringVal(n.X)))
-			} else if ir.ConstOverflow(x, types.Types[types.TINT]) {
-				base.Errorf("invalid %s index %v (index too large)", why, n.Index)
-			}
-		}
-
 	case types.TMAP:
 		n.Index = AssignConv(n.Index, t.Key(), "map index")
 		n.SetType(t.Elem())
@@ -632,19 +641,19 @@ func tcIndex(n *ir.IndexExpr) ir.Node {
 }
 
 // tcLenCap typechecks an OLEN or OCAP node.
-func tcLenCap(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcLenCap(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
-	n.X = implicitstar(n.X)
 	l := n.X
 	t := l.Type()
 	if t == nil {
 		n.SetType(nil)
 		return n
 	}
-
 	var ok bool
-	if n.Op() == ir.OLEN {
+	if t.IsPtr() && t.Elem().IsArray() {
+		ok = true
+	} else if n.Op() == ir.OLEN {
 		ok = okforlen[t.Kind()]
 	} else {
 		ok = okforcap[t.Kind()]
@@ -660,8 +669,8 @@ func tcLenCap(n *ir.UnaryExpr) ir.Node {
 }
 
 // tcUnsafeData typechecks an OUNSAFESLICEDATA or OUNSAFESTRINGDATA node.
-func tcUnsafeData(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcUnsafeData(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
 	l := n.X
 	t := l.Type()
@@ -694,8 +703,8 @@ func tcUnsafeData(n *ir.UnaryExpr) ir.Node {
 }
 
 // tcRecv typechecks an ORECV node.
-func tcRecv(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcRecv(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	n.X = DefaultLit(n.X, nil)
 	l := n.X
 	t := l.Type()
@@ -720,8 +729,8 @@ func tcRecv(n *ir.UnaryExpr) ir.Node {
 }
 
 // tcSPtr typechecks an OSPTR node.
-func tcSPtr(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcSPtr(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	t := n.X.Type()
 	if t == nil {
 		n.SetType(nil)
@@ -739,11 +748,11 @@ func tcSPtr(n *ir.UnaryExpr) ir.Node {
 }
 
 // tcSlice typechecks an OSLICE or OSLICE3 node.
-func tcSlice(n *ir.SliceExpr) ir.Node {
-	n.X = DefaultLit(Expr(n.X), nil)
-	n.Low = indexlit(Expr(n.Low))
-	n.High = indexlit(Expr(n.High))
-	n.Max = indexlit(Expr(n.Max))
+func tcSlice(curfunc *ir.Func, n *ir.SliceExpr) ir.Node {
+	n.X = DefaultLit(Expr(curfunc, n.X), nil)
+	n.Low = indexlit(Expr(curfunc, n.Low))
+	n.High = indexlit(Expr(curfunc, n.High))
+	n.Max = indexlit(Expr(curfunc, n.Max))
 	hasmax := n.Op().IsSlice3()
 	l := n.X
 	if l.Type() == nil {
@@ -757,9 +766,9 @@ func tcSlice(n *ir.SliceExpr) ir.Node {
 			return n
 		}
 
-		addr := NodAddr(n.X)
+		addr := NodAddr(curfunc, n.X)
 		addr.SetImplicit(true)
-		n.X = Expr(addr)
+		n.X = Expr(curfunc, addr)
 		l = n.X
 	}
 	t := l.Type()
@@ -789,19 +798,15 @@ func tcSlice(n *ir.SliceExpr) ir.Node {
 		return n
 	}
 
-	if n.Low != nil && !checksliceindex(l, n.Low, tp) {
+	if n.Low != nil && !checksliceindex(n.Low) {
 		n.SetType(nil)
 		return n
 	}
-	if n.High != nil && !checksliceindex(l, n.High, tp) {
+	if n.High != nil && !checksliceindex(n.High) {
 		n.SetType(nil)
 		return n
 	}
-	if n.Max != nil && !checksliceindex(l, n.Max, tp) {
-		n.SetType(nil)
-		return n
-	}
-	if !checksliceconst(n.Low, n.High) || !checksliceconst(n.Low, n.Max) || !checksliceconst(n.High, n.Max) {
+	if n.Max != nil && !checksliceindex(n.Max) {
 		n.SetType(nil)
 		return n
 	}
@@ -809,7 +814,7 @@ func tcSlice(n *ir.SliceExpr) ir.Node {
 }
 
 // tcSliceHeader typechecks an OSLICEHEADER node.
-func tcSliceHeader(n *ir.SliceHeaderExpr) ir.Node {
+func tcSliceHeader(curfunc *ir.Func, n *ir.SliceHeaderExpr) ir.Node {
 	// Errors here are Fatalf instead of Errorf because only the compiler
 	// can construct an OSLICEHEADER node.
 	// Components used in OSLICEHEADER that are supplied by parsed source code
@@ -827,27 +832,15 @@ func tcSliceHeader(n *ir.SliceHeaderExpr) ir.Node {
 		base.Fatalf("need unsafe.Pointer for OSLICEHEADER")
 	}
 
-	n.Ptr = Expr(n.Ptr)
-	n.Len = DefaultLit(Expr(n.Len), types.Types[types.TINT])
-	n.Cap = DefaultLit(Expr(n.Cap), types.Types[types.TINT])
-
-	if ir.IsConst(n.Len, constant.Int) && ir.Int64Val(n.Len) < 0 {
-		base.Fatalf("len for OSLICEHEADER must be non-negative")
-	}
-
-	if ir.IsConst(n.Cap, constant.Int) && ir.Int64Val(n.Cap) < 0 {
-		base.Fatalf("cap for OSLICEHEADER must be non-negative")
-	}
-
-	if ir.IsConst(n.Len, constant.Int) && ir.IsConst(n.Cap, constant.Int) && constant.Compare(n.Len.Val(), token.GTR, n.Cap.Val()) {
-		base.Fatalf("len larger than cap for OSLICEHEADER")
-	}
+	n.Ptr = Expr(curfunc, n.Ptr)
+	n.Len = DefaultLit(Expr(curfunc, n.Len), types.Types[types.TINT])
+	n.Cap = DefaultLit(Expr(curfunc, n.Cap), types.Types[types.TINT])
 
 	return n
 }
 
 // tcStringHeader typechecks an OSTRINGHEADER node.
-func tcStringHeader(n *ir.StringHeaderExpr) ir.Node {
+func tcStringHeader(curfunc *ir.Func, n *ir.StringHeaderExpr) ir.Node {
 	t := n.Type()
 	if t == nil {
 		base.Fatalf("no type specified for OSTRINGHEADER")
@@ -861,19 +854,15 @@ func tcStringHeader(n *ir.StringHeaderExpr) ir.Node {
 		base.Fatalf("need unsafe.Pointer for OSTRINGHEADER")
 	}
 
-	n.Ptr = Expr(n.Ptr)
-	n.Len = DefaultLit(Expr(n.Len), types.Types[types.TINT])
-
-	if ir.IsConst(n.Len, constant.Int) && ir.Int64Val(n.Len) < 0 {
-		base.Fatalf("len for OSTRINGHEADER must be non-negative")
-	}
+	n.Ptr = Expr(curfunc, n.Ptr)
+	n.Len = DefaultLit(Expr(curfunc, n.Len), types.Types[types.TINT])
 
 	return n
 }
 
 // tcStar typechecks an ODEREF node, which may be an expression or a type.
-func tcStar(n *ir.StarExpr, top int) ir.Node {
-	n.X = typecheck(n.X, ctxExpr|ctxType)
+func tcStar(curfunc *ir.Func, n *ir.StarExpr, top int) ir.Node {
+	n.X = typecheck(curfunc, n.X, ctxExpr|ctxType)
 	l := n.X
 	t := l.Type()
 	if t == nil {
@@ -902,8 +891,8 @@ func tcStar(n *ir.StarExpr, top int) ir.Node {
 }
 
 // tcUnaryArith typechecks a unary arithmetic expression.
-func tcUnaryArith(n *ir.UnaryExpr) ir.Node {
-	n.X = Expr(n.X)
+func tcUnaryArith(curfunc *ir.Func, n *ir.UnaryExpr) ir.Node {
+	n.X = Expr(curfunc, n.X)
 	l := n.X
 	t := l.Type()
 	if t == nil {

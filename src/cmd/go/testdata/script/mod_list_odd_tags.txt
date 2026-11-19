@@ -1,6 +1,4 @@
-[short] skip
 [!git] skip
-[!net] skip
 
 env GOPROXY=direct
 

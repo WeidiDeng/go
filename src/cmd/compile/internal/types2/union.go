@@ -17,7 +17,7 @@ type Union struct {
 	terms []*Term // list of syntactical terms (not a canonicalized termlist)
 }
 
-// NewUnion returns a new Union type with the given terms.
+// NewUnion returns a new [Union] type with the given terms.
 // It is an error to create an empty union; they are syntactically not possible.
 func NewUnion(terms []*Term) *Union {
 	if len(terms) == 0 {
@@ -32,7 +32,7 @@ func (u *Union) Term(i int) *Term { return u.terms[i] }
 func (u *Union) Underlying() Type { return u }
 func (u *Union) String() string   { return TypeString(u, nil) }
 
-// A Term represents a term in a Union.
+// A Term represents a term in a [Union].
 type Term term
 
 // NewTerm returns a new union term.
@@ -66,7 +66,7 @@ func parseUnion(check *Checker, uexpr syntax.Expr) Type {
 			return term.typ // typ already recorded through check.typ in parseTilde
 		}
 		if len(terms) >= maxTermCount {
-			if u != Typ[Invalid] {
+			if isValid(u) {
 				check.errorf(x, InvalidUnion, "cannot handle more than %d union terms (implementation limitation)", maxTermCount)
 				u = Typ[Invalid]
 			}
@@ -80,7 +80,7 @@ func parseUnion(check *Checker, uexpr syntax.Expr) Type {
 		}
 	}
 
-	if u == Typ[Invalid] {
+	if !isValid(u) {
 		return u
 	}
 
@@ -89,11 +89,11 @@ func parseUnion(check *Checker, uexpr syntax.Expr) Type {
 	// Note: This is a quadratic algorithm, but unions tend to be short.
 	check.later(func() {
 		for i, t := range terms {
-			if t.typ == Typ[Invalid] {
+			if !isValid(t.typ) {
 				continue
 			}
 
-			u := under(t.typ)
+			u := t.typ.Underlying()
 			f, _ := u.(*Interface)
 			if t.tilde {
 				if f != nil {
@@ -136,14 +136,9 @@ func parseUnion(check *Checker, uexpr syntax.Expr) Type {
 }
 
 func parseTilde(check *Checker, tx syntax.Expr) *Term {
-	x := tx
-	var tilde bool
-	if op, _ := x.(*syntax.Operation); op != nil && op.Op == syntax.Tilde {
-		x = op.X
-		tilde = true
-	}
+	x, tilde := unTilde(tx)
 	typ := check.typ(x)
-	// Embedding stand-alone type parameters is not permitted (issue #47127).
+	// Embedding stand-alone type parameters is not permitted (go.dev/issue/47127).
 	// We don't need this restriction anymore if we make the underlying type of a type
 	// parameter its constraint interface: if we embed a lone type parameter, we will
 	// simply use its underlying type (like we do for other named, embedded interfaces),
@@ -190,10 +185,10 @@ func overlappingTerm(terms []*Term, y *Term) int {
 // flattenUnion walks a union type expression of the form A | B | C | ...,
 // extracting both the binary exprs (blist) and leaf types (tlist).
 func flattenUnion(list []syntax.Expr, x syntax.Expr) (blist, tlist []syntax.Expr) {
-	if o, _ := x.(*syntax.Operation); o != nil && o.Op == syntax.Or {
-		blist, tlist = flattenUnion(list, o.X)
-		blist = append(blist, o)
-		x = o.Y
+	if ox, oy := splitOr(x); ox != nil {
+		blist, tlist = flattenUnion(list, ox)
+		blist = append(blist, x)
+		x = oy
 	}
 	return blist, append(tlist, x)
 }

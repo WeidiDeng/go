@@ -139,8 +139,8 @@ const (
 	REG_RESERVED // end of allocated registers
 
 	REGARG  = -1      // -1 disables passing the first argument in register
-	REGRT1  = REG_R3  // used during zeroing of the stack - not reserved
-	REGRT2  = REG_R4  // used during zeroing of the stack - not reserved
+	REGRT1  = REG_R1  // used during zeroing of the stack - not reserved
+	REGRT2  = REG_R10 // used during zeroing of the stack - not reserved
 	REGTMP  = REG_R10 // scratch register used in the assembler and linker
 	REGTMP2 = REG_R11 // scratch register used in the assembler and linker
 	REGCTXT = REG_R12 // context for closures
@@ -156,7 +156,7 @@ var S390XDWARFRegisters = map[int16]int16{}
 func init() {
 	// f assigns dwarfregisters[from:to by step] = (base):((to-from)/step+base)
 	f := func(from, step, to, base int16) {
-		for r := int16(from); r <= to; r += step {
+		for r := from; r <= to; r += step {
 			S390XDWARFRegisters[r] = (r-from)/step + base
 		}
 	}
@@ -189,6 +189,7 @@ const (
 	USETMP // generated code of this Prog uses REGTMP
 )
 
+//go:generate go run ../mkcnames.go -i a.out.go -o anamesz.go -p s390x
 const ( // comments from func aclass in asmz.go
 	C_NONE     = iota
 	C_REG      // general-purpose register (64-bit)
@@ -328,6 +329,7 @@ const (
 	AFNABS
 	AFNEG
 	AFNEGS
+	ALCDBR
 	ALEDBR
 	ALDEBR
 	ALPDFR
@@ -442,6 +444,7 @@ const (
 	// storage-and-storage
 	AMVC
 	AMVCIN
+	AMVCLE
 	ACLC
 	AXC
 	AOC
@@ -479,6 +482,15 @@ const (
 
 	// macros
 	ACLEAR
+
+	// crypto
+	AKM
+	AKMC
+	AKLMD
+	AKIMD
+	AKDSA
+	AKMA
+	AKMCTR
 
 	// vector
 	AVA
@@ -703,6 +715,14 @@ const (
 	AWFLNDB
 	AVFLPDB
 	AWFLPDB
+	AVFMAXDB
+	AWFMAXDB
+	AVFMAXSB
+	AWFMAXSB
+	AVFMINDB
+	AWFMINDB
+	AVFMINSB
+	AWFMINSB
 	AVFSQ
 	AVFSQDB
 	AWFSQDB
@@ -759,6 +779,10 @@ const (
 	AVLEIF
 	AVLEIG
 	AVLEIB
+	AVLER
+	AVLERH
+	AVLERF
+	AVLERG
 	AVFI
 	AVFIDB
 	AWFIDB
@@ -828,18 +852,24 @@ const (
 	AVMALEB
 	AVMALEH
 	AVMALEF
+	AVMALEG
 	AVMALH
 	AVMALHB
 	AVMALHH
 	AVMALHF
+	AVMALHG
+	AVMALHQ
 	AVMALO
 	AVMALOB
 	AVMALOH
 	AVMALOF
+	AVMALOG
 	AVMAL
 	AVMALB
 	AVMALHW
 	AVMALF
+	AVMALG
+	AVMALQ
 	AVMAO
 	AVMAOB
 	AVMAOH
@@ -856,18 +886,24 @@ const (
 	AVMLEB
 	AVMLEH
 	AVMLEF
+	AVMLEG
 	AVMLH
 	AVMLHB
 	AVMLHH
 	AVMLHF
+	AVMLHG
+	AVMLHQ
 	AVMLO
 	AVMLOB
 	AVMLOH
 	AVMLOF
+	AVMLOG
 	AVML
 	AVMLB
 	AVMLHW
 	AVMLF
+	AVMLG
+	AVMLQ
 	AVMO
 	AVMOB
 	AVMOH
@@ -925,7 +961,12 @@ const (
 	AVSTEF
 	AVSTEG
 	AVSTEB
+	AVSTER
+	AVSTERH
+	AVSTERF
+	AVSTERG
 	AVSTM
+	AVSTRL
 	AVSTL
 	AVSTRC
 	AVSTRCB
@@ -993,6 +1034,9 @@ const (
 	ABYTE
 	AWORD
 	ADWORD
+
+	// Breakpoint
+	ABRRK
 
 	// end marker
 	ALAST

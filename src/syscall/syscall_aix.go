@@ -21,7 +21,12 @@ func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
 func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 
 // Implemented in runtime/syscall_aix.go.
+// Accessed in assembly in x/sys/unix and x/sys/cpu.
+//
+//go:linkname rawSyscall6
 func rawSyscall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+
+//go:linkname syscall6
 func syscall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 
 // Constant expected by package but not supported
@@ -119,11 +124,11 @@ func Getwd() (ret string, err error) {
 		b := make([]byte, len)
 		err := getcwd(&b[0], len)
 		if err == nil {
-			i := 0
-			for b[i] != 0 {
-				i++
+			n := clen(b[:])
+			if n < 1 {
+				return "", EINVAL
 			}
-			return string(b[0:i]), nil
+			return string(b[:n]), nil
 		}
 		if err != ERANGE {
 			return "", err
@@ -222,7 +227,7 @@ func Wait4(pid int, wstatus *WaitStatus, options int, rusage *Rusage) (wpid int,
 	var status _C_int
 	var r _Pid_t
 	err = ERESTART
-	// AIX wait4 may return with ERESTART errno, while the processus is still
+	// AIX wait4 may return with ERESTART errno, while the process is still
 	// active.
 	for err == ERESTART {
 		r, err = wait4(_Pid_t(pid), &status, options, rusage)
@@ -428,8 +433,7 @@ func anyToSockaddr(rsa *RawSockaddrAny) (Sockaddr, error) {
 		if err != nil {
 			return nil, err
 		}
-		bytes := (*[len(pp.Path)]byte)(unsafe.Pointer(&pp.Path[0]))
-		sa.Name = string(bytes[0:n])
+		sa.Name = string(unsafe.Slice((*byte)(unsafe.Pointer(&pp.Path[0])), n))
 		return sa, nil
 
 	case AF_INET:
@@ -505,6 +509,7 @@ func (w WaitStatus) TrapCause() int { return -1 }
 
 //sys	Openat(dirfd int, path string, flags int, mode uint32) (fd int, err error)
 //sys	ptrace64(request int, id int64, addr int64, data int, buff uintptr) (err error)
+//sys	ptrace64Ptr(request int, id int64, addr int64, data int, buff unsafe.Pointer) (err error) = ptrace64
 
 func raw_ptrace(request int, pid int, addr *byte, data *byte) Errno {
 	if request == PTRACE_TRACEME {
@@ -525,13 +530,13 @@ func ptracePeek(pid int, addr uintptr, out []byte) (count int, err error) {
 		if bsize > 1024 {
 			bsize = 1024
 		}
-		err = ptrace64(PT_READ_BLOCK, int64(pid), int64(addr), bsize, uintptr(unsafe.Pointer(&out[0])))
+		err = ptrace64Ptr(PT_READ_BLOCK, int64(pid), int64(addr), bsize, unsafe.Pointer(&out[0]))
 		if err != nil {
 			return 0, err
 		}
 		addr += uintptr(bsize)
 		n += bsize
-		out = out[n:]
+		out = out[bsize:]
 	}
 	return n, nil
 }
@@ -551,13 +556,13 @@ func ptracePoke(pid int, addr uintptr, data []byte) (count int, err error) {
 		if bsize > 1024 {
 			bsize = 1024
 		}
-		err = ptrace64(PT_WRITE_BLOCK, int64(pid), int64(addr), bsize, uintptr(unsafe.Pointer(&data[0])))
+		err = ptrace64Ptr(PT_WRITE_BLOCK, int64(pid), int64(addr), bsize, unsafe.Pointer(&data[0]))
 		if err != nil {
 			return 0, err
 		}
 		addr += uintptr(bsize)
 		n += bsize
-		data = data[n:]
+		data = data[bsize:]
 	}
 	return n, nil
 }
@@ -629,11 +634,12 @@ func PtraceDetach(pid int) (err error) { return ptrace64(PT_DETACH, int64(pid), 
 //sysnb	Setegid(egid int) (err error)
 //sysnb	Seteuid(euid int) (err error)
 //sysnb	Setgid(gid int) (err error)
+//sysnb	Setuid(uid int) (err error)
 //sysnb	Setpgid(pid int, pgid int) (err error)
 //sys	Setpriority(which int, who int, prio int) (err error)
 //sysnb	Setregid(rgid int, egid int) (err error)
 //sysnb	Setreuid(ruid int, euid int) (err error)
-//sysnb	Setrlimit(which int, lim *Rlimit) (err error)
+//sysnb	setrlimit(which int, lim *Rlimit) (err error)
 //sys	Stat(path string, stat *Stat_t) (err error)
 //sys	Statfs(path string, buf *Statfs_t) (err error)
 //sys	Symlink(path string, link string) (err error)

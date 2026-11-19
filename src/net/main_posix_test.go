@@ -2,15 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js && !plan9
+//go:build !plan9
 
 package net
 
 import (
+	"errors"
 	"net/internal/socktest"
 	"strings"
 	"syscall"
 )
+
+func isUnreachableError(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH)
+}
 
 func enableSocketConnect() {
 	sw.Set(socktest.FilterConnect, nil)

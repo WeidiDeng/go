@@ -7,22 +7,22 @@ package noder
 import (
 	"bytes"
 	"fmt"
+	"internal/goexperiment"
 	"io"
 
 	"cmd/compile/internal/base"
-	"cmd/compile/internal/typecheck"
 	"cmd/internal/bio"
 )
 
 func WriteExports(out *bio.Writer) {
 	var data bytes.Buffer
 
-	if base.Debug.Unified != 0 {
-		data.WriteByte('u')
-		writeUnifiedExport(&data)
+	if goexperiment.GoListExportNewFormat {
+		data.WriteByte('p')
 	} else {
-		typecheck.WriteExports(&data, true)
+		data.WriteByte('u')
 	}
+	writeUnifiedExport(&data)
 
 	// The linker also looks for the $$ marker - use char after $$ to distinguish format.
 	out.WriteString("\n$$B\n") // indicate binary export format

@@ -4,14 +4,23 @@ package big
 
 import "strconv"
 
+func _() {
+	// An "invalid array index" compiler error signifies that the constant values have changed.
+	// Re-run the stringer command to generate them again.
+	var x [1]struct{}
+	_ = x[Below - -1]
+	_ = x[Exact-0]
+	_ = x[Above-1]
+}
+
 const _Accuracy_name = "BelowExactAbove"
 
 var _Accuracy_index = [...]uint8{0, 5, 10, 15}
 
 func (i Accuracy) String() string {
-	i -= -1
-	if i < 0 || i >= Accuracy(len(_Accuracy_index)-1) {
-		return "Accuracy(" + strconv.FormatInt(int64(i+-1), 10) + ")"
+	idx := int(i) - -1
+	if i < -1 || idx >= len(_Accuracy_index)-1 {
+		return "Accuracy(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _Accuracy_name[_Accuracy_index[i]:_Accuracy_index[i+1]]
+	return _Accuracy_name[_Accuracy_index[idx]:_Accuracy_index[idx+1]]
 }

@@ -5,7 +5,7 @@
 package exec
 
 import (
-	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -14,6 +14,7 @@ func TestDedupEnv(t *testing.T) {
 
 	tests := []struct {
 		noCase  bool
+		nulOK   bool
 		in      []string
 		want    []string
 		wantErr bool
@@ -50,10 +51,16 @@ func TestDedupEnv(t *testing.T) {
 			want:    []string{"B=b"},
 			wantErr: true,
 		},
+		{
+			// Plan 9 needs to preserve environment variables with NUL (#56544).
+			nulOK: true,
+			in:    []string{"path=one\x00two"},
+			want:  []string{"path=one\x00two"},
+		},
 	}
 	for _, tt := range tests {
-		got, err := dedupEnvCase(tt.noCase, tt.in)
-		if !reflect.DeepEqual(got, tt.want) || (err != nil) != tt.wantErr {
+		got, err := dedupEnvCase(tt.noCase, tt.nulOK, tt.in)
+		if !slices.Equal(got, tt.want) || (err != nil) != tt.wantErr {
 			t.Errorf("Dedup(%v, %q) = %q, %v; want %q, error:%v", tt.noCase, tt.in, got, err, tt.want, tt.wantErr)
 		}
 	}

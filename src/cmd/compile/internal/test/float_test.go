@@ -523,6 +523,269 @@ func TestFloatSignalingNaNConversionConst(t *testing.T) {
 	}
 }
 
+//go:noinline
+func isPosInf(x float64) bool {
+	return math.IsInf(x, 1)
+}
+
+//go:noinline
+func isPosInfEq(x float64) bool {
+	return x == math.Inf(1)
+}
+
+//go:noinline
+func isPosInfCmp(x float64) bool {
+	return x > math.MaxFloat64
+}
+
+//go:noinline
+func isNotPosInf(x float64) bool {
+	return !math.IsInf(x, 1)
+}
+
+//go:noinline
+func isNotPosInfEq(x float64) bool {
+	return x != math.Inf(1)
+}
+
+//go:noinline
+func isNotPosInfCmp(x float64) bool {
+	return x <= math.MaxFloat64
+}
+
+//go:noinline
+func isNegInf(x float64) bool {
+	return math.IsInf(x, -1)
+}
+
+//go:noinline
+func isNegInfEq(x float64) bool {
+	return x == math.Inf(-1)
+}
+
+//go:noinline
+func isNegInfCmp(x float64) bool {
+	return x < -math.MaxFloat64
+}
+
+//go:noinline
+func isNotNegInf(x float64) bool {
+	return !math.IsInf(x, -1)
+}
+
+//go:noinline
+func isNotNegInfEq(x float64) bool {
+	return x != math.Inf(-1)
+}
+
+//go:noinline
+func isNotNegInfCmp(x float64) bool {
+	return x >= -math.MaxFloat64
+}
+
+func TestInf(t *testing.T) {
+	tests := []struct {
+		value    float64
+		isPosInf bool
+		isNegInf bool
+		isNaN    bool
+	}{
+		{value: math.Inf(1), isPosInf: true},
+		{value: math.MaxFloat64},
+		{value: math.Inf(-1), isNegInf: true},
+		{value: -math.MaxFloat64},
+		{value: math.NaN(), isNaN: true},
+	}
+
+	check := func(name string, f func(x float64) bool, value float64, want bool) {
+		got := f(value)
+		if got != want {
+			t.Errorf("%v(%g): want %v, got %v", name, value, want, got)
+		}
+	}
+
+	for _, test := range tests {
+		check("isPosInf", isPosInf, test.value, test.isPosInf)
+		check("isPosInfEq", isPosInfEq, test.value, test.isPosInf)
+		check("isPosInfCmp", isPosInfCmp, test.value, test.isPosInf)
+
+		check("isNotPosInf", isNotPosInf, test.value, !test.isPosInf)
+		check("isNotPosInfEq", isNotPosInfEq, test.value, !test.isPosInf)
+		check("isNotPosInfCmp", isNotPosInfCmp, test.value, !test.isPosInf && !test.isNaN)
+
+		check("isNegInf", isNegInf, test.value, test.isNegInf)
+		check("isNegInfEq", isNegInfEq, test.value, test.isNegInf)
+		check("isNegInfCmp", isNegInfCmp, test.value, test.isNegInf)
+
+		check("isNotNegInf", isNotNegInf, test.value, !test.isNegInf)
+		check("isNotNegInfEq", isNotNegInfEq, test.value, !test.isNegInf)
+		check("isNotNegInfCmp", isNotNegInfCmp, test.value, !test.isNegInf && !test.isNaN)
+	}
+}
+
+//go:noinline
+func isNaNOrGtZero64(x float64) bool {
+	return math.IsNaN(x) || x > 0
+}
+
+//go:noinline
+func isNaNOrGteZero64(x float64) bool {
+	return x >= 0 || math.IsNaN(x)
+}
+
+//go:noinline
+func isNaNOrLtZero64(x float64) bool {
+	return x < 0 || math.IsNaN(x)
+}
+
+//go:noinline
+func isNaNOrLteZero64(x float64) bool {
+	return math.IsNaN(x) || x <= 0
+}
+
+func TestFusedNaNChecks64(t *testing.T) {
+	tests := []struct {
+		value             float64
+		isZero            bool
+		isGreaterThanZero bool
+		isLessThanZero    bool
+		isNaN             bool
+	}{
+		{value: 0.0, isZero: true},
+		{value: math.Copysign(0, -1), isZero: true},
+		{value: 1.0, isGreaterThanZero: true},
+		{value: -1.0, isLessThanZero: true},
+		{value: math.Inf(1), isGreaterThanZero: true},
+		{value: math.Inf(-1), isLessThanZero: true},
+		{value: math.NaN(), isNaN: true},
+	}
+
+	check := func(name string, f func(x float64) bool, value float64, want bool) {
+		got := f(value)
+		if got != want {
+			t.Errorf("%v(%g): want %v, got %v", name, value, want, got)
+		}
+	}
+
+	for _, test := range tests {
+		check("isNaNOrGtZero64", isNaNOrGtZero64, test.value, test.isNaN || test.isGreaterThanZero)
+		check("isNaNOrGteZero64", isNaNOrGteZero64, test.value, test.isNaN || test.isGreaterThanZero || test.isZero)
+		check("isNaNOrLtZero64", isNaNOrLtZero64, test.value, test.isNaN || test.isLessThanZero)
+		check("isNaNOrLteZero64", isNaNOrLteZero64, test.value, test.isNaN || test.isLessThanZero || test.isZero)
+	}
+}
+
+//go:noinline
+func isNaNOrGtZero32(x float32) bool {
+	return x > 0 || x != x
+}
+
+//go:noinline
+func isNaNOrGteZero32(x float32) bool {
+	return x != x || x >= 0
+}
+
+//go:noinline
+func isNaNOrLtZero32(x float32) bool {
+	return x != x || x < 0
+}
+
+//go:noinline
+func isNaNOrLteZero32(x float32) bool {
+	return x <= 0 || x != x
+}
+
+func TestFusedNaNChecks32(t *testing.T) {
+	tests := []struct {
+		value             float32
+		isZero            bool
+		isGreaterThanZero bool
+		isLessThanZero    bool
+		isNaN             bool
+	}{
+		{value: 0.0, isZero: true},
+		{value: float32(math.Copysign(0, -1)), isZero: true},
+		{value: 1.0, isGreaterThanZero: true},
+		{value: -1.0, isLessThanZero: true},
+		{value: float32(math.Inf(1)), isGreaterThanZero: true},
+		{value: float32(math.Inf(-1)), isLessThanZero: true},
+		{value: float32(math.NaN()), isNaN: true},
+	}
+
+	check := func(name string, f func(x float32) bool, value float32, want bool) {
+		got := f(value)
+		if got != want {
+			t.Errorf("%v(%g): want %v, got %v", name, value, want, got)
+		}
+	}
+
+	for _, test := range tests {
+		check("isNaNOrGtZero32", isNaNOrGtZero32, test.value, test.isNaN || test.isGreaterThanZero)
+		check("isNaNOrGteZero32", isNaNOrGteZero32, test.value, test.isNaN || test.isGreaterThanZero || test.isZero)
+		check("isNaNOrLtZero32", isNaNOrLtZero32, test.value, test.isNaN || test.isLessThanZero)
+		check("isNaNOrLteZero32", isNaNOrLteZero32, test.value, test.isNaN || test.isLessThanZero || test.isZero)
+	}
+}
+
+// minNormal64 is the smallest float64 value that is not subnormal.
+const minNormal64 = 2.2250738585072014e-308
+
+//go:noinline
+func isAbsLessThanMinNormal64(x float64) bool {
+	return math.Abs(x) < minNormal64
+}
+
+//go:noinline
+func isLessThanMinNormal64(x float64) bool {
+	return x < minNormal64
+}
+
+//go:noinline
+func isGreaterThanNegMinNormal64(x float64) bool {
+	return x > -minNormal64
+}
+
+//go:noinline
+func isGreaterThanOrEqualToMinNormal64(x float64) bool {
+	return math.Abs(x) >= minNormal64
+}
+
+func TestSubnormalComparisons(t *testing.T) {
+	tests := []struct {
+		value                  float64
+		isAbsLessThanMinNormal bool
+		isPositive             bool
+		isNegative             bool
+		isNaN                  bool
+	}{
+		{value: math.Inf(1), isPositive: true},
+		{value: math.MaxFloat64, isPositive: true},
+		{value: math.Inf(-1), isNegative: true},
+		{value: -math.MaxFloat64, isNegative: true},
+		{value: math.NaN(), isNaN: true},
+		{value: minNormal64, isPositive: true},
+		{value: minNormal64 / 2, isAbsLessThanMinNormal: true, isPositive: true},
+		{value: -minNormal64, isNegative: true},
+		{value: -minNormal64 / 2, isAbsLessThanMinNormal: true, isNegative: true},
+		{value: 0, isAbsLessThanMinNormal: true, isPositive: true},
+		{value: math.Copysign(0, -1), isAbsLessThanMinNormal: true, isNegative: true},
+	}
+
+	check := func(name string, f func(x float64) bool, value float64, want bool) {
+		got := f(value)
+		if got != want {
+			t.Errorf("%v(%g): want %v, got %v", name, value, want, got)
+		}
+	}
+
+	for _, test := range tests {
+		check("isAbsLessThanMinNormal64", isAbsLessThanMinNormal64, test.value, test.isAbsLessThanMinNormal)
+		check("isLessThanMinNormal64", isLessThanMinNormal64, test.value, test.isAbsLessThanMinNormal || test.isNegative)
+		check("isGreaterThanNegMinNormal64", isGreaterThanNegMinNormal64, test.value, test.isAbsLessThanMinNormal || test.isPositive)
+		check("isGreaterThanOrEqualToMinNormal64", isGreaterThanOrEqualToMinNormal64, test.value, !test.isAbsLessThanMinNormal && !test.isNaN)
+	}
+}
+
 var sinkFloat float64
 
 func BenchmarkMul2(b *testing.B) {
@@ -541,5 +804,97 @@ func BenchmarkMulNeg2(b *testing.B) {
 			m *= -2
 		}
 		sinkFloat = m
+	}
+}
+
+// The "a < b ? a : b" branch idiom lowers to a single min/max instruction
+// (MINSD/MAXSD on amd64, FCSEL on arm64). Unlike the min/max builtins it keeps
+// the branch's own NaN and signed-zero behavior. Test the optimized assign
+// form against an unoptimized reference whose comparison is hidden behind a
+// noinline call (compare1/compare2) so it can't be rewritten to the same
+// instruction.
+
+//go:noinline
+func minBranch64(a, b float64) float64 {
+	r := b
+	if a < b {
+		r = a
+	}
+	return r
+}
+
+//go:noinline
+func maxBranch64(a, b float64) float64 {
+	r := b
+	if a > b {
+		r = a
+	}
+	return r
+}
+
+//go:noinline
+func minBranch32(a, b float32) float32 {
+	r := b
+	if a < b {
+		r = a
+	}
+	return r
+}
+
+//go:noinline
+func maxBranch32(a, b float32) float32 {
+	r := b
+	if a > b {
+		r = a
+	}
+	return r
+}
+
+func minRef64(a, b float64) float64 {
+	if compare1(a, b) {
+		return a
+	}
+	return b
+}
+func maxRef64(a, b float64) float64 {
+	if compare1(b, a) {
+		return a
+	}
+	return b
+}
+func minRef32(a, b float32) float32 {
+	if compare2(a, b) {
+		return a
+	}
+	return b
+}
+func maxRef32(a, b float32) float32 {
+	if compare2(b, a) {
+		return a
+	}
+	return b
+}
+
+func TestFloatMinMaxBranchIdiom(t *testing.T) {
+	vals := []float64{
+		0, math.Copysign(0, -1), 1, -1, 2, -2, 0.5, -0.5,
+		math.Inf(1), math.Inf(-1), math.NaN(),
+	}
+	for _, a := range vals {
+		for _, b := range vals {
+			if got, want := minBranch64(a, b), minRef64(a, b); math.Float64bits(got) != math.Float64bits(want) {
+				t.Errorf("minBranch64(%x, %x) = %x, want %x", a, b, got, want)
+			}
+			if got, want := maxBranch64(a, b), maxRef64(a, b); math.Float64bits(got) != math.Float64bits(want) {
+				t.Errorf("maxBranch64(%x, %x) = %x, want %x", a, b, got, want)
+			}
+			a32, b32 := float32(a), float32(b)
+			if got, want := minBranch32(a32, b32), minRef32(a32, b32); math.Float32bits(got) != math.Float32bits(want) {
+				t.Errorf("minBranch32(%x, %x) = %x, want %x", a32, b32, got, want)
+			}
+			if got, want := maxBranch32(a32, b32), maxRef32(a32, b32); math.Float32bits(got) != math.Float32bits(want) {
+				t.Errorf("maxBranch32(%x, %x) = %x, want %x", a32, b32, got, want)
+			}
+		}
 	}
 }

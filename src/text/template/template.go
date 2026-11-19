@@ -5,6 +5,7 @@
 package template
 
 import (
+	"maps"
 	"reflect"
 	"sync"
 	"text/template/parse"
@@ -24,7 +25,7 @@ type common struct {
 }
 
 // Template is the representation of a parsed template. The *parse.Tree
-// field is exported only for use by html/template and should be treated
+// field is exported only for use by [html/template] and should be treated
 // as unexported by all other clients.
 type Template struct {
 	name string
@@ -79,7 +80,7 @@ func (t *Template) init() {
 
 // Clone returns a duplicate of the template, including all associated
 // templates. The actual representation is not copied, but the name space of
-// associated templates is, so further calls to Parse in the copy will add
+// associated templates is, so further calls to [Template.Parse] in the copy will add
 // templates to the copy but not to the original. Clone can be used to prepare
 // common templates and use them with variant definitions for other templates
 // by adding the variants after the clone is made.
@@ -89,6 +90,7 @@ func (t *Template) Clone() (*Template, error) {
 	if t.common == nil {
 		return nt, nil
 	}
+	nt.option = t.option
 	t.muTmpl.RLock()
 	defer t.muTmpl.RUnlock()
 	for k, v := range t.tmpl {
@@ -102,12 +104,8 @@ func (t *Template) Clone() (*Template, error) {
 	}
 	t.muFuncs.RLock()
 	defer t.muFuncs.RUnlock()
-	for k, v := range t.parseFuncs {
-		nt.parseFuncs[k] = v
-	}
-	for k, v := range t.execFuncs {
-		nt.execFuncs[k] = v
-	}
+	maps.Copy(nt.parseFuncs, t.parseFuncs)
+	maps.Copy(nt.execFuncs, t.execFuncs)
 	return nt, nil
 }
 
@@ -157,7 +155,7 @@ func (t *Template) Templates() []*Template {
 }
 
 // Delims sets the action delimiters to the specified strings, to be used in
-// subsequent calls to Parse, ParseFiles, or ParseGlob. Nested template
+// subsequent calls to [Template.Parse], [Template.ParseFiles], or [Template.ParseGlob]. Nested template
 // definitions will inherit the settings. An empty delimiter stands for the
 // corresponding default: {{ or }}.
 // The return value is the template, so calls can be chained.
@@ -169,11 +167,13 @@ func (t *Template) Delims(left, right string) *Template {
 }
 
 // Funcs adds the elements of the argument map to the template's function map.
-// It must be called before the template is parsed.
+// Any function used in the template must be added before the template is
+// parsed. Funcs may be called more than once, including after parsing (for
+// example, after [Template.Clone]), to replace a function of the same name;
+// the replacement is used when the template is executed.
 // It panics if a value in the map is not a function with appropriate return
 // type or if the name cannot be used syntactically as a function in a template.
-// It is legal to overwrite elements of the map. The return value is the template,
-// so calls can be chained.
+// The return value is the template, so calls can be chained.
 func (t *Template) Funcs(funcMap FuncMap) *Template {
 	t.init()
 	t.muFuncs.Lock()

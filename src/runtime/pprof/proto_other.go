@@ -2,21 +2,25 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !windows
+//go:build !windows && !darwin
 
 package pprof
 
 import (
 	"errors"
 	"os"
+	"runtime"
 )
 
 // readMapping reads /proc/self/maps and writes mappings to b.pb.
 // It saves the address ranges of the mappings in b.mem for use
 // when emitting locations.
 func (b *profileBuilder) readMapping() {
-	data, _ := os.ReadFile("/proc/self/maps")
-	parseProcSelfMaps(data, b.addMapping)
+	// /proc/self/maps is not relevant to WebAssembly's logical PCs.
+	if runtime.GOOS != "js" && runtime.GOOS != "wasip1" {
+		data, _ := os.ReadFile("/proc/self/maps")
+		parseProcSelfMaps(data, b.addMapping)
+	}
 	if len(b.mem) == 0 { // pprof expects a map entry, so fake one.
 		b.addMappingEntry(0, 0, 0, "", "", true)
 		// TODO(hyangah): make addMapping return *memMap or
@@ -25,6 +29,6 @@ func (b *profileBuilder) readMapping() {
 	}
 }
 
-func readMainModuleMapping() (start, end uint64, err error) {
-	return 0, 0, errors.New("not implemented")
+func readMainModuleMapping() (start, end uint64, exe, buildID string, err error) {
+	return 0, 0, "", "", errors.New("not implemented")
 }

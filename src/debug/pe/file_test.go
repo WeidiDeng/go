@@ -7,7 +7,9 @@ package pe
 import (
 	"bytes"
 	"debug/dwarf"
+	"encoding/binary"
 	"internal/testenv"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -413,7 +415,7 @@ func testDWARF(t *testing.T, linktype int) {
 
 	var foundDebugGDBScriptsSection bool
 	for _, sect := range f.Sections {
-		if sect.Name == ".debug_gdb_scripts" {
+		if sect.Name == ".debug_gdb_scripts" || sect.Name == ".zdebug_gdb_scripts" {
 			foundDebugGDBScriptsSection = true
 		}
 	}
@@ -511,17 +513,9 @@ main(void)
 	if bss == nil {
 		t.Fatal("could not find .bss section")
 	}
-	data, err := bss.Data()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(data) == 0 {
-		t.Fatalf("%s file .bss section cannot be empty", objpath)
-	}
-	for _, b := range data {
-		if b != 0 {
-			t.Fatalf(".bss section has non zero bytes: %v", data)
-		}
+	// We expect an error from bss.Data, as there are no contents.
+	if _, err := bss.Data(); err == nil {
+		t.Error("bss.Data succeeded, expected error")
 	}
 }
 
@@ -693,6 +687,44 @@ func TestImportedSymbolsNoPanicMissingOptionalHeader(t *testing.T) {
 		t.Fatalf("expected len(syms) == 0, received len(syms) = %d", len(syms))
 	}
 
+}
+
+func TestImportedSymbolsPE32TerminalThunkAtEndOfSection(t *testing.T) {
+	const sectionVA = 0x1000
+	data := make([]byte, 64)
+	binary.LittleEndian.PutUint32(data[0:4], sectionVA+56)
+	binary.LittleEndian.PutUint32(data[12:16], sectionVA+45)
+	copy(data[42:], "fn\x00")
+	copy(data[45:], "dll\x00")
+	binary.LittleEndian.PutUint32(data[56:60], sectionVA+40)
+	// data[60:64] is the terminating zero thunk at the end of the section.
+
+	section := &Section{
+		SectionHeader: SectionHeader{
+			VirtualSize:    uint32(len(data)),
+			VirtualAddress: sectionVA,
+			Size:           uint32(len(data)),
+			Offset:         1,
+		},
+	}
+	section.sr = io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
+	f := &File{
+		OptionalHeader: &OptionalHeader32{
+			NumberOfRvaAndSizes: IMAGE_DIRECTORY_ENTRY_IMPORT + 1,
+			DataDirectory: [16]DataDirectory{
+				IMAGE_DIRECTORY_ENTRY_IMPORT: {VirtualAddress: sectionVA},
+			},
+		},
+		Sections: []*Section{section},
+	}
+
+	syms, err := f.ImportedSymbols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syms) != 1 || syms[0] != "fn:dll" {
+		t.Fatalf("ImportedSymbols() = %v, want [fn:dll]", syms)
+	}
 }
 
 func TestImportedSymbolsNoPanicWithSliceOutOfBound(t *testing.T) {

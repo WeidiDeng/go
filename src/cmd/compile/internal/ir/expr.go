@@ -24,12 +24,12 @@ type Expr interface {
 // A miniExpr is a miniNode with extra fields common to expressions.
 // TODO(rsc): Once we are sure about the contents, compact the bools
 // into a bit field and leave extra bits available for implementations
-// embedding miniExpr. Right now there are ~60 unused bits sitting here.
+// embedding miniExpr. Right now there are ~24 unused bits sitting here.
 type miniExpr struct {
 	miniNode
+	flags bitset8
 	typ   *types.Type
 	init  Nodes // TODO(rsc): Don't require every Node to have an init
-	flags bitset8
 }
 
 const (
@@ -54,7 +54,7 @@ func (n *miniExpr) Init() Nodes           { return n.init }
 func (n *miniExpr) PtrInit() *Nodes       { return &n.init }
 func (n *miniExpr) SetInit(x Nodes)       { n.init = x }
 
-// An AddStringExpr is a string concatenation Expr[0] + Exprs[1] + ... + Expr[len(Expr)-1].
+// An AddStringExpr is a string concatenation List[0] + List[1] + ... + List[len(List)-1].
 type AddStringExpr struct {
 	miniExpr
 	List     Nodes
@@ -78,9 +78,39 @@ type AddrExpr struct {
 }
 
 func NewAddrExpr(pos src.XPos, x Node) *AddrExpr {
+	if x == nil || x.Typecheck() != 1 {
+		base.FatalfAt(pos, "missed typecheck: %L", x)
+	}
 	n := &AddrExpr{X: x}
-	n.op = OADDR
 	n.pos = pos
+
+	switch x.Op() {
+	case OARRAYLIT, OMAPLIT, OSLICELIT, OSTRUCTLIT:
+		n.op = OPTRLIT
+
+	default:
+		n.op = OADDR
+		if r, ok := OuterValue(x).(*Name); ok && r.Op() == ONAME {
+			r.SetAddrtaken(true)
+
+			// If r is a closure variable, we need to mark its canonical
+			// variable as addrtaken too, so that closure conversion
+			// captures it by reference.
+			//
+			// Exception: if we've already marked the variable as
+			// capture-by-value, then that means this variable isn't
+			// logically modified, and we must be taking its address to pass
+			// to a runtime function that won't mutate it. In that case, we
+			// only need to make sure our own copy is addressable.
+			if r.IsClosureVar() && !r.Byval() {
+				r.Canonical().SetAddrtaken(true)
+			}
+		}
+	}
+
+	n.SetType(types.NewPtr(x.Type()))
+	n.SetTypecheck(1)
+
 	return n
 }
 
@@ -102,18 +132,26 @@ type BasicLit struct {
 	val constant.Value
 }
 
-func NewBasicLit(pos src.XPos, val constant.Value) Node {
+// NewBasicLit returns an OLITERAL representing val with the given type.
+func NewBasicLit(pos src.XPos, typ *types.Type, val constant.Value) Node {
+	AssertValidTypeForConst(typ, val)
+
 	n := &BasicLit{val: val}
 	n.op = OLITERAL
 	n.pos = pos
-	if k := val.Kind(); k != constant.Unknown {
-		n.SetType(idealType(k))
-	}
+	n.SetType(typ)
+	n.SetTypecheck(1)
 	return n
 }
 
 func (n *BasicLit) Val() constant.Value       { return n.val }
 func (n *BasicLit) SetVal(val constant.Value) { n.val = val }
+
+// NewConstExpr returns an OLITERAL representing val, copying the
+// position and type from orig.
+func NewConstExpr(val constant.Value, orig Node) Node {
+	return NewBasicLit(orig.Pos(), orig.Type(), val)
+}
 
 // A BinaryExpr is a binary expression X Op Y,
 // or Op(X, Y) for builtin functions that do not become calls.
@@ -138,27 +176,33 @@ func (n *BinaryExpr) SetOp(op Op) {
 	case OADD, OADDSTR, OAND, OANDNOT, ODIV, OEQ, OGE, OGT, OLE,
 		OLSH, OLT, OMOD, OMUL, ONE, OOR, ORSH, OSUB, OXOR,
 		OCOPY, OCOMPLEX, OUNSAFEADD, OUNSAFESLICE, OUNSAFESTRING,
-		OEFACE:
+		OMAKEFACE:
 		n.op = op
 	}
 }
 
-// A CallExpr is a function call X(Args).
+// A CallExpr is a function call Fun(Args).
 type CallExpr struct {
 	miniExpr
-	origNode
-	X         Node
-	Args      Nodes
-	RType     Node    `mknode:"-"` // see reflectdata/helpers.go
-	KeepAlive []*Name // vars to be kept alive until call returns
-	IsDDD     bool
-	NoInline  bool
+	Fun           Node
+	Args          Nodes
+	DeferAt       Node
+	RType         Node    `mknode:"-"` // see reflectdata/helpers.go
+	KeepAlive     []*Name // vars to be kept alive until call returns
+	IsDDD         bool
+	GoDefer       bool // whether this call is part of a go or defer statement
+	NoInline      bool // whether this call must not be inlined
+	UseBuf        bool // use stack buffer for backing store (OAPPEND only)
+	AppendNoAlias bool // backing store proven to be unaliased (OAPPEND only)
+	// whether it's a runtime.KeepAlive call the compiler generates to
+	// keep a variable alive. See #73137.
+	IsCompilerVarLive bool
+	Reshape           bool
 }
 
 func NewCallExpr(pos src.XPos, op Op, fun Node, args []Node) *CallExpr {
-	n := &CallExpr{X: fun}
+	n := &CallExpr{Fun: fun}
 	n.pos = pos
-	n.orig = n
 	n.SetOp(op)
 	n.Args = args
 	return n
@@ -173,9 +217,9 @@ func (n *CallExpr) SetOp(op Op) {
 	case OAPPEND,
 		OCALL, OCALLFUNC, OCALLINTER, OCALLMETH,
 		ODELETE,
-		OGETG, OGETCALLERPC, OGETCALLERSP,
-		OMAKE, OPRINT, OPRINTN,
-		ORECOVER, ORECOVERFP:
+		OGETG, OGETCALLERSP,
+		OMAKE, OMAX, OMIN, OPRINT, OPRINTLN,
+		ORECOVER:
 		n.op = op
 	}
 }
@@ -192,7 +236,6 @@ type ClosureExpr struct {
 // Before type-checking, the type is Ntype.
 type CompLitExpr struct {
 	miniExpr
-	origNode
 	List     Nodes // initialized values
 	RType    Node  `mknode:"-"` // *runtime._type for OMAPLIT map types
 	Prealloc *Name
@@ -209,7 +252,6 @@ func NewCompLitExpr(pos src.XPos, op Op, typ *types.Type, list []Node) *CompLitE
 	if typ != nil {
 		n.SetType(typ)
 	}
-	n.orig = n
 	return n
 }
 
@@ -224,25 +266,6 @@ func (n *CompLitExpr) SetOp(op Op) {
 		n.op = op
 	}
 }
-
-type ConstExpr struct {
-	miniExpr
-	origNode
-	val constant.Value
-}
-
-func NewConstExpr(val constant.Value, orig Node) Node {
-	n := &ConstExpr{val: val}
-	n.op = OLITERAL
-	n.pos = orig.Pos()
-	n.orig = orig
-	n.SetType(orig.Type())
-	n.SetTypecheck(orig.Typecheck())
-	return n
-}
-
-func (n *ConstExpr) Sym() *types.Sym     { return n.orig.Sym() }
-func (n *ConstExpr) Val() constant.Value { return n.val }
 
 // A ConvExpr is a conversion Type(X).
 // It may end up being a value or a type.
@@ -289,7 +312,7 @@ func (n *ConvExpr) SetOp(op Op) {
 	switch op {
 	default:
 		panic(n.no("SetOp " + op.String()))
-	case OCONV, OCONVIFACE, OCONVIDATA, OCONVNOP, OBYTES2STR, OBYTES2STRTMP, ORUNES2STR, OSTR2BYTES, OSTR2BYTESTMP, OSTR2RUNES, ORUNESTR, OSLICE2ARR, OSLICE2ARRPTR:
+	case OCONV, OCONVIFACE, OCONVNOP, OBYTES2STR, OBYTES2STRTMP, ORUNES2STR, OSTR2BYTES, OSTR2BYTESTMP, OSTR2RUNES, ORUNESTR, OSLICE2ARR, OSLICE2ARRPTR:
 		n.op = op
 	}
 }
@@ -333,7 +356,7 @@ func NewKeyExpr(pos src.XPos, key, value Node) *KeyExpr {
 	return n
 }
 
-// A StructKeyExpr is an Field: Value composite literal key.
+// A StructKeyExpr is a Field: Value composite literal key.
 type StructKeyExpr struct {
 	miniExpr
 	Field *types.Field
@@ -354,6 +377,7 @@ type InlinedCallExpr struct {
 	miniExpr
 	Body       Nodes
 	ReturnVars Nodes // must be side-effect free
+	Reshape    bool
 }
 
 func NewInlinedCallExpr(pos src.XPos, body, retvars []Node) *InlinedCallExpr {
@@ -369,10 +393,16 @@ func (n *InlinedCallExpr) SingleResult() Node {
 	if have := len(n.ReturnVars); have != 1 {
 		base.FatalfAt(n.Pos(), "inlined call has %v results, expected 1", have)
 	}
-	if !n.Type().HasShape() && n.ReturnVars[0].Type().HasShape() {
-		// If the type of the call is not a shape, but the type of the return value
-		// is a shape, we need to do an implicit conversion, so the real type
-		// of n is maintained.
+
+	// If the type of the call is not a shape, but the type of the return value
+	// is a shape, we need to do an implicit conversion, so the real type
+	// of n is maintained.
+	needImplicitConv := !n.Type().HasShape() && n.ReturnVars[0].Type().HasShape()
+	if n.Reshape { // or if the inlined call expr needs reshaping.
+		needImplicitConv = true
+	}
+
+	if needImplicitConv {
 		r := NewConvExpr(n.Pos(), OCONVNOP, n.Type(), n.ReturnVars[0])
 		r.SetTypecheck(1)
 		return r
@@ -380,7 +410,7 @@ func (n *InlinedCallExpr) SingleResult() Node {
 	return n.ReturnVars[0]
 }
 
-// A LogicalExpr is a expression X Op Y where Op is && or ||.
+// A LogicalExpr is an expression X Op Y where Op is && or ||.
 // It is separate from BinaryExpr to make room for statements
 // that must be executed before Y but after X.
 type LogicalExpr struct {
@@ -432,15 +462,19 @@ func (n *MakeExpr) SetOp(op Op) {
 }
 
 // A NilExpr represents the predefined untyped constant nil.
-// (It may be copied and assigned a type, though.)
 type NilExpr struct {
 	miniExpr
 }
 
-func NewNilExpr(pos src.XPos) *NilExpr {
+func NewNilExpr(pos src.XPos, typ *types.Type) *NilExpr {
+	if typ == nil {
+		base.FatalfAt(pos, "missing type")
+	}
 	n := &NilExpr{}
 	n.pos = pos
 	n.op = ONIL
+	n.SetType(typ)
+	n.SetTypecheck(1)
 	return n
 }
 
@@ -460,20 +494,6 @@ func NewParenExpr(pos src.XPos, x Node) *ParenExpr {
 
 func (n *ParenExpr) Implicit() bool     { return n.flags&miniExprImplicit != 0 }
 func (n *ParenExpr) SetImplicit(b bool) { n.flags.set(miniExprImplicit, b) }
-
-// A RawOrigExpr represents an arbitrary Go expression as a string value.
-// When printed in diagnostics, the string value is written out exactly as-is.
-type RawOrigExpr struct {
-	miniExpr
-	Raw string
-}
-
-func NewRawOrigExpr(pos src.XPos, op Op, raw string) *RawOrigExpr {
-	n := &RawOrigExpr{Raw: raw}
-	n.pos = pos
-	n.op = op
-	return n
-}
 
 // A ResultExpr represents a direct access to a result.
 type ResultExpr struct {
@@ -498,9 +518,13 @@ type LinksymOffsetExpr struct {
 }
 
 func NewLinksymOffsetExpr(pos src.XPos, lsym *obj.LSym, offset int64, typ *types.Type) *LinksymOffsetExpr {
+	if typ == nil {
+		base.FatalfAt(pos, "nil type")
+	}
 	n := &LinksymOffsetExpr{Linksym: lsym, Offset_: offset}
 	n.typ = typ
 	n.op = OLINKSYMOFFSET
+	n.SetTypecheck(1)
 	return n
 }
 
@@ -557,14 +581,13 @@ func (n *SelectorExpr) FuncName() *Name {
 	if n.Op() != OMETHEXPR {
 		panic(n.no("FuncName"))
 	}
-	fn := NewNameAt(n.Selection.Pos, MethodSym(n.X.Type(), n.Sel))
+	sym, _ := MethodSym(n.X.Type(), n.Selection)
+	fn := NewNameAt(n.Selection.Pos, sym, n.Type())
 	fn.Class = PFUNC
-	fn.SetType(n.Type())
 	if n.Selection.Nname != nil {
 		// TODO(austin): Nname is nil for interface method
 		// expressions (I.M), so we can't attach a Func to
-		// those here. reflectdata.methodWrapper generates the
-		// Func.
+		// those here.
 		fn.Func = n.Selection.Nname.(*Name).Func
 	}
 	return fn
@@ -608,7 +631,7 @@ func (o Op) IsSlice3() bool {
 	return false
 }
 
-// A SliceHeader expression constructs a slice header from its parts.
+// A SliceHeaderExpr constructs a slice header from its parts.
 type SliceHeaderExpr struct {
 	miniExpr
 	Ptr Node
@@ -656,7 +679,7 @@ func NewStarExpr(pos src.XPos, x Node) *StarExpr {
 func (n *StarExpr) Implicit() bool     { return n.flags&miniExprImplicit != 0 }
 func (n *StarExpr) SetImplicit(b bool) { n.flags.set(miniExprImplicit, b) }
 
-// A TypeAssertionExpr is a selector expression X.(Type).
+// A TypeAssertExpr is a selector expression X.(Type).
 // Before type-checking, the type is Ntype.
 type TypeAssertExpr struct {
 	miniExpr
@@ -665,6 +688,14 @@ type TypeAssertExpr struct {
 	// Runtime type information provided by walkDotType for
 	// assertions from non-empty interface to concrete type.
 	ITab Node `mknode:"-"` // *runtime.itab for Type implementing X's type
+
+	// An internal/abi.TypeAssert descriptor to pass to the runtime.
+	Descriptor *obj.LSym
+
+	// When set to true, if this assert would panic, then use a nil pointer panic
+	// instead of an interface conversion panic.
+	// It must not be set for type assertions using the commaok form.
+	UseNilPanic bool
 }
 
 func NewTypeAssertExpr(pos src.XPos, x Node, typ *types.Type) *TypeAssertExpr {
@@ -747,31 +778,11 @@ func (n *UnaryExpr) SetOp(op Op) {
 	default:
 		panic(n.no("SetOp " + op.String()))
 	case OBITNOT, ONEG, ONOT, OPLUS, ORECV,
-		OALIGNOF, OCAP, OCLOSE, OIMAG, OLEN, ONEW,
-		OOFFSETOF, OPANIC, OREAL, OSIZEOF,
+		OCAP, OCLEAR, OCLOSE, OIMAG, OLEN, ONEW, OPANIC, OREAL,
 		OCHECKNIL, OCFUNC, OIDATA, OITAB, OSPTR,
 		OUNSAFESTRINGDATA, OUNSAFESLICEDATA:
 		n.op = op
 	}
-}
-
-// Probably temporary: using Implicit() flag to mark generic function nodes that
-// are called to make getGfInfo analysis easier in one pre-order pass.
-func (n *InstExpr) Implicit() bool     { return n.flags&miniExprImplicit != 0 }
-func (n *InstExpr) SetImplicit(b bool) { n.flags.set(miniExprImplicit, b) }
-
-// An InstExpr is a generic function or type instantiation.
-type InstExpr struct {
-	miniExpr
-	X     Node
-	Targs []Ntype
-}
-
-func NewInstExpr(pos src.XPos, op Op, x Node, targs []Ntype) *InstExpr {
-	n := &InstExpr{X: x, Targs: targs}
-	n.pos = pos
-	n.op = op
-	return n
 }
 
 func IsZero(n Node) bool {
@@ -848,15 +859,39 @@ func IsAddressable(n Node) bool {
 	return false
 }
 
+// StaticValue analyzes n to find the earliest expression that always
+// evaluates to the same value as n, which might be from an enclosing
+// function.
+//
+// For example, given:
+//
+//	var x int = g()
+//	func() {
+//		y := x
+//		*p = int(y)
+//	}
+//
+// calling StaticValue on the "int(y)" expression returns the outer
+// "g()" expression.
+//
+// NOTE: StaticValue can return a result with a different type than
+// n's type because it can traverse through OCONVNOP operations.
+// TODO: consider reapplying OCONVNOP operations to the result. See https://go.dev/cl/676517.
 func StaticValue(n Node) Node {
 	for {
-		if n.Op() == OCONVNOP {
-			n = n.(*ConvExpr).X
-			continue
-		}
-
-		if n.Op() == OINLCALL {
-			n = n.(*InlinedCallExpr).SingleResult()
+		switch n1 := n.(type) {
+		case *ConvExpr:
+			if n1.Op() == OCONVNOP {
+				n = n1.X
+				continue
+			}
+		case *InlinedCallExpr:
+			if n1.Op() == OINLCALL {
+				n = n1.SingleResult()
+				continue
+			}
+		case *ParenExpr:
+			n = n1.X
 			continue
 		}
 
@@ -868,14 +903,11 @@ func StaticValue(n Node) Node {
 	}
 }
 
-// staticValue1 implements a simple SSA-like optimization. If n is a local variable
-// that is initialized and never reassigned, staticValue1 returns the initializer
-// expression. Otherwise, it returns nil.
 func staticValue1(nn Node) Node {
 	if nn.Op() != ONAME {
 		return nil
 	}
-	n := nn.(*Name)
+	n := nn.(*Name).Canonical()
 	if n.Class != PAUTO {
 		return nil
 	}
@@ -899,28 +931,33 @@ FindRHS:
 				break FindRHS
 			}
 		}
-		base.Fatalf("%v missing from LHS of %v", n, defn)
+		base.FatalfAt(defn.Pos(), "%v missing from LHS of %v", n, defn)
 	default:
 		return nil
 	}
 	if rhs == nil {
-		base.Fatalf("RHS is nil: %v", defn)
+		if n.AutoTemp() {
+			return nil
+		}
+		base.FatalfAt(defn.Pos(), "RHS is nil: %v", defn)
 	}
 
-	if reassigned(n) {
+	if Reassigned(n) {
 		return nil
 	}
 
 	return rhs
 }
 
-// reassigned takes an ONAME node, walks the function in which it is defined, and returns a boolean
-// indicating whether the name has any assignments other than its declaration.
-// The second return value is the first such assignment encountered in the walk, if any. It is mostly
-// useful for -m output documenting the reason for inhibited optimizations.
+// Reassigned takes an ONAME node, walks the function in which it is
+// defined, and returns a boolean indicating whether the name has any
+// assignments other than its declaration.
 // NB: global variables are always considered to be re-assigned.
-// TODO: handle initial declaration not including an assignment and followed by a single assignment?
-func reassigned(name *Name) bool {
+// TODO: handle initial declaration not including an assignment and
+// followed by a single assignment?
+// NOTE: any changes made here should also be made in the corresponding
+// code in the ReassignOracle.Init method.
+func Reassigned(name *Name) bool {
 	if name.Op() != ONAME {
 		base.Fatalf("reassigned %v", name)
 	}
@@ -929,13 +966,20 @@ func reassigned(name *Name) bool {
 		return true
 	}
 
+	if name.Addrtaken() {
+		return true // conservatively assume it's reassigned indirectly
+	}
+
 	// TODO(mdempsky): This is inefficient and becoming increasingly
 	// unwieldy. Figure out a way to generalize escape analysis's
 	// reassignment detection for use by inlining and devirtualization.
 
 	// isName reports whether n is a reference to name.
 	isName := func(x Node) bool {
-		n, ok := x.(*Name)
+		if x == nil {
+			return false
+		}
+		n, ok := OuterValue(x).(*Name)
 		return ok && n.Canonical() == name
 	}
 
@@ -954,9 +998,19 @@ func reassigned(name *Name) bool {
 					return true
 				}
 			}
+		case OASOP:
+			n := n.(*AssignOpStmt)
+			if isName(n.X) {
+				return true
+			}
 		case OADDR:
 			n := n.(*AddrExpr)
-			if isName(OuterValue(n.X)) {
+			if isName(n.X) {
+				base.FatalfAt(n.Pos(), "%v not marked addrtaken", name)
+			}
+		case ORANGE:
+			n := n.(*RangeStmt)
+			if isName(n.Key) || isName(n.Value) {
 				return true
 			}
 		case OCLOSURE:
@@ -970,8 +1024,28 @@ func reassigned(name *Name) bool {
 	return Any(name.Curfn, do)
 }
 
+// StaticCalleeName returns the ONAME/PFUNC for n, if known.
+func StaticCalleeName(n Node) *Name {
+	switch n.Op() {
+	case OMETHEXPR:
+		n := n.(*SelectorExpr)
+		return MethodExprName(n)
+	case ONAME:
+		n := n.(*Name)
+		if n.Class == PFUNC {
+			return n
+		}
+	case OCLOSURE:
+		return n.(*ClosureExpr).Func.Nname
+	}
+	return nil
+}
+
 // IsIntrinsicCall reports whether the compiler back end will treat the call as an intrinsic operation.
 var IsIntrinsicCall = func(*CallExpr) bool { return false }
+
+// IsIntrinsicSym reports whether the compiler back end will treat a call to this symbol as an intrinsic operation.
+var IsIntrinsicSym = func(*types.Sym) bool { return false }
 
 // SameSafeExpr checks whether it is safe to reuse one of l and r
 // instead of computing both. SameSafeExpr assumes that l and r are
@@ -1085,30 +1159,76 @@ func IsReflectHeaderDataField(l Node) bool {
 
 func ParamNames(ft *types.Type) []Node {
 	args := make([]Node, ft.NumParams())
-	for i, f := range ft.Params().FieldSlice() {
-		args[i] = AsNode(f.Nname)
+	for i, f := range ft.Params() {
+		args[i] = f.Nname.(*Name)
 	}
 	return args
 }
 
-// MethodSym returns the method symbol representing a method name
-// associated with a specific receiver type.
-//
-// Method symbols can be used to distinguish the same method appearing
-// in different method sets. For example, T.M and (*T).M have distinct
-// method symbols.
-//
-// The returned symbol will be marked as a function.
-func MethodSym(recv *types.Type, msym *types.Sym) *types.Sym {
-	sym := MethodSymSuffix(recv, msym, "")
+func RecvParamNames(ft *types.Type) []Node {
+	args := make([]Node, ft.NumRecvs()+ft.NumParams())
+	for i, f := range ft.RecvParams() {
+		args[i] = f.Nname.(*Name)
+	}
+	return args
+}
+
+// MethodSym returns the method function symbol for recv. The second result
+// reports whether the symbol is a shared promoted wrapper.
+func MethodSym(recv *types.Type, method *types.Field) (*types.Sym, bool) {
+	if method.Embedded == 1 && recv.IsPtr() && method.Offset != types.BADWIDTH {
+		wrappee := method.Type.Recv().Type
+		return promotedWrapperSym(recv, wrappee, method.Sym, method.Offset), true
+	}
+	return ReceiverMethodSym(recv, method.Sym), false
+}
+
+// ReceiverMethodSym returns the receiver-named method function symbol.
+func ReceiverMethodSym(recv *types.Type, msym *types.Sym) *types.Sym {
+	sym := ReceiverMethodSymSuffix(recv, msym, "")
 	sym.SetFunc(true)
 	return sym
 }
 
-// MethodSymSuffix is like methodsym, but allows attaching a
-// distinguisher suffix. To avoid collisions, the suffix must not
-// start with a letter, number, or period.
-func MethodSymSuffix(recv *types.Type, msym *types.Sym, suffix string) *types.Sym {
+// promotedWrapperSym returns the symbol for a shared promoted method wrapper
+// that adjusts its pointer receiver by offset before calling msym on wrappee.
+func promotedWrapperSym(wrapper, wrappee *types.Type, msym *types.Sym, offset int64) *types.Sym {
+	if msym.IsBlank() {
+		base.Fatalf("blank method name")
+	}
+
+	// derefs == 0: T; not shared because its ABI depends on the concrete T.
+	// derefs == 1: *T; used for pointer-shaped receivers.
+	// derefs == 2: **T; used for not-in-heap T, where *T is scalar-shaped.
+	derefs := 0
+	for t := wrapper; t.IsPtr(); t = t.Elem() {
+		derefs++
+	}
+
+	// Pointers to not-in-heap types are scalar-shaped and use a different
+	// receiver pointer map from ordinary pointers.
+	recvMode := ""
+	if wrapper.Elem().NotInHeap() {
+		recvMode = "n"
+	}
+
+	wrappeeMethod := ReceiverMethodSym(wrappee, msym)
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, ".embed.%d%s.%d.", derefs, recvMode, offset)
+	b.WriteString(wrappeeMethod.Pkg.Prefix)
+	b.WriteString(".")
+	b.WriteString(wrappeeMethod.Name)
+
+	sym := wrappeeMethod.Pkg.LookupBytes(b.Bytes())
+	sym.SetFunc(true)
+	return sym
+}
+
+// ReceiverMethodSymSuffix is like ReceiverMethodSym, but allows attaching a
+// distinguisher suffix. To avoid collisions, the suffix must not start with a
+// letter, number, or period.
+func ReceiverMethodSymSuffix(recv *types.Type, msym *types.Sym, suffix string) *types.Sym {
 	if msym.IsBlank() {
 		base.Fatalf("blank method name")
 	}
@@ -1153,6 +1273,51 @@ func MethodSymSuffix(recv *types.Type, msym *types.Sym, suffix string) *types.Sy
 	return rpkg.LookupBytes(b.Bytes())
 }
 
+// LookupMethodSelector returns the types.Sym of the selector for a method
+// named in local symbol name, as well as the types.Sym of the receiver.
+//
+// TODO(prattmic): this does not attempt to handle method suffixes (wrappers).
+func LookupMethodSelector(pkg *types.Pkg, name string) (typ, meth *types.Sym, err error) {
+	typeName, methName := splitType(name)
+	if typeName == "" {
+		return nil, nil, fmt.Errorf("%s doesn't contain type split", name)
+	}
+
+	if len(typeName) > 3 && typeName[:2] == "(*" && typeName[len(typeName)-1] == ')' {
+		// Symbol name is for a pointer receiver method. We just want
+		// the base type name.
+		typeName = typeName[2 : len(typeName)-1]
+	}
+
+	typ = pkg.Lookup(typeName)
+	meth = pkg.Selector(methName)
+	return typ, meth, nil
+}
+
+// splitType splits a local symbol name into type and method (fn). If this a
+// free function, typ == "".
+//
+// N.B. closures and methods can be ambiguous (e.g., bar.func1). These cases
+// are returned as methods.
+func splitType(name string) (typ, fn string) {
+	// Types are split on the first dot, ignoring everything inside
+	// brackets (instantiation of type parameter, usually including
+	// "go.shape").
+	bracket := 0
+	for i, r := range name {
+		if r == '.' && bracket == 0 {
+			return name[:i], name[i+1:]
+		}
+		if r == '[' {
+			bracket++
+		}
+		if r == ']' {
+			bracket--
+		}
+	}
+	return "", name
+}
+
 // MethodExprName returns the ONAME representing the method
 // referenced by expression n, which must be a method selector,
 // method expression, or method value.
@@ -1169,4 +1334,118 @@ func MethodExprFunc(n Node) *types.Field {
 	}
 	base.Fatalf("unexpected node: %v (%v)", n, n.Op())
 	panic("unreachable")
+}
+
+// A MoveToHeapExpr takes a slice as input and moves it to the
+// heap (by copying the backing store if it is not already
+// on the heap).
+type MoveToHeapExpr struct {
+	miniExpr
+	Slice Node
+	// An expression that evaluates to a *runtime._type
+	// that represents the slice element type.
+	RType Node
+	// If PreserveCapacity is true, the capacity of
+	// the resulting slice, and all of the elements in
+	// [len:cap], must be preserved.
+	// If PreserveCapacity is false, the resulting
+	// slice may have any capacity >= len, with any
+	// elements in the resulting [len:cap] range zeroed.
+	PreserveCapacity bool
+}
+
+func NewMoveToHeapExpr(pos src.XPos, slice Node) *MoveToHeapExpr {
+	n := &MoveToHeapExpr{Slice: slice}
+	n.pos = pos
+	n.op = OMOVE2HEAP
+	return n
+}
+
+func IsSideEffect(n Node) bool {
+	switch n.Op() {
+	// Assume side effects unless we know otherwise.
+	default:
+		return true
+
+	// No side effects here (arguments are checked separately).
+	case ONAME,
+		ONONAME,
+		OTYPE,
+		OLITERAL,
+		ONIL,
+		OADD,
+		OSUB,
+		OOR,
+		OXOR,
+		OADDSTR,
+		OADDR,
+		OANDAND,
+		OBYTES2STR,
+		ORUNES2STR,
+		OSTR2BYTES,
+		OSTR2RUNES,
+		OCAP,
+		OCOMPLIT,
+		OMAPLIT,
+		OSTRUCTLIT,
+		OARRAYLIT,
+		OSLICELIT,
+		OPTRLIT,
+		OCONV,
+		OCONVIFACE,
+		OCONVNOP,
+		ODOT,
+		OEQ,
+		ONE,
+		OLT,
+		OLE,
+		OGT,
+		OGE,
+		OKEY,
+		OSTRUCTKEY,
+		OLEN,
+		OMUL,
+		OLSH,
+		ORSH,
+		OAND,
+		OANDNOT,
+		ONEW,
+		ONOT,
+		OBITNOT,
+		OPLUS,
+		ONEG,
+		OOROR,
+		OPAREN,
+		ORUNESTR,
+		OREAL,
+		OIMAG,
+		OCOMPLEX:
+		return false
+
+	// Only possible side effect is division by zero.
+	case ODIV, OMOD:
+		n := n.(*BinaryExpr)
+		if n.Y.Op() != OLITERAL || constant.Sign(n.Y.Val()) == 0 {
+			return true
+		}
+
+	// Only possible side effect is panic on invalid size,
+	// but many makechan and makemap use size zero, which is definitely OK.
+	case OMAKECHAN, OMAKEMAP:
+		n := n.(*MakeExpr)
+		if !IsConst(n.Len, constant.Int) || constant.Sign(n.Len.Val()) != 0 {
+			return true
+		}
+
+	// Only possible side effect is panic on invalid size.
+	// TODO(rsc): Merge with previous case (probably breaks toolstash -cmp).
+	case OMAKESLICE, OMAKESLICECOPY:
+		return true
+	}
+	return false
+}
+
+// AnySideEffects reports whether n contains any operations that could have observable side effects.
+func AnySideEffects(n Node) bool {
+	return Any(n, IsSideEffect)
 }

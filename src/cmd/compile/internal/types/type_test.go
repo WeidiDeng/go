@@ -5,8 +5,89 @@
 package types
 
 import (
+	"bytes"
+	"fmt"
+	"strings"
 	"testing"
+
+	"cmd/internal/src"
 )
+
+// testTypeName is a minimal types.Object for NewNamed in tests.
+type testTypeName struct {
+	sym *Sym
+}
+
+func (o *testTypeName) Sym() *Sym     { return o.sym }
+func (o *testTypeName) Pos() src.XPos { return src.NoXPos }
+func (o *testTypeName) Type() *Type   { return nil }
+
+// If the printer mistakenly switches to fmtTypeID while formatting an
+// unexported interface method name, the method's signature is then
+// printed in fmtTypeID as well, so package-local names use Pkg.Prefix
+// (import path) instead of Pkg.Name. Regression test for that mistake.
+func TestFormatInterfaceUnexportedMethodUsesGoModeForSignature(t *testing.T) {
+	oldLocal := LocalPkg
+	oldPtr, oldReg, oldMax := PtrSize, RegSize, MaxWidth
+	t.Cleanup(func() {
+		LocalPkg = oldLocal
+		PtrSize, RegSize, MaxWidth = oldPtr, oldReg, oldMax
+	})
+	LocalPkg = NewPkg("main", "main")
+	PtrSize = 8
+	RegSize = 8
+	MaxWidth = 1 << 50
+
+	lib := NewPkg("example.com/lib", "lib")
+	namedT := NewNamed(&testTypeName{sym: lib.Lookup("T")})
+	// Underlying must not rely on Types[…]; InitTypes is not run in this package's tests.
+	namedT.SetUnderlying(NewStruct(nil))
+
+	sig := NewSignature(nil, nil, []*Field{NewField(src.NoXPos, nil, namedT)})
+	iface := NewInterface([]*Field{NewField(src.NoXPos, LocalPkg.Lookup("unexported"), sig)})
+	CalcSize(iface) // populate interface method set for printing (expandiface)
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%v", iface)
+	got := buf.String()
+	// Go syntax should qualify T with the package name, not the linker prefix / path.
+	const want = "lib.T"
+	if !strings.Contains(got, want) {
+		t.Fatalf("formatted type missing %q:\n%s", want, got)
+	}
+	// Stale fmtTypeID mode used Prefix ("example.com/lib") instead of Name ("lib").
+	if strings.Contains(got, "example.com/lib.T") {
+		t.Fatalf("formatted type should not use import path to qualify T (found example.com/lib.T):\n%s", got)
+	}
+}
+
+func TestCopyTFlagFrom(t *testing.T) {
+	oldPtr, oldReg, oldMax := PtrSize, RegSize, MaxWidth
+	t.Cleanup(func() {
+		PtrSize, RegSize, MaxWidth = oldPtr, oldReg, oldMax
+	})
+	PtrSize = 8
+	RegSize = 8
+	MaxWidth = 1 << 50
+
+	src := NewStruct(nil)
+	dst := NewStruct(nil)
+	CalcSize(src)
+	CalcSize(dst)
+	src.SetMethodsComputed(true)
+	src.TFlag()
+
+	dst.CopyTFlagFrom(src)
+	if dst.MethodsComputed() {
+		t.Fatal("CopyTFlagFrom copied method-set state")
+	}
+	if !dst.TFlagComputed() {
+		t.Fatal("CopyTFlagFrom did not make TFlag available")
+	}
+	if got, want := dst.TFlag(), src.TFlag(); got != want {
+		t.Fatalf("copied TFlag = %v, want %v", got, want)
+	}
+}
 
 func TestSSACompare(t *testing.T) {
 	a := []*Type{
@@ -22,6 +103,67 @@ func TestSSACompare(t *testing.T) {
 			if x == y && c != CMPeq || x != y && c == CMPeq {
 				t.Errorf("%s compare %s == %d\n", x.extra, y.extra, c)
 			}
+		}
+	}
+}
+
+func TestLinkString(t *testing.T) {
+	oldLocal := LocalPkg
+	oldPtr, oldReg, oldMax := PtrSize, RegSize, MaxWidth
+	t.Cleanup(func() {
+		LocalPkg = oldLocal
+		PtrSize, RegSize, MaxWidth = oldPtr, oldReg, oldMax
+	})
+	LocalPkg = NewPkg("main", "main")
+	PtrSize = 8
+	RegSize = 8
+	MaxWidth = 1 << 50
+
+	lib := NewPkg("example.com/some/very/long/package/path/lib", "lib")
+	namedT := NewNamed(&testTypeName{sym: lib.Lookup("ExportedFieldType")})
+	namedT.SetUnderlying(NewStruct(nil))
+
+	makeFields := func() []*Field {
+		var fields []*Field
+		for i := range 15 {
+			f := NewField(src.NoXPos, lib.Lookup(fmt.Sprintf("Field%d", i)), namedT)
+			f.Note = fmt.Sprintf(`protobuf:"bytes,%d,opt,name=field_%d,proto3"`, i, i)
+			fields = append(fields, f)
+		}
+		return fields
+	}
+
+	s1 := NewStruct(makeFields())
+	s2 := NewStruct(makeFields())
+
+	for _, tc := range []struct {
+		name string
+		fn   func(*Type) string
+	}{
+		{"LinkString", (*Type).LinkString},
+	} {
+		str1 := tc.fn(s1)
+		str2 := tc.fn(s2)
+
+		if len(str1) != 64 {
+			t.Fatalf("len(s1.%s()) = %d, want 64 (got %q)", tc.name, len(str1), str1)
+		}
+		if str1 != str2 {
+			t.Fatalf("identical unnamed structs got different %ss: %q vs %q", tc.name, str1, str2)
+		}
+
+		if allocs := testing.AllocsPerRun(100, func() {
+			_ = tc.fn(s1)
+		}); allocs != 0 {
+			t.Fatalf("repeated %s() allocated %v times, want 0", tc.name, allocs)
+		}
+
+		// Named types with long names should not be hashed.
+		longName := strings.Repeat("LongTypeName", 50)
+		longNamed := NewNamed(&testTypeName{sym: lib.Lookup(longName)})
+		longNamed.SetUnderlying(NewStruct(nil))
+		if got := tc.fn(longNamed); !strings.HasSuffix(got, "."+longName) {
+			t.Fatalf("named type %s() = %q, want suffix .%s", tc.name, got, longName)
 		}
 	}
 }

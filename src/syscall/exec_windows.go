@@ -9,11 +9,13 @@ package syscall
 import (
 	"internal/bytealg"
 	"runtime"
+	"slices"
 	"sync"
 	"unicode/utf16"
 	"unsafe"
 )
 
+// ForkLock is not used on Windows.
 var ForkLock sync.RWMutex
 
 // EscapeArg rewrites command line argument s as prescribed
@@ -112,16 +114,65 @@ func makeCmdLine(args []string) string {
 	return string(b)
 }
 
+func envSorted(envv []string) []string {
+	if len(envv) < 2 {
+		return envv
+	}
+
+	lowerKeyCache := map[string][]byte{} // lowercased keys to avoid recomputing them in sort
+	lowerKey := func(kv string) []byte {
+		eq := bytealg.IndexByteString(kv, '=')
+		if eq < 0 {
+			return nil
+		}
+		k := kv[:eq]
+		v, ok := lowerKeyCache[k]
+		if !ok {
+			v = []byte(k)
+			for i, b := range v {
+				// We only normalize ASCII for now.
+				// In practice, all environment variables are ASCII, and the
+				// syscall package can't import "unicode" anyway.
+				// Also, per https://nullprogram.com/blog/2023/08/23/ the
+				// sorting of environment variables doesn't really matter.
+				// TODO(bradfitz): use RtlCompareUnicodeString instead,
+				// per that blog post? For now, ASCII is good enough.
+				if 'a' <= b && b <= 'z' {
+					v[i] -= 'a' - 'A'
+				}
+			}
+			lowerKeyCache[k] = v
+		}
+		return v
+	}
+
+	cmpEnv := func(a, b string) int {
+		return bytealg.Compare(lowerKey(a), lowerKey(b))
+	}
+
+	if !slices.IsSortedFunc(envv, cmpEnv) {
+		envv = slices.Clone(envv)
+		slices.SortFunc(envv, cmpEnv)
+	}
+	return envv
+}
+
 // createEnvBlock converts an array of environment strings into
 // the representation required by CreateProcess: a sequence of NUL
 // terminated strings followed by a nil.
 // Last bytes are two UCS-2 NULs, or four NUL bytes.
 // If any string contains a NUL, it returns (nil, EINVAL).
-func createEnvBlock(envv []string) (*uint16, error) {
+func createEnvBlock(envv []string) ([]uint16, error) {
 	if len(envv) == 0 {
-		return &utf16.Encode([]rune("\x00\x00"))[0], nil
+		return utf16.Encode([]rune("\x00\x00")), nil
 	}
-	length := 0
+
+	// https://learn.microsoft.com/en-us/windows/win32/procthread/changing-environment-variables
+	// says that: "All strings in the environment block must be sorted
+	// alphabetically by name."
+	envv = envSorted(envv)
+
+	var length int
 	for _, s := range envv {
 		if bytealg.IndexByteString(s, 0) != -1 {
 			return nil, EINVAL
@@ -130,17 +181,15 @@ func createEnvBlock(envv []string) (*uint16, error) {
 	}
 	length += 1
 
-	b := make([]byte, length)
-	i := 0
+	b := make([]uint16, 0, length)
 	for _, s := range envv {
-		l := len(s)
-		copy(b[i:i+l], []byte(s))
-		copy(b[i+l:i+l+1], []byte{0})
-		i = i + l + 1
+		for _, c := range s {
+			b = utf16.AppendRune(b, c)
+		}
+		b = utf16.AppendRune(b, 0)
 	}
-	copy(b[i:i+1], []byte{0})
-
-	return &utf16.Encode([]rune(string(b)))[0], nil
+	b = utf16.AppendRune(b, 0)
+	return b, nil
 }
 
 func CloseOnExec(fd Handle) {
@@ -240,6 +289,8 @@ type ProcAttr struct {
 	Sys   *SysProcAttr
 }
 
+// TODO: add Sandbox to SysProcAttr - see https://github.com/golang/go/issues/80415#issuecomment-5106006695 for details
+
 type SysProcAttr struct {
 	HideWindow                 bool
 	CmdLine                    string // used if non-empty, else the windows command line is built by escaping the arguments passed to StartProcess
@@ -247,9 +298,21 @@ type SysProcAttr struct {
 	Token                      Token               // if set, runs new process in the security context represented by the token
 	ProcessAttributes          *SecurityAttributes // if set, applies these security attributes as the descriptor for the new process
 	ThreadAttributes           *SecurityAttributes // if set, applies these security attributes as the descriptor for the main thread of the new process
-	NoInheritHandles           bool                // if set, each inheritable handle in the calling process is not inherited by the new process
+	NoInheritHandles           bool                // if set, no handles are inherited by the new process, not even the standard handles, contained in ProcAttr.Files, nor the ones contained in AdditionalInheritedHandles
 	AdditionalInheritedHandles []Handle            // a list of additional handles, already marked as inheritable, that will be inherited by the new process
 	ParentProcess              Handle              // if non-zero, the new process regards the process given by this handle as its parent process, and AdditionalInheritedHandles, if set, should exist in this parent process
+	Jobs                       []Handle            // if non-empty, start the process with this job object list
+	Console                    Handle              // if non-zero, start the process connected to this console
+	Desktop                    string              // if non-empty, start the process on the named desktop
+	AppContainer               *AppContainer       // if non-nil, create AppContainer process with this metadata
+}
+
+// An AppContainer defines parameters for creating a process in an AppContainer.
+// It is a safe Go version of the Windows SECURITY_CAPABILITIES structure.
+// See https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-security_capabilities.
+type AppContainer struct {
+	SID          *SID
+	Capabilities []SIDAndAttributes
 }
 
 var zeroProcAttr ProcAttr
@@ -287,9 +350,35 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 			return 0, 0, err
 		}
 	}
-	argv0p, err := UTF16PtrFromString(argv0)
-	if err != nil {
-		return 0, 0, err
+	var argv0p *uint16
+	isBat := false
+	if sys.CmdLine == "" && hasBatchExtension(argv0) {
+		resolved, err := FullPath(argv0)
+		if err != nil {
+			return 0, 0, err
+		}
+		// Avoid rewriting argv[0] if the resolved path contains '%' or '!',
+		// which cmd.exe could expand as environment variables. Also check
+		// GetBinaryTypeW to ensure the file is not an executable binary
+		// with a .bat or .cmd extension.
+		if bytealg.IndexByteString(resolved, '%') == -1 && bytealg.IndexByteString(resolved, '!') == -1 {
+			resolvedp, err := UTF16PtrFromString(resolved)
+			if err != nil {
+				return 0, 0, err
+			}
+			var binaryType uint32
+			if getBinaryType(resolvedp, &binaryType) == _ERROR_BAD_EXE_FORMAT {
+				isBat = true
+				argv0 = resolved
+				argv0p = resolvedp
+			}
+		}
+	}
+	if argv0p == nil {
+		argv0p, err = UTF16PtrFromString(argv0)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 
 	var cmdline string
@@ -298,6 +387,34 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	// and joining each argument with spaces
 	if sys.CmdLine != "" {
 		cmdline = sys.CmdLine
+	} else if isBat {
+		// For .bat and .cmd files, Windows CreateProcess implicitly invokes
+		// cmd.exe /c <cmdline>, ignoring lpApplicationName (argv0) when
+		// resolving the script to execute. Replace argv[0] with argv0 so
+		// cmd.exe runs the resolved script rather than re-resolving argv[0]
+		// against Dir and PATH.
+		//
+		// We wrap argv0 in quotes (in case it contains spaces or cmd.exe
+		// metacharacters like '&' or '()') and wrap the entire command line
+		// in an outer pair of quotes. When cmd.exe processes /c without /s,
+		// if the command line starts with a quote and contains more than two
+		// quotes, cmd.exe strips the first and last quote characters on the
+		// command line, leaving `"argv0" args...` intact.
+		if bytealg.IndexByteString(argv0, '"') != -1 {
+			return 0, 0, EINVAL
+		}
+		var b []byte
+		b = append(b, '"', '"')
+		b = append(b, argv0...)
+		b = append(b, '"')
+		if len(argv) > 1 {
+			for _, v := range argv[1:] {
+				b = append(b, ' ')
+				b = appendEscapeArg(b, v)
+			}
+		}
+		b = append(b, '"')
+		cmdline = string(b)
 	} else {
 		cmdline = makeCmdLine(argv)
 	}
@@ -318,17 +435,6 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 		}
 	}
 
-	var maj, min, build uint32
-	rtlGetNtVersionNumbers(&maj, &min, &build)
-	isWin7 := maj < 6 || (maj == 6 && min <= 1)
-	// NT kernel handles are divisible by 4, with the bottom 3 bits left as
-	// a tag. The fully set tag correlates with the types of handles we're
-	// concerned about here.  Except, the kernel will interpret some
-	// special handle values, like -1, -2, and so forth, so kernelbase.dll
-	// checks to see that those bottom three bits are checked, but that top
-	// bit is not checked.
-	isLegacyWin7ConsoleHandle := func(handle Handle) bool { return isWin7 && handle&0x10000003 == 3 }
-
 	p, _ := GetCurrentProcess()
 	parentProcess := p
 	if sys.ParentProcess != 0 {
@@ -336,28 +442,25 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	}
 	fd := make([]Handle, len(attr.Files))
 	for i := range attr.Files {
-		if attr.Files[i] > 0 {
-			destinationProcessHandle := parentProcess
-
-			// On Windows 7, console handles aren't real handles, and can only be duplicated
-			// into the current process, not a parent one, which amounts to the same thing.
-			if parentProcess != p && isLegacyWin7ConsoleHandle(Handle(attr.Files[i])) {
-				destinationProcessHandle = p
-			}
-
-			err := DuplicateHandle(p, Handle(attr.Files[i]), destinationProcessHandle, &fd[i], 0, true, DUPLICATE_SAME_ACCESS)
+		// If sys.Console is set, must not pass handles for StdInput, StdOutput, StdErr.
+		// To avoid os/exec needing to know this, we just ignore the actual files passed when sys.Console != 0.
+		if sys.Console == 0 && attr.Files[i] > 0 {
+			err := DuplicateHandle(p, Handle(attr.Files[i]), parentProcess, &fd[i], 0, true, DUPLICATE_SAME_ACCESS)
 			if err != nil {
 				return 0, 0, err
 			}
 			defer DuplicateHandle(parentProcess, fd[i], 0, nil, 0, false, DUPLICATE_CLOSE_SOURCE)
 		}
 	}
-	si := new(_STARTUPINFOEXW)
-	si.ProcThreadAttributeList, err = newProcThreadAttributeList(2)
+
+	// Note: process attributes are documented at
+	// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+	procAttrList, err := newProcThreadAttributeList(10)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer deleteProcThreadAttributeList(si.ProcThreadAttributeList)
+	defer procAttrList.delete()
+	si := new(_STARTUPINFOEXW)
 	si.Cb = uint32(unsafe.Sizeof(*si))
 	si.Flags = STARTF_USESTDHANDLES
 	if sys.HideWindow {
@@ -365,7 +468,7 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 		si.ShowWindow = SW_HIDE
 	}
 	if sys.ParentProcess != 0 {
-		err = updateProcThreadAttribute(si.ProcThreadAttributeList, 0, _PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, unsafe.Pointer(&sys.ParentProcess), unsafe.Sizeof(sys.ParentProcess), nil, nil)
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, unsafe.Pointer(&sys.ParentProcess), unsafe.Sizeof(sys.ParentProcess))
 		if err != nil {
 			return 0, 0, err
 		}
@@ -375,14 +478,6 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	si.StdErr = fd[2]
 
 	fd = append(fd, sys.AdditionalInheritedHandles...)
-
-	// On Windows 7, console handles aren't real handles, so don't pass them
-	// through to PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
-	for i := range fd {
-		if isLegacyWin7ConsoleHandle(fd[i]) {
-			fd[i] = 0
-		}
-	}
 
 	// The presence of a NULL handle in the list is enough to cause PROC_THREAD_ATTRIBUTE_HANDLE_LIST
 	// to treat the entire list as empty, so remove NULL handles.
@@ -399,7 +494,7 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 
 	// Do not accidentally inherit more than these handles.
 	if willInheritHandles {
-		err = updateProcThreadAttribute(si.ProcThreadAttributeList, 0, _PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&fd[0]), uintptr(len(fd))*unsafe.Sizeof(fd[0]), nil, nil)
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&fd[0]), uintptr(len(fd))*unsafe.Sizeof(fd[0]))
 		if err != nil {
 			return 0, 0, err
 		}
@@ -410,12 +505,48 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 		return 0, 0, err
 	}
 
+	if len(sys.Jobs) > 0 {
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_JOB_LIST, unsafe.Pointer(unsafe.SliceData(sys.Jobs)), uintptr(len(sys.Jobs))*unsafe.Sizeof(Handle(0)))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if sys.Console != 0 {
+		// Note: You'd expect this to be &sys.Console, but sys.Console is correct.
+		// Windows APIs are not always consistent!
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(sys.Console), unsafe.Sizeof(sys.Console))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if sys.Desktop != "" {
+		wdesk, err := UTF16PtrFromString(sys.Desktop)
+		if err != nil {
+			return 0, 0, err
+		}
+		si.Desktop = wdesk
+	}
+
+	if app := sys.AppContainer; app != nil {
+		var sc _SECURITY_CAPABILITIES
+		sc.AppContainerSid = app.SID
+		sc.Capabilities = unsafe.Pointer(unsafe.SliceData(app.Capabilities))
+		sc.CapabilityCount = uint32(len(app.Capabilities))
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, unsafe.Pointer(&sc), unsafe.Sizeof(sc))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	si.ProcThreadAttributeList = procAttrList.list()
 	pi := new(ProcessInformation)
 	flags := sys.CreationFlags | CREATE_UNICODE_ENVIRONMENT | _EXTENDED_STARTUPINFO_PRESENT
 	if sys.Token != 0 {
-		err = CreateProcessAsUser(sys.Token, argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, envBlock, dirp, &si.StartupInfo, pi)
+		err = CreateProcessAsUser(sys.Token, argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, &envBlock[0], dirp, &si.StartupInfo, pi)
 	} else {
-		err = CreateProcess(argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, envBlock, dirp, &si.StartupInfo, pi)
+		err = CreateProcess(argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, &envBlock[0], dirp, &si.StartupInfo, pi)
 	}
 	if err != nil {
 		return 0, 0, err
@@ -425,6 +556,45 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	runtime.KeepAlive(sys)
 
 	return int(pi.ProcessId), uintptr(pi.Process), nil
+}
+
+// hasBatchExtension reports whether path has a .bat or .cmd extension
+// (ignoring any trailing spaces or dots, which Windows strips).
+func hasBatchExtension(path string) bool {
+	for len(path) > 0 && (path[len(path)-1] == ' ' || path[len(path)-1] == '.') {
+		path = path[:len(path)-1]
+	}
+	if len(path) < 4 {
+		return false
+	}
+	ext := path[len(path)-4:]
+	return asciiEqualFold(ext, ".bat") || asciiEqualFold(ext, ".cmd")
+}
+
+func asciiEqualFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if asciiLower(s[i]) != asciiLower(t[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLower(b byte) byte {
+	if 'A' <= b && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+type _SECURITY_CAPABILITIES struct {
+	AppContainerSid *SID
+	Capabilities    unsafe.Pointer
+	CapabilityCount uint32
+	Reserved        uint32
 }
 
 func Exec(argv0 string, argv []string, envv []string) (err error) {

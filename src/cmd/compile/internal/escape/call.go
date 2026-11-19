@@ -10,32 +10,16 @@ import (
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
+	"strings"
 )
 
 // call evaluates a call expressions, including builtin calls. ks
 // should contain the holes representing where the function callee's
 // results flows.
 func (e *escape) call(ks []hole, call ir.Node) {
-	var init ir.Nodes
-	e.callCommon(ks, call, &init, nil)
-	if len(init) != 0 {
-		call.(*ir.CallExpr).PtrInit().Append(init...)
-	}
-}
-
-func (e *escape) callCommon(ks []hole, call ir.Node, init *ir.Nodes, wrapper *ir.Func) {
-
-	// argumentPragma handles escape analysis of argument *argp to the
-	// given hole. If the function callee is known, pragma is the
-	// function's pragma flags; otherwise 0.
-	argumentFunc := func(fn *ir.Name, k hole, argp *ir.Node) {
-		e.rewriteArgument(argp, init, call, fn, wrapper)
-
-		e.expr(k.note(call, "call parameter"), *argp)
-	}
-
-	argument := func(k hole, argp *ir.Node) {
-		argumentFunc(nil, k, argp)
+	argument := func(k hole, arg ir.Node) {
+		// TODO(mdempsky): Should be "call argument".
+		e.expr(k.note(call, "call parameter"), arg)
 	}
 
 	switch call.Op() {
@@ -43,78 +27,109 @@ func (e *escape) callCommon(ks []hole, call ir.Node, init *ir.Nodes, wrapper *ir
 		ir.Dump("esc", call)
 		base.Fatalf("unexpected call op: %v", call.Op())
 
-	case ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER:
+	case ir.OCALLFUNC, ir.OCALLINTER:
 		call := call.(*ir.CallExpr)
-		typecheck.FixVariadicCall(call)
-		typecheck.FixMethodCall(call)
+		typecheck.AssertFixedCall(call)
 
-		// Pick out the function callee, if statically known.
+		// Pick out the function callee(s), if statically known.
+		// fns collects all known callees; for a single static callee
+		// it has one element. For unknown callees fns is nil.
 		//
-		// TODO(mdempsky): Change fn from *ir.Name to *ir.Func, but some
-		// functions (e.g., runtime builtins, method wrappers, generated
-		// eq/hash functions) don't have it set. Investigate whether
-		// that's a concern.
-		var fn *ir.Name
+		// TODO(mdempsky): Change fns from []*ir.Name to []*ir.Func,
+		// but some functions (e.g., runtime builtins, method wrappers,
+		// generated eq/hash functions) don't have it set. Investigate
+		// whether that's a concern.
+		var fns []*ir.Name
 		switch call.Op() {
 		case ir.OCALLFUNC:
-			// If we have a direct call to a closure (not just one we were
-			// able to statically resolve with ir.StaticValue), mark it as
-			// such so batch.outlives can optimize the flow results.
-			if call.X.Op() == ir.OCLOSURE {
-				call.X.(*ir.ClosureExpr).Func.SetClosureCalled(true)
+			ro := e.reassignOracle(e.curfn)
+			v := ro.StaticValue(call.Fun)
+			if fn := ir.StaticCalleeName(v); fn != nil {
+				fns = []*ir.Name{fn}
+			} else if name, ok := v.(*ir.Name); ok {
+				fns = resolveAssignedCallees(ro.FuncAssignments(name.Canonical()))
 			}
+		}
 
-			switch v := ir.StaticValue(call.X); v.Op() {
-			case ir.ONAME:
-				if v := v.(*ir.Name); v.Class == ir.PFUNC {
-					fn = v
+		fntype := call.Fun.Type()
+		if len(fns) == 1 {
+			fntype = fns[0].Type()
+		}
+
+		// Wire result flows for in-batch callees.
+		if ks != nil {
+			for _, f := range fns {
+				if e.inMutualBatch(f) {
+					for i, result := range f.Type().Results() {
+						e.expr(ks[i], result.Nname.(*ir.Name))
+					}
 				}
-			case ir.OCLOSURE:
-				fn = v.(*ir.ClosureExpr).Func.Nname
-			case ir.OMETHEXPR:
-				fn = ir.MethodExprName(v)
-			}
-		case ir.OCALLMETH:
-			base.FatalfAt(call.Pos(), "OCALLMETH missed by typecheck")
-		}
-
-		fntype := call.X.Type()
-		if fn != nil {
-			fntype = fn.Type()
-		}
-
-		if ks != nil && fn != nil && e.inMutualBatch(fn) {
-			for i, result := range fn.Type().Results().FieldSlice() {
-				e.expr(ks[i], ir.AsNode(result.Nname))
 			}
 		}
 
-		var recvp *ir.Node
+		var recvArg ir.Node
 		if call.Op() == ir.OCALLFUNC {
 			// Evaluate callee function expression.
-			//
-			// Note: We use argument and not argumentFunc, because while
-			// call.X here may be an argument to runtime.{new,defer}proc,
-			// it's not an argument to fn itself.
-			argument(e.discardHole(), &call.X)
+			calleeK := e.discardHole()
+			if len(fns) == 0 { // unknown callee
+				for _, k := range ks {
+					if k.dst != &e.blankLoc {
+						// The results flow somewhere, but we don't statically
+						// know the callee function. If a closure flows here, we
+						// need to conservatively assume its results might flow to
+						// the heap.
+						calleeK = e.calleeHole().note(call, "callee operand")
+						break
+					}
+				}
+			}
+			e.expr(calleeK, call.Fun)
 		} else {
-			recvp = &call.X.(*ir.SelectorExpr).X
+			recvArg = call.Fun.(*ir.SelectorExpr).X
 		}
 
 		args := call.Args
-		if recv := fntype.Recv(); recv != nil {
-			if recvp == nil {
-				// Function call using method expression. Recevier argument is
+		if fntype.Recv() != nil {
+			if recvArg == nil {
+				// Function call using method expression. Receiver argument is
 				// at the front of the regular arguments list.
-				recvp = &args[0]
-				args = args[1:]
+				recvArg, args = args[0], args[1:]
 			}
-
-			argumentFunc(fn, e.tagHole(ks, fn, recv), recvp)
 		}
 
-		for i, param := range fntype.Params().FieldSlice() {
-			argumentFunc(fn, e.tagHole(ks, fn, param), &args[i])
+		if call.IsCompilerVarLive {
+			// Don't escape compiler-inserted KeepAlive.
+			if recvArg != nil {
+				argument(e.discardHole(), recvArg)
+			}
+			for _, arg := range args {
+				argument(e.discardHole(), arg)
+			}
+		} else if isEscapeNonString(fns, fntype) {
+			// internal/abi.EscapeNonString forces its argument to
+			// the heap if it contains a non-string pointer. This is
+			// used in hash/maphash.Comparable (where we cannot hash
+			// pointers to locals whose address may change on stack
+			// growth) and unique.clone (to model the data flow edge
+			// with strings excluded, because strings are cloned by
+			// content). The actual call we match is:
+			//   internal/abi.EscapeNonString[go.shape.T](dict, go.shape.T)
+			k := e.heapHole()
+			if !hasNonStringPointers(fntype.Params()[1].Type) {
+				k = e.discardHole()
+			}
+			for _, arg := range args {
+				argument(k, arg)
+			}
+		} else {
+			if recvArg != nil {
+				e.rewriteArgument(recvArg, call, fns)
+				argument(e.mergedTagHole(ks, fns, -1, len(fntype.Params())), recvArg)
+			}
+			for i := range fntype.Params() {
+				e.rewriteArgument(args[i], call, fns)
+				argument(e.mergedTagHole(ks, fns, i, len(fntype.Params())), args[i])
+			}
 		}
 
 	case ir.OINLCALL:
@@ -136,76 +151,93 @@ func (e *escape) callCommon(ks []hole, call ir.Node, init *ir.Nodes, wrapper *ir
 		// it has enough capacity. Alternatively, a new heap
 		// slice might be allocated, and all slice elements
 		// might flow to heap.
-		appendeeK := ks[0]
+		appendeeK := e.teeHole(ks[0], e.mutatorHole())
 		if args[0].Type().Elem().HasPointers() {
 			appendeeK = e.teeHole(appendeeK, e.heapHole().deref(call, "appendee slice"))
 		}
-		argument(appendeeK, &args[0])
+		argument(appendeeK, args[0])
 
 		if call.IsDDD {
 			appendedK := e.discardHole()
 			if args[1].Type().IsSlice() && args[1].Type().Elem().HasPointers() {
 				appendedK = e.heapHole().deref(call, "appended slice...")
 			}
-			argument(appendedK, &args[1])
+			argument(appendedK, args[1])
 		} else {
 			for i := 1; i < len(args); i++ {
-				argument(e.heapHole(), &args[i])
+				argument(e.heapHole(), args[i])
 			}
 		}
+		e.discard(call.RType)
+
+		// Model the new backing store that might be allocated by append.
+		// Its address flows to the result.
+		// Users of escape analysis can look at the escape information for OAPPEND
+		// and use that to decide where to allocate the backing store.
+		backingStore := e.spill(ks[0], call)
+		// As we have a boolean to prevent reuse, we can treat these allocations as outside any loops.
+		backingStore.dst.loopDepth = 0
 
 	case ir.OCOPY:
 		call := call.(*ir.BinaryExpr)
-		argument(e.discardHole(), &call.X)
+		argument(e.mutatorHole(), call.X)
 
 		copiedK := e.discardHole()
 		if call.Y.Type().IsSlice() && call.Y.Type().Elem().HasPointers() {
 			copiedK = e.heapHole().deref(call, "copied slice")
 		}
-		argument(copiedK, &call.Y)
+		argument(copiedK, call.Y)
+		e.discard(call.RType)
 
 	case ir.OPANIC:
 		call := call.(*ir.UnaryExpr)
-		argument(e.heapHole(), &call.X)
+		argument(e.heapHole(), call.X)
 
 	case ir.OCOMPLEX:
 		call := call.(*ir.BinaryExpr)
-		argument(e.discardHole(), &call.X)
-		argument(e.discardHole(), &call.Y)
+		e.discard(call.X)
+		e.discard(call.Y)
 
-	case ir.ODELETE, ir.OPRINT, ir.OPRINTN, ir.ORECOVER:
+	case ir.ODELETE, ir.OPRINT, ir.OPRINTLN, ir.ORECOVER:
 		call := call.(*ir.CallExpr)
-		fixRecoverCall(call)
-		for i := range call.Args {
-			argument(e.discardHole(), &call.Args[i])
+		for _, arg := range call.Args {
+			e.discard(arg)
 		}
+		e.discard(call.RType)
+		// Note: keys used in map deletes do not need to escape.
+		// See "Hashing Pointers" doc in internal/runtime/maps/map.go.
 
-	case ir.OLEN, ir.OCAP, ir.OREAL, ir.OIMAG, ir.OCLOSE, ir.OUNSAFESTRINGDATA, ir.OUNSAFESLICEDATA:
+	case ir.OMIN, ir.OMAX:
+		call := call.(*ir.CallExpr)
+		for _, arg := range call.Args {
+			argument(ks[0], arg)
+		}
+		e.discard(call.RType)
+
+	case ir.OLEN, ir.OCAP, ir.OREAL, ir.OIMAG, ir.OCLOSE:
 		call := call.(*ir.UnaryExpr)
-		argument(e.discardHole(), &call.X)
+		e.discard(call.X)
+
+	case ir.OCLEAR:
+		call := call.(*ir.UnaryExpr)
+		argument(e.mutatorHole(), call.X)
+
+	case ir.OUNSAFESTRINGDATA, ir.OUNSAFESLICEDATA:
+		call := call.(*ir.UnaryExpr)
+		argument(ks[0], call.X)
 
 	case ir.OUNSAFEADD, ir.OUNSAFESLICE, ir.OUNSAFESTRING:
 		call := call.(*ir.BinaryExpr)
-		argument(ks[0], &call.X)
-		argument(e.discardHole(), &call.Y)
+		argument(ks[0], call.X)
+		e.discard(call.Y)
+		e.discard(call.RType)
 	}
 }
 
 // goDeferStmt analyzes a "go" or "defer" statement.
-//
-// In the process, it also normalizes the statement to always use a
-// simple function call with no arguments and no results. For example,
-// it rewrites:
-//
-//	defer f(x, y)
-//
-// into:
-//
-//	x1, y1 := x, y
-//	defer func() { f(x1, y1) }()
 func (e *escape) goDeferStmt(n *ir.GoDeferStmt) {
 	k := e.heapHole()
-	if n.Op() == ir.ODEFER && e.loopDepth == 1 {
+	if n.Op() == ir.ODEFER && e.loopDepth == 1 && n.DeferAt == nil {
 		// Top-level defer arguments don't escape to the heap,
 		// but they do need to last until they're invoked.
 		k = e.later(e.discardHole())
@@ -215,145 +247,77 @@ func (e *escape) goDeferStmt(n *ir.GoDeferStmt) {
 		n.SetEsc(ir.EscNever)
 	}
 
-	call := n.Call
-
-	init := n.PtrInit()
-	init.Append(ir.TakeInit(call)...)
-	e.stmts(*init)
-
 	// If the function is already a zero argument/result function call,
 	// just escape analyze it normally.
 	//
 	// Note that the runtime is aware of this optimization for
 	// "go" statements that start in reflect.makeFuncStub or
 	// reflect.methodValueCall.
-	if call, ok := call.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
-		if sig := call.X.Type(); sig.NumParams()+sig.NumResults() == 0 {
-			if clo, ok := call.X.(*ir.ClosureExpr); ok && n.Op() == ir.OGO {
-				clo.IsGoWrap = true
-			}
-			e.expr(k, call.X)
-			return
-		}
+
+	call, ok := n.Call.(*ir.CallExpr)
+	if !ok || call.Op() != ir.OCALLFUNC {
+		base.FatalfAt(n.Pos(), "expected function call: %v", n.Call)
+	}
+	if sig := call.Fun.Type(); sig.NumParams()+sig.NumResults() != 0 {
+		base.FatalfAt(n.Pos(), "expected signature without parameters or results: %v", sig)
 	}
 
-	// Create a new no-argument function that we'll hand off to defer.
-	fn := ir.NewClosureFunc(n.Pos(), true)
-	fn.SetWrapper(true)
-	fn.Nname.SetType(types.NewSignature(types.LocalPkg, nil, nil, nil, nil))
-	fn.Body = []ir.Node{call}
-	if call, ok := call.(*ir.CallExpr); ok && call.Op() == ir.OCALLFUNC {
-		// If the callee is a named function, link to the original callee.
-		x := call.X
-		if x.Op() == ir.ONAME && x.(*ir.Name).Class == ir.PFUNC {
-			fn.WrappedFunc = call.X.(*ir.Name).Func
-		} else if x.Op() == ir.OMETHEXPR && ir.MethodExprFunc(x).Nname != nil {
-			fn.WrappedFunc = ir.MethodExprName(x).Func
-		}
-	}
-
-	clo := fn.OClosure
-	if n.Op() == ir.OGO {
+	if clo, ok := call.Fun.(*ir.ClosureExpr); ok && n.Op() == ir.OGO {
 		clo.IsGoWrap = true
 	}
 
-	e.callCommon(nil, call, init, fn)
-	e.closures = append(e.closures, closure{e.spill(k, clo), clo})
-
-	// Create new top level call to closure.
-	n.Call = ir.NewCallExpr(call.Pos(), ir.OCALL, clo, nil)
-	ir.WithFunc(e.curfn, func() {
-		typecheck.Stmt(n.Call)
-	})
+	e.expr(k, call.Fun)
 }
 
-// rewriteArgument rewrites the argument *argp of the given call expression.
-// fn is the static callee function, if known.
-// wrapper is the go/defer wrapper function for call, if any.
-func (e *escape) rewriteArgument(argp *ir.Node, init *ir.Nodes, call ir.Node, fn *ir.Name, wrapper *ir.Func) {
+// rewriteArgument rewrites the argument arg of the given call expression.
+// fns is the list of statically known callees, if any.
+func (e *escape) rewriteArgument(arg ir.Node, call *ir.CallExpr, fns []*ir.Name) {
 	var pragma ir.PragmaFlag
-	if fn != nil && fn.Func != nil {
-		pragma = fn.Func.Pragma
+	for _, fn := range fns {
+		if fn.Func != nil {
+			pragma |= fn.Func.Pragma
+		}
+	}
+	if pragma&(ir.UintptrKeepAlive|ir.UintptrEscapes) == 0 {
+		return
 	}
 
 	// unsafeUintptr rewrites "uintptr(ptr)" arguments to syscall-like
 	// functions, so that ptr is kept alive and/or escaped as
 	// appropriate. unsafeUintptr also reports whether it modified arg0.
-	unsafeUintptr := func(arg0 ir.Node) bool {
-		if pragma&(ir.UintptrKeepAlive|ir.UintptrEscapes) == 0 {
-			return false
-		}
-
+	unsafeUintptr := func(arg ir.Node) {
 		// If the argument is really a pointer being converted to uintptr,
-		// arrange for the pointer to be kept alive until the call returns,
-		// by copying it into a temp and marking that temp
-		// still alive when we pop the temp stack.
-		if arg0.Op() != ir.OCONVNOP || !arg0.Type().IsUintptr() {
-			return false
+		// arrange for the pointer to be kept alive until the call
+		// returns, by copying it into a temp and marking that temp still
+		// alive when we pop the temp stack.
+		conv, ok := arg.(*ir.ConvExpr)
+		if !ok || conv.Op() != ir.OCONVNOP {
+			return // not a conversion
 		}
-		arg := arg0.(*ir.ConvExpr)
-
-		if !arg.X.Type().IsUnsafePtr() {
-			return false
+		if !conv.X.Type().IsUnsafePtr() || !conv.Type().IsUintptr() {
+			return // not an unsafe.Pointer->uintptr conversion
 		}
 
 		// Create and declare a new pointer-typed temp variable.
-		tmp := e.wrapExpr(arg.Pos(), &arg.X, init, call, wrapper)
+		//
+		// TODO(mdempsky): This potentially violates the Go spec's order
+		// of evaluations, by evaluating arg.X before any other
+		// operands.
+		tmp := e.copyExpr(conv.Pos(), conv.X, call.PtrInit())
+		conv.X = tmp
 
+		k := e.mutatorHole()
 		if pragma&ir.UintptrEscapes != 0 {
-			e.flow(e.heapHole().note(arg, "//go:uintptrescapes"), e.oldLoc(tmp))
+			k = e.heapHole().note(conv, "//go:uintptrescapes")
 		}
+		e.flow(k, e.oldLoc(tmp))
 
 		if pragma&ir.UintptrKeepAlive != 0 {
-			call := call.(*ir.CallExpr)
-
-			// SSA implements CallExpr.KeepAlive using OpVarLive, which
-			// doesn't support PAUTOHEAP variables. I tried changing it to
-			// use OpKeepAlive, but that ran into issues of its own.
-			// For now, the easy solution is to explicitly copy to (yet
-			// another) new temporary variable.
-			keep := tmp
-			if keep.Class == ir.PAUTOHEAP {
-				keep = e.copyExpr(arg.Pos(), tmp, call.PtrInit(), wrapper, false)
-			}
-
-			keep.SetAddrtaken(true) // ensure SSA keeps the tmp variable
-			call.KeepAlive = append(call.KeepAlive, keep)
-		}
-
-		return true
-	}
-
-	visit := func(pos src.XPos, argp *ir.Node) {
-		// Optimize a few common constant expressions. By leaving these
-		// untouched in the call expression, we let the wrapper handle
-		// evaluating them, rather than taking up closure context space.
-		switch arg := *argp; arg.Op() {
-		case ir.OLITERAL, ir.ONIL, ir.OMETHEXPR:
-			return
-		case ir.ONAME:
-			if arg.(*ir.Name).Class == ir.PFUNC {
-				return
-			}
-		}
-
-		if unsafeUintptr(*argp) {
-			return
-		}
-
-		if wrapper != nil {
-			e.wrapExpr(pos, argp, init, call, wrapper)
+			tmp.SetAddrtaken(true) // ensure SSA keeps the tmp variable
+			call.KeepAlive = append(call.KeepAlive, tmp)
 		}
 	}
 
-	// Peel away any slice literals for better escape analyze
-	// them. For example:
-	//
-	//     go F([]int{a, b})
-	//
-	// If F doesn't escape its arguments, then the slice can
-	// be allocated on the new goroutine's stack.
-	//
 	// For variadic functions, the compiler has already rewritten:
 	//
 	//     f(a, b, c)
@@ -363,68 +327,60 @@ func (e *escape) rewriteArgument(argp *ir.Node, init *ir.Nodes, call ir.Node, fn
 	//     f([]T{a, b, c}...)
 	//
 	// So we need to look into slice elements to handle uintptr(ptr)
-	// arguments to syscall-like functions correctly.
-	if arg := *argp; arg.Op() == ir.OSLICELIT {
+	// arguments to variadic syscall-like functions correctly.
+	if arg.Op() == ir.OSLICELIT {
 		list := arg.(*ir.CompLitExpr).List
-		for i := range list {
-			el := &list[i]
-			if list[i].Op() == ir.OKEY {
-				el = &list[i].(*ir.KeyExpr).Value
+		for _, el := range list {
+			if el.Op() == ir.OKEY {
+				el = el.(*ir.KeyExpr).Value
 			}
-			visit(arg.Pos(), el)
+			unsafeUintptr(el)
 		}
 	} else {
-		visit(call.Pos(), argp)
+		unsafeUintptr(arg)
 	}
-}
-
-// wrapExpr replaces *exprp with a temporary variable copy. If wrapper
-// is non-nil, the variable will be captured for use within that
-// function.
-func (e *escape) wrapExpr(pos src.XPos, exprp *ir.Node, init *ir.Nodes, call ir.Node, wrapper *ir.Func) *ir.Name {
-	tmp := e.copyExpr(pos, *exprp, init, e.curfn, true)
-
-	if wrapper != nil {
-		// Currently for "defer i.M()" if i is nil it panics at the point
-		// of defer statement, not when deferred function is called.  We
-		// need to do the nil check outside of the wrapper.
-		if call.Op() == ir.OCALLINTER && exprp == &call.(*ir.CallExpr).X.(*ir.SelectorExpr).X {
-			check := ir.NewUnaryExpr(pos, ir.OCHECKNIL, ir.NewUnaryExpr(pos, ir.OITAB, tmp))
-			init.Append(typecheck.Stmt(check))
-		}
-
-		e.oldLoc(tmp).captured = true
-
-		tmp = ir.NewClosureVar(pos, wrapper, tmp)
-	}
-
-	*exprp = tmp
-	return tmp
 }
 
 // copyExpr creates and returns a new temporary variable within fn;
 // appends statements to init to declare and initialize it to expr;
-// and escape analyzes the data flow if analyze is true.
-func (e *escape) copyExpr(pos src.XPos, expr ir.Node, init *ir.Nodes, fn *ir.Func, analyze bool) *ir.Name {
+// and escape analyzes the data flow.
+func (e *escape) copyExpr(pos src.XPos, expr ir.Node, init *ir.Nodes) *ir.Name {
 	if ir.HasUniquePos(expr) {
 		pos = expr.Pos()
 	}
 
-	tmp := typecheck.TempAt(pos, fn, expr.Type())
+	tmp := typecheck.TempAt(pos, e.curfn, expr.Type())
 
 	stmts := []ir.Node{
 		ir.NewDecl(pos, ir.ODCL, tmp),
 		ir.NewAssignStmt(pos, tmp, expr),
 	}
-	typecheck.Stmts(stmts)
+	typecheck.Stmts(e.curfn, stmts)
 	init.Append(stmts...)
 
-	if analyze {
-		e.newLoc(tmp, false)
-		e.stmts(stmts)
-	}
+	e.newLoc(tmp, true)
+	e.stmts(stmts)
 
 	return tmp
+}
+
+func (e *escape) mergedTagHole(ks []hole, fns []*ir.Name, paramIdx int, nParams int) hole {
+	if len(fns) == 0 {
+		return e.heapHole()
+	}
+	holes := make([]hole, 0, len(fns))
+	for _, f := range fns {
+		offset := nParams - len(f.Type().Params())
+		j := paramIdx - offset
+		var p *types.Field
+		if j >= 0 {
+			p = f.Type().Params()[j]
+		} else {
+			p = f.Type().Recv()
+		}
+		holes = append(holes, e.tagHole(ks, f, p))
+	}
+	return e.teeHole(holes...)
 }
 
 // tagHole returns a hole for evaluating an argument passed to param.
@@ -438,16 +394,25 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	}
 
 	if e.inMutualBatch(fn) {
-		return e.addr(ir.AsNode(param.Nname))
+		if param.Nname == nil {
+			return e.discardHole()
+		}
+		return e.addr(param.Nname.(*ir.Name))
 	}
 
 	// Call to previously tagged function.
 
 	var tagKs []hole
-
 	esc := parseLeaks(param.Note)
+
 	if x := esc.Heap(); x >= 0 {
 		tagKs = append(tagKs, e.heapHole().shift(x))
+	}
+	if x := esc.Mutator(); x >= 0 {
+		tagKs = append(tagKs, e.mutatorHole().shift(x))
+	}
+	if x := esc.Callee(); x >= 0 {
+		tagKs = append(tagKs, e.calleeHole().shift(x))
 	}
 
 	if ks != nil {
@@ -459,4 +424,52 @@ func (e *escape) tagHole(ks []hole, fn *ir.Name, param *types.Field) hole {
 	}
 
 	return e.teeHole(tagKs...)
+}
+
+// resolveAssignedCallees resolves all assignment RHS values to static
+// callee names, skipping zero-value assignments since nil panics on
+// call and can't cause escape.
+func resolveAssignedCallees(assigns []*ir.AssignStmt) []*ir.Name {
+	fns := make([]*ir.Name, 0, len(assigns))
+	for _, as := range assigns {
+		if ir.IsZero(as.Y) {
+			continue // zero value panics on call; skip
+		}
+		callee := ir.StaticCalleeName(as.Y)
+		if callee == nil {
+			return nil
+		}
+		if callee.Func != nil && callee.Func.Pragma&(ir.UintptrKeepAlive|ir.UintptrEscapes) != 0 {
+			return nil
+		}
+		fns = append(fns, callee)
+	}
+	return fns
+}
+
+func isEscapeNonString(fns []*ir.Name, fntype *types.Type) bool {
+	return len(fns) == 1 &&
+		fns[0].Sym().Pkg.Path == "internal/abi" &&
+		strings.HasPrefix(fns[0].Sym().Name, "EscapeNonString[") &&
+		len(fntype.Params()) == 2 && fntype.Params()[1].Type.IsShape()
+}
+
+func hasNonStringPointers(t *types.Type) bool {
+	if !t.HasPointers() {
+		return false
+	}
+	switch t.Kind() {
+	case types.TSTRING:
+		return false
+	case types.TSTRUCT:
+		for _, f := range t.Fields() {
+			if hasNonStringPointers(f.Type) {
+				return true
+			}
+		}
+		return false
+	case types.TARRAY:
+		return hasNonStringPointers(t.Elem())
+	}
+	return true
 }

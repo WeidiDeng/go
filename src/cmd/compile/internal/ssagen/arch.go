@@ -25,8 +25,13 @@ type ArchInfo struct {
 
 	PadFrame func(int64) int64
 
-	// ZeroRange zeroes a range of memory on stack. It is only inserted
-	// at function entry, and it is ok to clobber registers.
+	// ZeroRange zeroes a range of memory the on stack.
+	//  - it is only called at function entry
+	//  - it is ok to clobber (non-arg) registers.
+	//  - currently used only for small things, so it can be simple.
+	//    - pointers to heap-allocated return values
+	//    - open-coded deferred functions
+	// (Max size in make.bash is 40 bytes.)
 	ZeroRange func(*objw.Progs, *obj.Prog, int64, int64, *uint32) *obj.Prog
 
 	Ginsnop func(*objw.Progs) *obj.Prog
@@ -48,4 +53,11 @@ type ArchInfo struct {
 
 	// SpillArgReg emits instructions that spill reg to n+off.
 	SpillArgReg func(pp *objw.Progs, p *obj.Prog, f *ssa.Func, t *types.Type, reg int16, n *ir.Name, off int64) *obj.Prog
+
+	// SSAGenFinish, if non-nil, is called after all of a function's Progs
+	// have been generated and defframe has run: branch and jump-table
+	// targets are resolved and the frame size is final. It allows the
+	// backend to run a last Prog-level pass. Used on arm64 to fuse adjacent
+	// spill/reload MOVDs into STP/LDP.
+	SSAGenFinish func(pp *objw.Progs)
 }

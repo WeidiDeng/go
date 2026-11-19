@@ -12,11 +12,11 @@ import (
 	"strings"
 )
 
-// A LineReader reads a sequence of LineEntry structures from a DWARF
+// A LineReader reads a sequence of [LineEntry] structures from a DWARF
 // "line" section for a single compilation unit. LineEntries occur in
-// order of increasing PC and each LineEntry gives metadata for the
-// instructions from that LineEntry's PC to just before the next
-// LineEntry's PC. The last entry will have its EndSequence field set.
+// order of increasing PC and each [LineEntry] gives metadata for the
+// instructions from that [LineEntry]'s PC to just before the next
+// [LineEntry]'s PC. The last entry will have the [LineEntry.EndSequence] field set.
 type LineReader struct {
 	buf buf
 
@@ -137,7 +137,7 @@ type LineFile struct {
 }
 
 // LineReader returns a new reader for the line table of compilation
-// unit cu, which must be an Entry with tag TagCompileUnit.
+// unit cu, which must be an [Entry] with tag [TagCompileUnit].
 //
 // If this compilation unit has no line table, it returns nil, nil.
 func (d *Data) LineReader(cu *Entry) (*LineReader, error) {
@@ -216,10 +216,11 @@ func (r *LineReader) readHeader(compDir string) error {
 		headerLength = Offset(buf.uint32())
 	}
 	programOffset := buf.off + headerLength
-	if programOffset > r.endOffset {
+	if programOffset < buf.off || programOffset > r.endOffset {
 		return DecodeError{"line", hdrOffset, fmt.Sprintf("malformed line table: program offset %d exceeds end offset %d", programOffset, r.endOffset)}
 	}
 	r.programOffset = programOffset
+	r.buf = makeBuf(buf.dwarf, buf.format, buf.name, buf.off, buf.data[:programOffset-buf.off])
 	r.minInstructionLength = int(buf.uint8())
 	if r.version >= 4 {
 		// [DWARF4 6.2.4]
@@ -290,7 +291,10 @@ func (r *LineReader) readHeader(compDir string) error {
 		}
 	} else {
 		dirFormat := r.readLNCTFormat()
-		c := buf.uint()
+		c, err := r.readLNCTCount()
+		if err != nil {
+			return err
+		}
 		r.directories = make([]string, c)
 		for i := range r.directories {
 			dir, _, _, err := r.readLNCT(dirFormat, dwarf64)
@@ -300,7 +304,10 @@ func (r *LineReader) readHeader(compDir string) error {
 			r.directories[i] = dir
 		}
 		fileFormat := r.readLNCTFormat()
-		c = buf.uint()
+		c, err = r.readLNCTCount()
+		if err != nil {
+			return err
+		}
 		r.fileEntries = make([]*LineFile, c)
 		for i := range r.fileEntries {
 			name, mtime, size, err := r.readLNCT(fileFormat, dwarf64)
@@ -333,6 +340,19 @@ func (r *LineReader) readLNCTFormat() []lnctForm {
 		ret[i].form = format(r.buf.uint())
 	}
 	return ret
+}
+
+// readLNCTCount reads an LNCT count and checks that it cannot result in an
+// unreasonable allocation.
+func (r *LineReader) readLNCTCount() (int, error) {
+	c := r.buf.uint()
+	if r.buf.err != nil {
+		return 0, r.buf.err
+	}
+	if c > uint64(len(r.buf.data)) {
+		return 0, DecodeError{"line", r.buf.off, "directory or file count out of range"}
+	}
+	return int(c), nil
 }
 
 // readLNCT reads a sequence of LNCT entries and returns path information.
@@ -437,7 +457,7 @@ func (r *LineReader) readFileEntry() (bool, error) {
 	off := r.buf.off
 	dirIndex := int(r.buf.uint())
 	if !pathIsAbs(name) {
-		if dirIndex >= len(r.directories) {
+		if dirIndex < 0 || dirIndex >= len(r.directories) {
 			return false, DecodeError{"line", off, "directory index too large"}
 		}
 		name = pathJoin(r.directories[dirIndex], name)
@@ -465,7 +485,7 @@ func (r *LineReader) readFileEntry() (bool, error) {
 // updateFile updates r.state.File after r.fileIndex has
 // changed or r.fileEntries has changed.
 func (r *LineReader) updateFile() {
-	if r.fileIndex < len(r.fileEntries) {
+	if r.fileIndex >= 0 && r.fileIndex < len(r.fileEntries) {
 		r.state.File = r.fileEntries[r.fileIndex]
 	} else {
 		r.state.File = nil
@@ -474,7 +494,7 @@ func (r *LineReader) updateFile() {
 
 // Next sets *entry to the next row in this line table and moves to
 // the next row. If there are no more entries and the line table is
-// properly terminated, it returns io.EOF.
+// properly terminated, it returns [io.EOF].
 //
 // Rows are always in order of increasing entry.Address, but
 // entry.Line may go forward or backward.
@@ -662,9 +682,9 @@ func (r *LineReader) Tell() LineReaderPos {
 	return LineReaderPos{r.buf.off, len(r.fileEntries), r.state, r.fileIndex}
 }
 
-// Seek restores the line table reader to a position returned by Tell.
+// Seek restores the line table reader to a position returned by [LineReader.Tell].
 //
-// The argument pos must have been returned by a call to Tell on this
+// The argument pos must have been returned by a call to [LineReader.Tell] on this
 // line table.
 func (r *LineReader) Seek(pos LineReaderPos) {
 	r.buf.off = pos.off
@@ -712,7 +732,7 @@ func (r *LineReader) resetState() {
 // Files returns the file name table of this compilation unit as of
 // the current position in the line table. The file name table may be
 // referenced from attributes in this compilation unit such as
-// AttrDeclFile.
+// [AttrDeclFile].
 //
 // Entry 0 is always nil, since file index 0 represents "no file".
 //
@@ -729,12 +749,12 @@ func (r *LineReader) Files() []*LineFile {
 // seek PC is not covered by any entry in the line table.
 var ErrUnknownPC = errors.New("ErrUnknownPC")
 
-// SeekPC sets *entry to the LineEntry that includes pc and positions
+// SeekPC sets *entry to the [LineEntry] that includes pc and positions
 // the reader on the next entry in the line table. If necessary, this
 // will seek backwards to find pc.
 //
 // If pc is not covered by any entry in this line table, SeekPC
-// returns ErrUnknownPC. In this case, *entry and the final seek
+// returns [ErrUnknownPC]. In this case, *entry and the final seek
 // position are unspecified.
 //
 // Note that DWARF line tables only permit sequential, forward scans.
@@ -837,7 +857,7 @@ func splitDrive(path string) (drive, rest string) {
 	}
 	if len(path) > 3 && (path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') {
 		// Normalize the path so we can search for just \ below.
-		npath := strings.Replace(path, "/", `\`, -1)
+		npath := strings.ReplaceAll(path, "/", `\`)
 		// Get the host part, which must be non-empty.
 		slash1 := strings.IndexByte(npath[2:], '\\') + 2
 		if slash1 > 2 {

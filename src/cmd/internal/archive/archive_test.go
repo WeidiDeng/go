@@ -14,9 +14,9 @@ import (
 	"internal/xcoff"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"unicode/utf8"
@@ -114,17 +114,17 @@ func buildGoobj(t *testing.T) goobjPaths {
 			go2src := filepath.Join("testdata", "go2.go")
 
 			importcfgfile := filepath.Join(buildDir, "importcfg")
-			testenv.WriteImportcfg(t, importcfgfile, nil)
+			testenv.WriteImportcfg(t, importcfgfile, nil, go1src, go2src)
 
-			out, err := exec.Command(gotool, "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-o", go1obj, go1src).CombinedOutput()
+			out, err := testenv.Command(t, gotool, "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-o", go1obj, go1src).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("go tool compile -o %s %s: %v\n%s", go1obj, go1src, err, out)
 			}
-			out, err = exec.Command(gotool, "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-o", go2obj, go2src).CombinedOutput()
+			out, err = testenv.Command(t, gotool, "tool", "compile", "-importcfg="+importcfgfile, "-p=p", "-o", go2obj, go2src).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("go tool compile -o %s %s: %v\n%s", go2obj, go2src, err, out)
 			}
-			out, err = exec.Command(gotool, "tool", "pack", "c", goarchive, go1obj, go2obj).CombinedOutput()
+			out, err = testenv.Command(t, gotool, "tool", "pack", "c", goarchive, go1obj, go2obj).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("go tool pack c %s %s %s: %v\n%s", goarchive, go1obj, go2obj, err, out)
 			}
@@ -139,7 +139,7 @@ func buildGoobj(t *testing.T) goobjPaths {
 				if err != nil {
 					return err
 				}
-				cmd := exec.Command(gotool, "build", "-buildmode=archive", "-o", cgoarchive, "-gcflags=all="+os.Getenv("GO_GCFLAGS"), "mycgo")
+				cmd := testenv.Command(t, gotool, "build", "-buildmode=archive", "-o", cgoarchive, "-gcflags=all="+os.Getenv("GO_GCFLAGS"), "mycgo")
 				cmd.Dir = filepath.Join(gopath, "src", "mycgo")
 				cmd.Env = append(os.Environ(), "GOPATH="+gopath)
 				out, err = cmd.CombinedOutput()
@@ -373,6 +373,8 @@ func TestExactly16Bytes(t *testing.T) {
 		"123456789012345日本語67890",
 		"1234567890123456日本語7890",
 		"1234567890123456日本語7日本語890",
+		"12345678901234567890.syso",
+		"1234567890日本語.syso",
 	}
 	for _, str := range tests {
 		got := exactly16Bytes(str)
@@ -384,6 +386,9 @@ func TestExactly16Bytes(t *testing.T) {
 			if c == utf8.RuneError {
 				t.Errorf("exactly16Bytes(%q) is %q, has partial rune", str, got)
 			}
+		}
+		if strings.HasSuffix(str, ".syso") && !strings.HasSuffix(strings.TrimRight(got, " "), ".syso") {
+			t.Errorf("exactly16Bytes(%q) is %q, did not preserve .syso suffix", str, got)
 		}
 	}
 }

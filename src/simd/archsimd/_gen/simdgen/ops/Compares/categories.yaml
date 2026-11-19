@@ -1,0 +1,53 @@
+!sum
+# const imm predicate(holds for both float and int|uint):
+# 0: Equal
+# 1: Less
+# 2: LessEqual
+# 4: NotEqual
+# 5: GreaterEqual
+# 6: Greater
+- go: Equal
+  constImm: 0
+  commutative: true
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x == y.
+- go: Less
+  constImm: 1
+  commutative: false
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x < y.
+- go: LessEqual
+  constImm: 2
+  commutative: false
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x <= y.
+- go: NotEqual
+  constImm: 4
+  commutative: true
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x != y.
+- go: GreaterEqual
+  constImm: 13
+  commutative: false
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x >= y.
+- go: Greater
+  constImm: 14
+  commutative: false
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x > y.
+- go: TestPairBitsNonzero
+  noTypes: "true"
+  noGenericOps: "true"
+  commutative: true
+  documentation: !string |-
+    // NAME returns a mask whose elements indicate whether x & y != 0.
+
+- go: compareToMask
+  noTypes: "true"
+  noGenericOps: "true"
+  # Whether this is commutative depends on the predicate.
+  commutative: false
+  documentation: !string |-
+    // NAME compares x and y using the predicate in its immediate, and returns
+    // the result as an AVX-512 mask.

@@ -263,10 +263,15 @@ TEXT main·foo(SB),DUPOK|NOSPLIT,$16-0 // TEXT main.foo(SB), DUPOK|NOSPLIT, $16-
 	NC	$8, (R15), n-8(SP)       // d407f010f000
 	OC	$8, (R15), n-8(SP)       // d607f010f000
 	MVC	$8, (R15), n-8(SP)       // d207f010f000
+	MVC	$256, 8192(R1), 8192(R2) // b90400a2c2a800002000b90400b1c2b800002000d2ffa000b000
 	MVCIN	$8, (R15), n-8(SP)       // e807f010f000
 	CLC	$8, (R15), n-8(SP)       // d507f000f010
 	XC	$256, -8(R15), -8(R15)   // b90400afc2a8fffffff8d7ffa000a000
-	MVC	$256, 8192(R1), 8192(R2) // b90400a2c2a800002000b90400b1c2b800002000d2ffa000b000
+	MVCLE   0, R4, R6                // a8640000
+	MVCLE   4095, R4, R6             // a8640fff
+	MVCLE   $4095, R4, R6            // a8640fff
+	MVCLE   (R3), R4, R6             // a8643000
+	MVCLE   10(R3), R4, R6           // a864300a
 
 	CMP	R1, R2                 // b9200012
 	CMP	R3, $32767             // a73f7fff
@@ -401,6 +406,7 @@ TEXT main·foo(SB),DUPOK|NOSPLIT,$16-0 // TEXT main.foo(SB), DUPOK|NOSPLIT, $16-
 	FMADDS	F1, F2, F3             // b30e3012
 	FMSUB	F4, F5, F5             // b31f5045
 	FMSUBS	F6, F6, F7             // b30f7066
+	LCDBR	F0, F2                 // b3130020
 	LPDFR	F1, F2                 // b3700021
 	LNDFR	F3, F4                 // b3710043
 	CPSDR	F5, F6, F7             // b3725076
@@ -410,9 +416,18 @@ TEXT main·foo(SB),DUPOK|NOSPLIT,$16-0 // TEXT main.foo(SB), DUPOK|NOSPLIT, $16-
 	TCDB	F15, $4095             // edf00fff0011
 
 	UNDEF                          // 00000000
+	BRRK			       // 0001
 	NOPH                           // 0700
 
 	SYNC                           // 07e0
+
+	KM	R2, R4                 // b92e0024
+	KMC	R2, R6                 // b92f0026
+	KLMD	R2, R8                 // b93f0028
+	KIMD	R0, R4                 // b93e0004
+	KDSA	R0, R8                 // b93a0008
+	KMA	R2, R6, R4             // b9296024
+	KMCTR   R2, R6, R4             // b92d6024
 
 	// vector add and sub instructions
 	VAB	V3, V4, V4              // e743400000f3
@@ -441,6 +456,12 @@ TEXT main·foo(SB),DUPOK|NOSPLIT,$16-0 // TEXT main.foo(SB), DUPOK|NOSPLIT, $16-
 	VST	V1, (R15)               // e710f000000e
 	VL	(R15), V31              // e7f0f0000806
 	VST	V31, (R15)              // e7f0f000080e
+	VLER	$3, (R2)(R5), V2        // e62520003007
+	VLERG	(R2)(R5), V7            // e67520003007
+	VSTERH	V3, (R2)(R5)            // e6352000100f
+	VSTERF	V5, (R2)(R4)            // e6542000200f
+	VLLEZG	32(R2)(R5), V2          // e72520203004
+	VSTRL	V4, $6, 1(R4)           // e6064001403d
 	VESLB	$5, V14                 // e7ee00050030
 	VESRAG	$0, V15, V16            // e70f0000383a
 	VLM	(R15), V8, V23          // e787f0000436
@@ -506,12 +527,49 @@ TEXT main·foo(SB),DUPOK|NOSPLIT,$16-0 // TEXT main.foo(SB), DUPOK|NOSPLIT, $16-
 	VMSLEG  V21, V22, V23, V24      // e78563807fb8
 	VMSLOG  V21, V22, V23, V24      // e78563407fb8
 	VMSLEOG V21, V22, V23, V24      // e78563c07fb8
+	VMALEG	V10, V11, V12, V1       // e71ab300c0ac
+	VMALOG	V21, V22, V23, V24      // e78563007fad
+	VMALHG	V5, V6, V7, V3          // e735630070a9
+	VMALHQ	V3, V4, V5, V21         // e753440058a9
+	VMALG	V21, V22, V23, V24      // e78563007faa
+	VMALQ	V21, V22, V23, V24      // e78564007faa
+	VMLEG	V21, V22, V23           // e77560003ea4
+	VMLOG	V21, V22, V23           // e77560003ea5
+	VMLHG	V1, V2, V3              // e731200030a1
+	VMLHQ	V1, V2, V3              // e731200040a1
+	VMLG	V21, V22, V23           // e77560003ea2
+	VMLQ	V21, V22, V23           // e77560004ea2
 	VSUMGH	V1, V2, V3              // e73120001065
 	VSUMGF	V16, V17, V18           // e72010002e65
 	VSUMQF	V4, V5, V6              // e76450002067
 	VSUMQG	V19, V20, V21           // e75340003e67
 	VSUMB	V7, V8, V9              // e79780000064
-	VSUMH	V22, V23, V24           // e78670001e64
+	VSUMH	V22, V23, V24		// e78670001e64
+	VSTRC	V18, V20, V22, V24	// e78240006f8a
+	VSTRCB	V18, V20, V22, V24	// e78240006f8a
+	VSTRCH	V18, V20, V22, V24	// e78241006f8a
+	VSTRCF	V18, V20, V22, V24	// e78242006f8a
+	VSTRCBS V18, V20, V22, V24	// e78240106f8a
+	VSTRCHS V18, V20, V22, V24	// e78241106f8a
+	VSTRCFS V18, V20, V22, V24	// e78242106f8a
+	VSTRCZB V18, V20, V22, V24	// e78240206f8a
+	VSTRCZH V18, V20, V22, V24	// e78241206f8a
+	VSTRCZF V18, V20, V22, V24	// e78242206f8a
+	VSTRCZBS V18, V20, V22, V24	// e78240306f8a
+	VSTRCZHS V18, V20, V22, V24	// e78241306f8a
+	VSTRCZFS V18, V20, V22, V24	// e78242306f8a
+	VFMAXSB	$1, V2, V3, V4          // e742301020ef
+	WFMAXSB	$2, V5, V6, V7          // e775602820ef
+	WFMAXSB	$2, F5, F6, F7          // e775602820ef
+	VFMAXDB	$3, V8, V9, V10		// e7a8903030ef
+	WFMAXDB	$4, V11, V12, V13	// e7dbc04830ef
+	WFMAXDB	$4, F11, F12, F13	// e7dbc04830ef
+	VFMINSB	$7, V14, V15, V16	// e70ef07028ee
+	WFMINSB	$8, V17, V18, V19	// e73120882eee
+	WFMINSB	$8, F1, F2, F3		// e731208820ee
+	VFMINDB	$9, V20, V21, V22	// e76450903eee
+	WFMINDB	$10, V23, V24, V25	// e79780a83eee
+	WFMINDB	$10, F7, F8, F9		// e79780a830ee
 
 	RET
 	RET	foo(SB)

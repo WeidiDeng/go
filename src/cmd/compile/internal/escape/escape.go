@@ -6,12 +6,17 @@ package escape
 
 import (
 	"fmt"
+	"go/constant"
+	"go/token"
+	"internal/goexperiment"
+	"slices"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/logopt"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
+	"cmd/internal/src"
 )
 
 // Escape analysis.
@@ -85,11 +90,19 @@ import (
 // A batch holds escape analysis state that's shared across an entire
 // batch of functions being analyzed at once.
 type batch struct {
-	allLocs  []*location
-	closures []closure
+	allLocs         []*location
+	closures        []closure
+	reassignOracles map[*ir.Func]*ir.ReassignOracle
 
-	heapLoc  location
-	blankLoc location
+	// staleOracles collects the ReassignOracles that cover a function whose IR
+	// was modified by rewriteClosureVarsWithLiterals, so that they can be
+	// dropped from reassignOracles once the rewriting is done.
+	staleOracles []*ir.ReassignOracle
+
+	heapLoc    location
+	mutatorLoc location
+	calleeLoc  location
+	blankLoc   location
 }
 
 // A closure holds a closure expression and its spill hole (i.e.,
@@ -115,21 +128,25 @@ type escape struct {
 	loopDepth int
 }
 
-func Funcs(all []ir.Node) {
-	ir.VisitFuncsBottomUp(all, Batch)
+func Funcs(all []*ir.Func) {
+	// Make a cache of ir.ReassignOracles. The cache is lazily populated.
+	// TODO(thepudds): consider adding a field on ir.Func instead. We might also be able
+	// to use that field elsewhere, like in walk. See discussion in https://go.dev/cl/688075.
+	reassignOracles := make(map[*ir.Func]*ir.ReassignOracle)
+
+	ir.VisitFuncsBottomUp(all, func(list []*ir.Func, recursive bool) {
+		Batch(list, reassignOracles)
+	})
 }
 
 // Batch performs escape analysis on a minimal batch of
 // functions.
-func Batch(fns []*ir.Func, recursive bool) {
-	for _, fn := range fns {
-		if fn.Op() != ir.ODCLFUNC {
-			base.Fatalf("unexpected node: %v", fn)
-		}
-	}
-
+func Batch(fns []*ir.Func, reassignOracles map[*ir.Func]*ir.ReassignOracle) {
 	var b batch
-	b.heapLoc.escapes = true
+	b.heapLoc.attrs = attrEscapes | attrPersists | attrMutates | attrCalls
+	b.mutatorLoc.attrs = attrMutates
+	b.calleeLoc.attrs = attrCalls
+	b.reassignOracles = reassignOracles
 
 	// Construct data-flow graph from syntax trees.
 	for _, fn := range fns {
@@ -140,21 +157,27 @@ func Batch(fns []*ir.Func, recursive bool) {
 		b.initFunc(fn)
 	}
 	for _, fn := range fns {
-		if !fn.IsHiddenClosure() {
+		if !fn.IsClosure() {
 			b.walkFunc(fn)
 		}
 	}
 
 	// We've walked the function bodies, so we've seen everywhere a
-	// variable might be reassigned or have it's address taken. Now we
+	// variable might be reassigned or have its address taken. Now we
 	// can decide whether closures should capture their free variables
 	// by value or reference.
 	for _, closure := range b.closures {
 		b.flowClosure(closure.k, closure.clo)
 	}
 	b.closures = nil
+	b.invalidateStaleOracles()
 
 	for _, loc := range b.allLocs {
+		// Try to replace some non-constant expressions with literals.
+		b.rewriteWithLiterals(loc.n, loc.curfn)
+
+		// Check if the node must be heap allocated for certain reasons
+		// such as OMAKESLICE for a large slice.
 		if why := HeapAllocReason(loc.n); why != "" {
 			b.flow(b.heapHole().addr(loc.n, why), loc)
 		}
@@ -184,19 +207,19 @@ func (b *batch) initFunc(fn *ir.Func) {
 
 	// Allocate locations for local variables.
 	for _, n := range fn.Dcl {
-		e.newLoc(n, false)
+		e.newLoc(n, true)
 	}
 
 	// Also for hidden parameters (e.g., the ".this" parameter to a
 	// method value wrapper).
 	if fn.OClosure == nil {
 		for _, n := range fn.ClosureVars {
-			e.newLoc(n.Canonical(), false)
+			e.newLoc(n.Canonical(), true)
 		}
 	}
 
 	// Initialize resultIndex for result parameters.
-	for i, f := range fn.Type().Results().FieldSlice() {
+	for i, f := range fn.Type().Results() {
 		e.oldLoc(f.Nname.(*ir.Name)).resultIndex = 1 + i
 	}
 }
@@ -251,6 +274,15 @@ func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
 				base.FatalfAt(n.Pos(), "dictionary variable not captured by value")
 			}
 		}
+	}
+
+	// Now that we know which variables are captured by value, try to avoid
+	// capturing the ones that hold a constant altogether.
+	b.rewriteClosureVarsWithLiterals(clo.Func)
+
+	for _, cv := range clo.Func.ClosureVars {
+		n := cv.Canonical()
+		loc := b.oldLoc(cv)
 
 		if base.Flag.LowerM > 1 {
 			how := "ref"
@@ -269,17 +301,151 @@ func (b *batch) flowClosure(k hole, clo *ir.ClosureExpr) {
 	}
 }
 
+// rewriteClosureVarsWithLiterals rewrites the variables that clofn captures by
+// value and whose value is a known constant into ordinary local variables of
+// clofn, initialized with that constant, so that clofn does not need to
+// capture them. A closure that is left capturing nothing is not a closure
+// anymore, and walkClosure can then refer to its function directly instead of
+// building a closure record for it. See #5370.
+func (b *batch) rewriteClosureVarsWithLiterals(clofn *ir.Func) {
+	// All the copies that inlining made of a closure share a single linker
+	// symbol, so we must not specialize the body of just one of them: every
+	// copy would end up capturing the same constants. In particular, a copy
+	// that captures nothing is referred to through its func value symbol,
+	// f.func1·f, and there is one of those per copy under the very same name.
+	if clofn.IsInlinedClosure() {
+		return
+	}
+
+	var ro *ir.ReassignOracle // initialized lazily below, if needed
+	var repl map[*ir.Name]*ir.Name
+	var prefix ir.Nodes
+
+	for _, cv := range clofn.ClosureVars {
+		// Only variables captured by value can hold a constant: escape analysis
+		// has just proven those are neither address taken nor ever reassigned.
+		if !cv.Byval() || !ir.ValidTypeForConst(cv.Type(), constant.MakeUnknown()) {
+			continue
+		}
+
+		// Look up a cached ReassignOracle for the closure, lazily computing one if needed.
+		if ro == nil {
+			ro = b.reassignOracle(clofn)
+			if ro == nil {
+				base.Fatalf("no ReassignOracle for function %v with closure parent %v", clofn, clofn.ClosureParent)
+			}
+		}
+		lit, ok := ro.StaticValue(cv).(*ir.BasicLit)
+		if !ok || !ir.ValidTypeForConst(cv.Type(), lit.Val()) {
+			continue
+		}
+		declPos := cv.Canonical().Pos()
+		if !base.LiteralAllocHash.MatchPos(declPos, nil) {
+			// De-selected by literal alloc optimizations debug hash.
+			continue
+		}
+
+		// Redeclare the variable inside clofn, keeping the name and the
+		// declaration position of the variable it replaces, so that the debug
+		// information still describes it the same way: dwarfgen reports a
+		// variable at the position of its canonical variable, which for a
+		// closure variable is where it was declared in the enclosing function.
+		// The statements below belong to the closure body, though, so they keep
+		// the position of the closure itself.
+		//
+		// Note we assign the constant to a variable instead of substituting it
+		// at every use. Substituting it would report a compile time error for
+		// expressions like make([]byte, n) with a negative n, where the spec
+		// asks for a run time panic instead (see #4085). Assigning it also
+		// keeps the value reachable for rewriteWithLiterals below, which knows
+		// where replacing an expression with a literal is safe.
+		pos := clofn.Pos()
+		name := clofn.NewLocal(declPos, cv.Sym(), cv.Type())
+		name.SetUsed(true)
+		name.SetEsc(ir.EscNever) // a constant never needs to be heap allocated
+		as := typecheck.Stmt(clofn, ir.NewAssignStmt(pos, name, ir.NewBasicLit(pos, cv.Type(), lit.Val())))
+		prefix.Append(typecheck.Stmt(clofn, ir.NewDecl(pos, ir.ODCL, name)))
+		prefix.Append(as)
+		name.Defn = as.(*ir.AssignStmt) // so that a ReassignOracle can still find the constant
+
+		if repl == nil {
+			repl = make(map[*ir.Name]*ir.Name)
+		}
+		repl[cv] = name
+
+		if base.Debug.EscapeDebug >= 3 {
+			base.WarnfAt(pos, "rewriting closure variable %v (%v) to %v", cv, cv.Type(), lit)
+		}
+	}
+
+	if repl == nil {
+		return
+	}
+
+	// Substitute the captured variables with the local variables declared above.
+	var edit func(ir.Node) ir.Node
+	edit = func(n ir.Node) ir.Node {
+		switch n := n.(type) {
+		case *ir.Name:
+			if name := repl[n]; name != nil {
+				return name
+			}
+		case *ir.ClosureExpr:
+			// A closure nested inside clofn reads the variables it captures
+			// out of clofn's closure record, which no longer holds the ones
+			// rewritten above, so point it at the local that holds the
+			// constant instead. Only its captures change; its body is left
+			// alone, which is what lets this work for a closure that inlining
+			// copied.
+			for _, cv := range n.Func.ClosureVars {
+				if name := repl[cv.Outer]; name != nil {
+					cv.Outer = name
+				}
+			}
+		}
+		ir.EditChildren(n, edit)
+		return n
+	}
+	ir.EditChildren(clofn, edit)
+
+	clofn.Body.Prepend(prefix...)
+	clofn.ClosureVars = slices.DeleteFunc(clofn.ClosureVars, func(cv *ir.Name) bool {
+		return repl[cv] != nil
+	})
+
+	// We just modified the IR that ro was initialized from.
+	b.staleOracles = append(b.staleOracles, ro)
+}
+
+// invalidateStaleOracles drops the cached ReassignOracles that cover a function
+// whose IR was modified by rewriteClosureVarsWithLiterals, so that
+// reassignOracle initializes them again from the current IR.
+// See ir.ReassignOracle.Init.
+func (b *batch) invalidateStaleOracles() {
+	if len(b.staleOracles) == 0 {
+		return
+	}
+
+	stale := make(map[*ir.ReassignOracle]bool, len(b.staleOracles))
+	for _, ro := range b.staleOracles {
+		stale[ro] = true
+	}
+	b.staleOracles = nil
+
+	for fn, ro := range b.reassignOracles {
+		if stale[ro] {
+			delete(b.reassignOracles, fn)
+		}
+	}
+}
+
 func (b *batch) finish(fns []*ir.Func) {
 	// Record parameter tags for package export data.
 	for _, fn := range fns {
 		fn.SetEsc(escFuncTagged)
 
-		narg := 0
-		for _, fs := range &types.RecvsParams {
-			for _, f := range fs(fn.Type()).Fields().Slice() {
-				narg++
-				f.Note = b.paramTag(fn, narg, f)
-			}
+		for i, param := range fn.Type().RecvParams() {
+			param.Note = b.paramTag(fn, 1+i, param)
 		}
 	}
 
@@ -288,6 +454,7 @@ func (b *batch) finish(fns []*ir.Func) {
 		if n == nil {
 			continue
 		}
+
 		if n.Op() == ir.ONAME {
 			n := n.(*ir.Name)
 			n.Opt = nil
@@ -300,17 +467,21 @@ func (b *batch) finish(fns []*ir.Func) {
 		// TODO(mdempsky): Update tests to expect this.
 		goDeferWrapper := n.Op() == ir.OCLOSURE && n.(*ir.ClosureExpr).Func.Wrapper()
 
-		if loc.escapes {
+		if loc.hasAttr(attrEscapes) {
 			if n.Op() == ir.ONAME {
 				if base.Flag.CompilingRuntime {
-					base.ErrorfAt(n.Pos(), "%v escapes to heap, not allowed in runtime", n)
+					base.ErrorfAt(n.Pos(), 0, "%v escapes to heap, not allowed in runtime", n)
 				}
 				if base.Flag.LowerM != 0 {
 					base.WarnfAt(n.Pos(), "moved to heap: %v", n)
 				}
 			} else {
 				if base.Flag.LowerM != 0 && !goDeferWrapper {
-					base.WarnfAt(n.Pos(), "%v escapes to heap", n)
+					if n.Op() == ir.OAPPEND {
+						base.WarnfAt(n.Pos(), "append escapes to heap")
+					} else {
+						base.WarnfAt(n.Pos(), "%v escapes to heap", n)
+					}
 				}
 				if logopt.Enabled() {
 					var e_curfn *ir.Func // TODO(mdempsky): Fix.
@@ -320,10 +491,14 @@ func (b *batch) finish(fns []*ir.Func) {
 			n.SetEsc(ir.EscHeap)
 		} else {
 			if base.Flag.LowerM != 0 && n.Op() != ir.ONAME && !goDeferWrapper {
-				base.WarnfAt(n.Pos(), "%v does not escape", n)
+				if n.Op() == ir.OAPPEND {
+					base.WarnfAt(n.Pos(), "append does not escape")
+				} else {
+					base.WarnfAt(n.Pos(), "%v does not escape", n)
+				}
 			}
 			n.SetEsc(ir.EscNone)
-			if loc.transient {
+			if !loc.hasAttr(attrPersists) {
 				switch n.Op() {
 				case ir.OCLOSURE:
 					n := n.(*ir.ClosureExpr)
@@ -337,6 +512,32 @@ func (b *batch) finish(fns []*ir.Func) {
 				}
 			}
 		}
+
+		// If the result of a string->[]byte conversion is never mutated,
+		// then it can simply reuse the string's memory directly.
+		if base.Debug.ZeroCopy != 0 {
+			if n, ok := n.(*ir.ConvExpr); ok && n.Op() == ir.OSTR2BYTES && !loc.hasAttr(attrMutates) {
+				if base.Flag.LowerM >= 1 {
+					base.WarnfAt(n.Pos(), "zero-copy string->[]byte conversion")
+				}
+				n.SetOp(ir.OSTR2BYTESTMP)
+			}
+		}
+	}
+
+	if goexperiment.RuntimeFreegc {
+		// Look for specific patterns of usage, such as appends
+		// to slices that we can prove are not aliased.
+		for _, fn := range fns {
+			a := aliasAnalysis{}
+			a.analyze(fn)
+		}
+	}
+
+	for _, fn := range fns {
+		if ir.MatchAstDump(fn, "escape") {
+			ir.AstDump(fn, "escape, "+ir.FuncName(fn))
+		}
 	}
 }
 
@@ -345,10 +546,10 @@ func (b *batch) finish(fns []*ir.Func) {
 // fn has not yet been analyzed, so its parameters and results
 // should be incorporated directly into the flow graph instead of
 // relying on its escape analysis tagging.
-func (e *escape) inMutualBatch(fn *ir.Name) bool {
+func (b *batch) inMutualBatch(fn *ir.Name) bool {
 	if fn.Defn != nil && fn.Defn.Esc() < escFuncTagged {
 		if fn.Defn.Esc() == escFuncUnknown {
-			base.Fatalf("graph inconsistency: %v", fn)
+			base.FatalfAt(fn.Pos(), "graph inconsistency: %v", fn)
 		}
 		return true
 	}
@@ -372,8 +573,8 @@ const (
 
 func (b *batch) paramTag(fn *ir.Func, narg int, f *types.Field) string {
 	name := func() string {
-		if f.Sym != nil {
-			return f.Sym.Name
+		if f.Nname != nil {
+			return f.Nname.Sym().Name
 		}
 		return fmt.Sprintf("arg#%d", narg)
 	}
@@ -411,6 +612,8 @@ func (b *batch) paramTag(fn *ir.Func, narg int, f *types.Field) string {
 			if diagnose && f.Sym != nil {
 				base.WarnfAt(f.Pos, "%v does not escape", name())
 			}
+			esc.AddMutator(0)
+			esc.AddCallee(0)
 		} else {
 			if diagnose && f.Sym != nil {
 				base.WarnfAt(f.Pos, "leaking param: %v", name())
@@ -452,25 +655,184 @@ func (b *batch) paramTag(fn *ir.Func, narg int, f *types.Field) string {
 	esc := loc.paramEsc
 	esc.Optimize()
 
-	if diagnose && !loc.escapes {
-		if esc.Empty() {
-			base.WarnfAt(f.Pos, "%v does not escape", name())
-		}
-		if x := esc.Heap(); x >= 0 {
-			if x == 0 {
-				base.WarnfAt(f.Pos, "leaking param: %v", name())
-			} else {
-				// TODO(mdempsky): Mention level=x like below?
-				base.WarnfAt(f.Pos, "leaking param content: %v", name())
-			}
-		}
-		for i := 0; i < numEscResults; i++ {
-			if x := esc.Result(i); x >= 0 {
-				res := fn.Type().Results().Field(i).Sym
-				base.WarnfAt(f.Pos, "leaking param: %v to result %v level=%d", name(), res, x)
-			}
-		}
+	if diagnose && !loc.hasAttr(attrEscapes) {
+		b.reportLeaks(f.Pos, name(), esc, fn.Type())
 	}
 
 	return esc.Encode()
+}
+
+func (b *batch) reportLeaks(pos src.XPos, name string, esc leaks, sig *types.Type) {
+	warned := false
+	if x := esc.Heap(); x >= 0 {
+		if x == 0 {
+			base.WarnfAt(pos, "leaking param: %v", name)
+		} else {
+			// TODO(mdempsky): Mention level=x like below?
+			base.WarnfAt(pos, "leaking param content: %v", name)
+		}
+		warned = true
+	}
+	for i := 0; i < numEscResults; i++ {
+		if x := esc.Result(i); x >= 0 {
+			res := sig.Result(i).Nname.Sym().Name
+			base.WarnfAt(pos, "leaking param: %v to result %v level=%d", name, res, x)
+			warned = true
+		}
+	}
+
+	if base.Debug.EscapeMutationsCalls <= 0 {
+		if !warned {
+			base.WarnfAt(pos, "%v does not escape", name)
+		}
+		return
+	}
+
+	if x := esc.Mutator(); x >= 0 {
+		base.WarnfAt(pos, "mutates param: %v derefs=%v", name, x)
+		warned = true
+	}
+	if x := esc.Callee(); x >= 0 {
+		base.WarnfAt(pos, "calls param: %v derefs=%v", name, x)
+		warned = true
+	}
+
+	if !warned {
+		base.WarnfAt(pos, "%v does not escape, mutate, or call", name)
+	}
+}
+
+// rewriteWithLiterals attempts to replace certain non-constant expressions
+// within n with a literal if possible.
+func (b *batch) rewriteWithLiterals(n ir.Node, fn *ir.Func) {
+	if n == nil || fn == nil {
+		return
+	}
+
+	assignTemp := func(pos src.XPos, n ir.Node, init *ir.Nodes) {
+		// Preserve any side effects of n by assigning it to an otherwise unused temp.
+		tmp := typecheck.TempAt(pos, fn, n.Type())
+		init.Append(typecheck.Stmt(fn, ir.NewDecl(pos, ir.ODCL, tmp)))
+		init.Append(typecheck.Stmt(fn, ir.NewAssignStmt(pos, tmp, n)))
+	}
+
+	switch n.Op() {
+	case ir.OMAKESLICE:
+		// Check if we can replace a non-constant argument to make with
+		// a literal to allow for this slice to be stack allocated if otherwise allowed.
+		n := n.(*ir.MakeExpr)
+
+		r := &n.Cap
+		if n.Cap == nil {
+			r = &n.Len
+		}
+
+		// Rewriting the capacity hoists it into n's init list, which runs
+		// before the length is evaluated, so only rewrite it when the length
+		// do not have side effects. See #81696.
+		if r == &n.Cap && ir.AnySideEffects(n.Len) {
+			return
+		}
+
+		if (*r).Op() != ir.OLITERAL {
+			// Look up a cached ReassignOracle for the function, lazily computing one if needed.
+			ro := b.reassignOracle(fn)
+			if ro == nil {
+				base.Fatalf("no ReassignOracle for function %v with closure parent %v", fn, fn.ClosureParent)
+			}
+
+			s := ro.StaticValue(*r)
+			switch s.Op() {
+			case ir.OLITERAL:
+				lit, ok := s.(*ir.BasicLit)
+				if !ok || lit.Val().Kind() != constant.Int {
+					base.Fatalf("unexpected BasicLit Kind")
+				}
+				if constant.Compare(lit.Val(), token.GEQ, constant.MakeInt64(0)) {
+					if !base.LiteralAllocHash.MatchPos(n.Pos(), nil) {
+						// De-selected by literal alloc optimizations debug hash.
+						return
+					}
+					// Preserve any side effects of the original expression, then replace it.
+					assignTemp(n.Pos(), *r, n.PtrInit())
+					*r = ir.NewBasicLit(n.Pos(), (*r).Type(), lit.Val())
+				}
+			case ir.OLEN:
+				x := ro.StaticValue(s.(*ir.UnaryExpr).X)
+				if x.Op() == ir.OSLICELIT {
+					x := x.(*ir.CompLitExpr)
+					// Preserve any side effects of the original expression, then update the value.
+					assignTemp(n.Pos(), *r, n.PtrInit())
+					*r = ir.NewBasicLit(n.Pos(), types.Types[types.TINT], constant.MakeInt64(x.Len))
+				}
+			}
+		}
+	case ir.OCONVIFACE:
+		// Check if we can replace a non-constant expression in an interface conversion with
+		// a literal to avoid heap allocating the underlying interface value.
+		conv := n.(*ir.ConvExpr)
+		if conv.X.Op() != ir.OLITERAL && !conv.X.Type().IsInterface() {
+			// TODO(thepudds): likely could avoid some work by tightening the check of conv.X's type.
+			// Look up a cached ReassignOracle for the function, lazily computing one if needed.
+			ro := b.reassignOracle(fn)
+			if ro == nil {
+				base.Fatalf("no ReassignOracle for function %v with closure parent %v", fn, fn.ClosureParent)
+			}
+			v := ro.StaticValue(conv.X)
+			if v != nil && v.Op() == ir.OLITERAL && ir.ValidTypeForConst(conv.X.Type(), v.Val()) {
+				if !base.LiteralAllocHash.MatchPos(n.Pos(), nil) {
+					// De-selected by literal alloc optimizations debug hash.
+					return
+				}
+				if base.Debug.EscapeDebug >= 3 {
+					base.WarnfAt(n.Pos(), "rewriting OCONVIFACE value from %v (%v) to %v (%v)", conv.X, conv.X.Type(), v, v.Type())
+				}
+				// Preserve any side effects of the original expression, then replace it.
+				assignTemp(conv.Pos(), conv.X, conv.PtrInit())
+				v := v.(*ir.BasicLit)
+				conv.X = ir.NewBasicLit(conv.Pos(), conv.X.Type(), v.Val())
+				typecheck.Expr(fn, conv)
+			}
+		}
+	}
+}
+
+// reassignOracle returns an initialized *ir.ReassignOracle for fn.
+// If fn is a closure, it returns the ReassignOracle for the ultimate parent.
+//
+// A new ReassignOracle is initialized lazily if needed, and the result
+// is cached to reduce duplicative work of preparing a ReassignOracle.
+func (b *batch) reassignOracle(fn *ir.Func) *ir.ReassignOracle {
+	if ro, ok := b.reassignOracles[fn]; ok {
+		return ro // Hit.
+	}
+
+	// For closures, we want the ultimate parent's ReassignOracle,
+	// so walk up the parent chain, if any.
+	f := fn
+	for f.ClosureParent != nil && !f.ClosureParent.IsPackageInit() {
+		f = f.ClosureParent
+	}
+
+	if f != fn {
+		// We found a parent.
+		ro := b.reassignOracles[f]
+		if ro != nil {
+			// Hit, via a parent. Before returning, store this ro for the original fn as well.
+			b.reassignOracles[fn] = ro
+			return ro
+		}
+	}
+
+	// Miss. We did not find a ReassignOracle for fn or a parent, so lazily create one.
+	ro := &ir.ReassignOracle{}
+	ro.Init(f)
+
+	// Cache the answer for the original fn.
+	b.reassignOracles[fn] = ro
+	if f != fn {
+		// Cache for the parent as well.
+		b.reassignOracles[f] = ro
+	}
+	return ro
 }

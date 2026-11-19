@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"time"
 )
 
 func ExampleHijacker() {
@@ -56,23 +57,41 @@ func ExampleGet() {
 	fmt.Printf("%s", body)
 }
 
-func ExampleFileServer() {
-	// Simple static webserver:
-	log.Fatal(http.ListenAndServe(":8080", http.FileServer(http.Dir("/usr/share/doc"))))
+// Simple static webserver.
+func ExampleFileServerFS() {
+	// os.Root blocks following symlinks that lead outside of /usr/share/doc.
+	root, err := os.OpenRoot("/usr/share/doc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	handler := http.FileServerFS(root.FS())
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
 
-func ExampleFileServer_stripPrefix() {
-	// To serve a directory on disk (/tmp) under an alternate URL
-	// path (/tmpfiles/), use StripPrefix to modify the request
-	// URL's path before the FileServer sees it:
-	http.Handle("/tmpfiles/", http.StripPrefix("/tmpfiles/", http.FileServer(http.Dir("/tmp"))))
+// Serving a directory on disk (/usr/share/doc) under an alternate URL path (/docs/).
+func ExampleFileServerFS_stripPrefix() {
+	root, err := os.OpenRoot("/usr/share/doc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	handler := http.FileServerFS(root.FS())
+
+	// Use StripPrefix to remove the /docs/ prefix from the path before
+	// FileServerFS sees it.
+	http.Handle("GET /docs/", http.StripPrefix("/docs/", handler))
 }
 
 func ExampleStripPrefix() {
-	// To serve a directory on disk (/tmp) under an alternate URL
-	// path (/tmpfiles/), use StripPrefix to modify the request
-	// URL's path before the FileServer sees it:
-	http.Handle("/tmpfiles/", http.StripPrefix("/tmpfiles/", http.FileServer(http.Dir("/tmp"))))
+	root, err := os.OpenRoot("/usr/share/doc")
+	if err != nil {
+		log.Fatal(err)
+	}
+	handler := http.FileServerFS(root.FS())
+
+	// To serve a directory on disk (/usr/share/doc) under an alternate URL
+	// path (/docs/), use StripPrefix to modify the request
+	// before FileServerFS sees it.
+	http.Handle("GET /docs/", http.StripPrefix("/docs/", handler))
 }
 
 type apiHandler struct{}
@@ -192,4 +211,51 @@ func ExampleNotFoundHandler() {
 	mux.Handle("/resources/people/", newPeopleHandler())
 
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+func ExampleProtocols_http1() {
+	srv := http.Server{
+		Addr: ":8443",
+	}
+
+	// Serve only HTTP/1.
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+
+	log.Fatal(srv.ListenAndServeTLS("cert.pem", "key.pem"))
+}
+
+func ExampleProtocols_http1or2() {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+
+	// Use either HTTP/1 or HTTP/2.
+	t.Protocols = new(http.Protocols)
+	t.Protocols.SetHTTP1(true)
+	t.Protocols.SetHTTP2(true)
+
+	cli := &http.Client{Transport: t}
+	res, err := cli.Get("http://www.google.com/robots.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	res.Body.Close()
+}
+
+func ExampleCrossOriginProtection() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/hello", func(w http.ResponseWriter, req *http.Request) {
+		io.WriteString(w, "request allowed\n")
+	})
+
+	srv := http.Server{
+		Addr:         ":8080",
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		// Use CrossOriginProtection.Handler to block all non-safe cross-origin
+		// browser requests to mux.
+		Handler: http.NewCrossOriginProtection().Handler(mux),
+	}
+
+	log.Fatal(srv.ListenAndServe())
 }

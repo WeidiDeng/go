@@ -6,7 +6,9 @@ package constraint
 
 import (
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -24,6 +26,10 @@ var exprStringTests = []struct {
 		out: "!abc",
 	},
 	{
+		x:   not(not(tag("abc"))),
+		out: "abc",
+	},
+	{
 		x:   not(and(tag("abc"), tag("def"))),
 		out: "!(abc && def)",
 	},
@@ -32,7 +38,15 @@ var exprStringTests = []struct {
 		out: "abc && (def || ghi)",
 	},
 	{
+		x:   and(tag("abc"), not(not(or(tag("def"), tag("ghi"))))),
+		out: "abc && (def || ghi)",
+	},
+	{
 		x:   or(and(tag("abc"), tag("def")), tag("ghi")),
+		out: "(abc && def) || ghi",
+	},
+	{
+		x:   or(not(not(and(tag("abc"), tag("def")))), tag("ghi")),
 		out: "(abc && def) || ghi",
 	},
 }
@@ -194,7 +208,7 @@ func TestExprEval(t *testing.T) {
 				return tag == "yes"
 			}
 			ok := x.Eval(hasTag)
-			if ok != tt.ok || !reflect.DeepEqual(tags, wantTags) {
+			if ok != tt.ok || !maps.Equal(tags, wantTags) {
 				t.Errorf("Eval(%#q):\nhave ok=%v, tags=%v\nwant ok=%v, tags=%v",
 					tt.in, ok, tags, tt.ok, wantTags)
 			}
@@ -222,7 +236,7 @@ var parsePlusBuildExprTests = []struct {
 func TestParsePlusBuildExpr(t *testing.T) {
 	for i, tt := range parsePlusBuildExprTests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			x := parsePlusBuildExpr(tt.in)
+			x, _ := parsePlusBuildExpr(tt.in)
 			if x.String() != tt.x.String() {
 				t.Errorf("parsePlusBuildExpr(%q):\nhave %v\nwant %v", tt.in, x, tt.x)
 			}
@@ -313,8 +327,71 @@ func TestPlusBuildLines(t *testing.T) {
 			for _, line := range tt.out {
 				want = append(want, "// +build "+line)
 			}
-			if !reflect.DeepEqual(lines, want) {
+			if !slices.Equal(lines, want) {
 				t.Errorf("PlusBuildLines(%q):\nhave %q\nwant %q", tt.in, lines, want)
+			}
+		})
+	}
+}
+
+func TestSizeLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		expr string
+	}{
+		{
+			name: "go:build or limit",
+			expr: "//go:build " + strings.Repeat("a || ", maxSize+2),
+		},
+		{
+			name: "go:build and limit",
+			expr: "//go:build " + strings.Repeat("a && ", maxSize+2),
+		},
+		{
+			name: "go:build and depth limit",
+			expr: "//go:build " + strings.Repeat("(a &&", maxSize+2),
+		},
+		{
+			name: "go:build or depth limit",
+			expr: "//go:build " + strings.Repeat("(a ||", maxSize+2),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.expr)
+			if err == nil {
+				t.Error("expression did not trigger limit")
+			} else if syntaxErr, ok := err.(*SyntaxError); !ok || syntaxErr.Err != "build expression too large" {
+				if !ok {
+					t.Errorf("unexpected error: %v", err)
+				} else {
+					t.Errorf("unexpected syntax error: %s", syntaxErr.Err)
+				}
+			}
+		})
+	}
+}
+
+func TestPlusSizeLimits(t *testing.T) {
+	maxOldSize := 100
+	for _, tc := range []struct {
+		name string
+		expr string
+	}{
+		{
+			name: "+build or limit",
+			expr: "// +build " + strings.Repeat("a ", maxOldSize+2),
+		},
+		{
+			name: "+build and limit",
+			expr: "// +build " + strings.Repeat("a,", maxOldSize+2),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.expr)
+			if err == nil {
+				t.Error("expression did not trigger limit")
+			} else if err != errComplex {
+				t.Errorf("unexpected error: got %q, want %q", err, errComplex)
 			}
 		})
 	}

@@ -1,0 +1,80 @@
+!sum
+# Average (unsigned byte, unsigned word)
+# Instructions: VPAVGB, VPAVGW
+- go: Average
+  asm: "VPAVG[BW]" # Matches VPAVGB (byte) and VPAVGW (word)
+  in:
+  - &uint_t # $t will be Uint8xN for VPAVGB, Uint16xN for VPAVGW
+    go: $t
+    base: uint
+  - *uint_t
+  out:
+  - *uint_t
+
+# Absolute Value (signed byte, word, dword, qword)
+# Instructions: VPABSB, VPABSW, VPABSD, VPABSQ
+#
+# VPABSB, VPABSW and VPABSD are AVX at 128 bits and AVX2 at 256 bits, the
+# feature levels midway requires of those widths, so Abs on 8-, 16- and 32-bit
+# elements uses them at every width. VPABSQ, for 64-bit elements, needs AVX-512
+# at every width, so Abs uses it only at 512 bits; at 128 and 256 bits it is
+# emulated with AVX and AVX2 in ops_emulated_amd64.go, and AMD64.rules turns
+# that emulation back into VPABSQ (absInt64AVX512 below) where AVX-512 is
+# known to be available.
+- go: Abs
+  asm: "VPABS[BWD]" # Matches VPABSB, VPABSW, VPABSD
+  in:
+  - &int_t # $t will be Int8xN, Int16xN, Int32xN
+    go: $t
+    base: int
+  out:
+  - base: uint # Output is magnitude, requires uint for full range
+- go: Abs
+  asm: "VPABSQ"
+  in:
+  - go: $t
+    base: int
+    bits: 512
+  out:
+  - base: uint
+- go: absInt64AVX512
+  asm: "VPABSQ"
+  in:
+  - go: $t
+    base: int
+    bits: (128|256)
+  out:
+  - base: uint
+
+# Sign Operation (signed byte, word, dword)
+# Instructions: VPSIGNB, VPSIGNW, VPSIGND
+- go: MulSign
+  asm: "VPSIGN[BWD]" # Matches VPSIGNB, VPSIGNW, VPSIGND
+  in:
+  - *int_t # value to multiply by sign
+  - *int_t # value from which to take the sign
+  out:
+  - *int_t
+
+# Population Count (count set bits in each element)
+# Instructions: VPOPCNTB, VPOPCNTW (AVX512_BITALG)
+#               VPOPCNTD, VPOPCNTQ (AVX512_VPOPCNTDQ)
+- go: onesCount # lower case to coexist with feature-checking emulation
+  asm: "VPOPCNTB"
+  hideMaskMethods: true
+  in:
+  - &any
+    go: $t
+  out:
+  - *any
+
+# Population Count (count set bits in each element)
+# Instructions: VPOPCNTB, VPOPCNTW (AVX512_BITALG)
+#               VPOPCNTD, VPOPCNTQ (AVX512_VPOPCNTDQ)
+- go: OnesCount
+  asm: "VPOPCNT[WDQ]"
+  in:
+  - &any
+    go: $t
+  out:
+  - *any

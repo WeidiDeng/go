@@ -195,18 +195,15 @@ func shifts6() {
 	_ = float32(1.0 /* ERROR "must be integer" */ <<s)
 	_ = float32(1.1 /* ERROR "must be integer" */ <<s)
 
-	// TODO(gri) Re-enable these tests once types2 has the go/types fixes.
-	//           Issue #52080.
-	// _ = int32(0x80000000 /* ERROR "overflows int32" */ << s)
-	// TODO(rfindley) Eliminate the redundant error here.
-	// _ = int32(( /* ERROR "truncated to int32" */ 0x80000000 /* ERROR "truncated to int32" */ + 0i) << s)
+	_ = int32(0x80000000 /* ERROR "overflows int32" */ << s)
+	_ = int32((0x80000000 /* ERROR "truncated to int32" */ + 0i) << s)
 
 	_ = int(1+0i<<0)
-	// _ = int((1+0i)<<s)
-	// _ = int(1.0<<s)
-	// _ = int(complex(1, 0)<<s)
+	_ = int((1+0i)<<s)
+	_ = int(1.0<<s)
+	_ = int(complex(1, 0)<<s)
 	_ = int(float32/* ERROR "must be integer" */(1.0) <<s)
-	_ = int(1.1 /* ERROR must be integer */ <<s)
+	_ = int(1.1 /* ERROR "must be integer" */ <<s)
 	_ = int(( /* ERROR "must be integer" */ 1+1i)  <<s)
 
 	_ = complex(1 /* ERROR "must be integer" */ <<s, 0)
@@ -247,38 +244,38 @@ func shifts7() {
 
 	_ = (1<<s)<<(1<<s)
 	_ = (1<<s)<<(1.<<s)
-	_ = ( /* ERROR "integer" */ 1.<<s)<<(1<<s)
-	_ = ( /* ERROR "integer" */ 1.<<s)<<(1.<<s)
+	_ = (1. /* ERROR "integer" */ <<s)<<(1<<s)
+	_ = (1. /* ERROR "integer" */ <<s)<<(1.<<s)
 
 	x = (1<<s)<<(1<<s)
 	x = (1<<s)<<(1.<<s)
-	x = ( /* ERROR "integer" */ 1.<<s)<<(1<<s)
-	x = ( /* ERROR "integer" */ 1.<<s)<<(1.<<s)
+	x = (1.<<s)<<(1<<s)
+	x = (1.<<s)<<(1.<<s)
 }
 
 func shifts8() {
 	// shift examples from shift discussion: better error messages
 	var s uint
-	_ = 1.0 /* ERROR "shifted operand 1.0 \(type float64\) must be integer" */ <<s == 1
-	_ = 1.0 /* ERROR "shifted operand 1.0 \(type float64\) must be integer" */ <<s == 1.0
-	_ = 1 /* ERROR "shifted operand 1 \(type float64\) must be integer" */ <<s == 1.0
-	_ = 1 /* ERROR "shifted operand 1 \(type float64\) must be integer" */ <<s + 1.0 == 1
-	_ = 1 /* ERROR "shifted operand 1 \(type float64\) must be integer" */ <<s + 1.1 == 1
-	_ = 1 /* ERROR "shifted operand 1 \(type float64\) must be integer" */ <<s + 1 == 1.0
+	_ = 1.0 /* ERROR "shifted operand 1.0 (type float64) must be integer" */ <<s == 1
+	_ = 1.0 /* ERROR "shifted operand 1.0 (type float64) must be integer" */ <<s == 1.0
+	_ = 1 /* ERROR "shifted operand 1 (type float64) must be integer" */ <<s == 1.0
+	_ = 1 /* ERROR "shifted operand 1 (type float64) must be integer" */ <<s + 1.0 == 1
+	_ = 1 /* ERROR "shifted operand 1 (type float64) must be integer" */ <<s + 1.1 == 1
+	_ = 1 /* ERROR "shifted operand 1 (type float64) must be integer" */ <<s + 1 == 1.0
 
 	// additional cases
-	_ = complex(1.0 /* ERROR "shifted operand 1.0 \(type float64\) must be integer" */ <<s, 1)
-	_ = complex(1.0, 1 /* ERROR "shifted operand 1 \(type float64\) must be integer" */ <<s)
+	_ = complex(1.0 /* ERROR "shifted operand 1.0 (type float64) must be integer" */ <<s, 1)
+	_ = complex(1.0, 1 /* ERROR "shifted operand 1 (type float64) must be integer" */ <<s)
 
 	_ = int(1.<<s)
-	_ = int(1.1 /* ERROR "shifted operand .* must be integer" */ <<s)
-	_ = float32(1 /* ERROR "shifted operand .* must be integer" */ <<s)
-	_ = float32(1. /* ERROR "shifted operand .* must be integer" */ <<s)
-	_ = float32(1.1 /* ERROR "shifted operand .* must be integer" */ <<s)
+	_ = int(1.1 /* ERRORx `shifted operand .* must be integer` */ <<s)
+	_ = float32(1 /* ERRORx `shifted operand .* must be integer` */ <<s)
+	_ = float32(1. /* ERRORx `shifted operand .* must be integer` */ <<s)
+	_ = float32(1.1 /* ERRORx `shifted operand .* must be integer` */ <<s)
 	// TODO(gri) the error messages for these two are incorrect - disabled for now
 	// _ = complex64(1<<s)
 	// _ = complex64(1.<<s)
-	_ = complex64(1.1 /* ERROR "shifted operand .* must be integer" */ <<s)
+	_ = complex64(1.1 /* ERRORx `shifted operand .* must be integer` */ <<s)
 }
 
 func shifts9() {
@@ -382,7 +379,7 @@ func issue21727() {
 	var a = make([]int, 1<<s + 1.2 /* ERROR "truncated to int" */ )
 	var _ = a[1<<s - 2.3 /* ERROR "truncated to int" */ ]
 	var _ int = 1<<s + 3.4 /* ERROR "truncated to int" */
-	var _ = string(1 /* ERROR shifted operand 1 .* must be integer */ << s)
+	var _ = string(1 /* ERROR "cannot convert 1 << s (untyped int value) to type string: argument must have type byte or rune with go1.28 or later" */ << s)
 	var _ = string(1.0 /* ERROR "cannot convert" */ << s)
 }
 

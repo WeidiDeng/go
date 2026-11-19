@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,7 +40,7 @@ var osDefaultInheritEnv = func() []string {
 	switch runtime.GOOS {
 	case "darwin", "ios":
 		return []string{"DYLD_LIBRARY_PATH"}
-	case "linux", "freebsd", "netbsd", "openbsd":
+	case "android", "linux", "freebsd", "netbsd", "openbsd":
 		return []string{"LD_LIBRARY_PATH"}
 	case "hpux":
 		return []string{"LD_LIBRARY_PATH", "SHLIB_PATH"}
@@ -115,23 +116,19 @@ func removeLeadingDuplicates(env []string) (ret []string) {
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	root := h.Root
-	if root == "" {
-		root = "/"
-	}
-
 	if len(req.TransferEncoding) > 0 && req.TransferEncoding[0] == "chunked" {
 		rw.WriteHeader(http.StatusBadRequest)
 		rw.Write([]byte("Chunked request bodies are not supported by CGI."))
 		return
 	}
 
-	pathInfo := req.URL.Path
-	if root != "/" && strings.HasPrefix(pathInfo, root) {
-		pathInfo = pathInfo[len(root):]
-	}
+	root := strings.TrimRight(h.Root, "/")
+	pathInfo := strings.TrimPrefix(req.URL.Path, root)
 
 	port := "80"
+	if req.TLS != nil {
+		port = "443"
+	}
 	if matches := trailingPort.FindStringSubmatch(req.Host); len(matches) != 0 {
 		port = matches[1]
 	}
@@ -281,7 +278,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		headerLines++
 		header, val, ok := strings.Cut(string(line), ":")
 		if !ok {
-			h.printf("cgi: bogus header line: %s", string(line))
+			h.printf("cgi: bogus header line: %s", line)
 			continue
 		}
 		if !httpguts.ValidHeaderFieldName(header) {
@@ -313,7 +310,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if loc := headers.Get("Location"); loc != "" {
-		if strings.HasPrefix(loc, "/") && h.PathLocationHandler != nil {
+		// If the Location starts with //, this is a protocol-relative redirect.
+		if strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") && h.PathLocationHandler != nil {
 			h.handleInternalRedirect(rw, req, loc)
 			return
 		}
@@ -365,7 +363,7 @@ func (h *Handler) printf(format string, v ...any) {
 }
 
 func (h *Handler) handleInternalRedirect(rw http.ResponseWriter, req *http.Request, path string) {
-	url, err := req.URL.Parse(path)
+	u, err := url.ParseRequestURI(path)
 	if err != nil {
 		rw.WriteHeader(http.StatusInternalServerError)
 		h.printf("cgi: error resolving local URI path %q: %v", path, err)
@@ -382,12 +380,12 @@ func (h *Handler) handleInternalRedirect(rw http.ResponseWriter, req *http.Reque
 	// second request?
 	newReq := &http.Request{
 		Method:     "GET",
-		URL:        url,
+		URL:        u,
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     make(http.Header),
-		Host:       url.Host,
+		Host:       req.Host,
 		RemoteAddr: req.RemoteAddr,
 		TLS:        req.TLS,
 	}

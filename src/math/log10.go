@@ -5,7 +5,7 @@
 package math
 
 // Log10 returns the decimal logarithm of x.
-// The special cases are the same as for Log.
+// The special cases are the same as for [Log].
 func Log10(x float64) float64 {
 	if haveArchLog10 {
 		return archLog10(x)
@@ -18,7 +18,7 @@ func log10(x float64) float64 {
 }
 
 // Log2 returns the binary logarithm of x.
-// The special cases are the same as for Log.
+// The special cases are the same as for [Log].
 func Log2(x float64) float64 {
 	if haveArchLog2 {
 		return archLog2(x)
@@ -32,6 +32,10 @@ func log2(x float64) float64 {
 	// Don't depend on Log(0.5)*(1/Ln2)+exp being exactly exp-1.
 	if frac == 0.5 {
 		return float64(exp - 1)
+	}
+	// Avoid cancellation near 1. x-1 is exact for x in [0.5, 2).
+	if exp == 0 || exp == 1 {
+		return Log1p(x-1) * (1 / Ln2)
 	}
 	return Log(frac)*(1/Ln2) + float64(exp)
 }

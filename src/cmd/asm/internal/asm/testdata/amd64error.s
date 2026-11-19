@@ -3,7 +3,8 @@
 // license that can be found in the LICENSE file.
 
 TEXT errors(SB),$0
-	MOVL	foo<>(SB)(AX), AX	// ERROR "invalid instruction"
+	MOVL	foo<>(SB)(AX), AX	// ERROR "base register not allowed with global symbol"
+	MOVL	foo<>(SB)(AX*1), AX	// ERROR "invalid instruction"
 	MOVL	(AX)(SP*1), AX		// ERROR "invalid instruction"
 	EXTRACTPS $4, X2, (BX)          // ERROR "invalid instruction"
 	EXTRACTPS $-1, X2, (BX)         // ERROR "invalid instruction"
@@ -74,7 +75,7 @@ TEXT errors(SB),$0
 	MOVQ (AX), DR3                  // ERROR "invalid instruction"
 	MOVQ (AX), DR6                  // ERROR "invalid instruction"
 	MOVQ (AX), DR7                  // ERROR "invalid instruction"
-        // AVX512GATHER index/index #UD cases.
+	// AVX512GATHER index/index #UD cases.
 	VPGATHERQQ (BP)(X2*2), K1, X2   // ERROR "index and destination registers should be distinct"
 	VPGATHERQQ (BP)(Y15*2), K1, Y15 // ERROR "index and destination registers should be distinct"
 	VPGATHERQQ (BP)(Z20*2), K1, Z20 // ERROR "index and destination registers should be distinct"
@@ -132,7 +133,7 @@ TEXT errors(SB),$0
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
 	VADDPD.BCST X3, X2, K1, X1       // ERROR "illegal broadcast without memory argument"
-	// CLWB instuctions:
+	// CLWB instructions:
 	CLWB BX                          // ERROR "invalid instruction"
 	// CLDEMOTE instructions:
 	CLDEMOTE BX                      // ERROR "invalid instruction"
@@ -140,4 +141,23 @@ TEXT errors(SB),$0
 	TPAUSE (BX)                      // ERROR "invalid instruction"
 	UMONITOR (BX)                    // ERROR "invalid instruction"
 	UMWAIT (BX)                      // ERROR "invalid instruction"
+	// .Z instructions
+	VMOVDQA32.Z Z0, Z1               // ERROR "mask register must be specified for .Z instructions"
+	VMOVDQA32.Z Z0, K0, Z1           // ERROR "invalid instruction"
+	VMOVDQA32.Z Z0, K1, Z1           // ok
+
+	RDPID (BX)			 // ERROR "invalid instruction"
+
+	// High byte registers cannot be encoded with a REX prefix.
+	MOVB (BX)(R8*4), AH              // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVB AH, (R8)                    // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVB AH, SIB                     // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVB R9B, BH                     // ERROR "cannot use BH in instruction requiring REX prefix"
+	MOVBQZX AH, AX                   // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVBQZX AH, R8                   // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVBLZX AH, R9                   // ERROR "cannot use AH in instruction requiring REX prefix"
+	MOVBQSX DH, AX                   // ERROR "cannot use DH in instruction requiring REX prefix"
+	MOVBWZX CH, R10                  // ERROR "cannot use CH in instruction requiring REX prefix"
+	ADDB $1, CH                      // ok
+
 	RET

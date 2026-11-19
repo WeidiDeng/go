@@ -6,10 +6,13 @@ package work
 
 import (
 	"bytes"
+	"cmd/internal/archive"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cache"
@@ -17,43 +20,50 @@ import (
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/str"
 	"cmd/internal/buildid"
+	"cmd/internal/pathcache"
+	"cmd/internal/quoted"
+	"cmd/internal/telemetry/counter"
 )
 
 // Build IDs
 //
 // Go packages and binaries are stamped with build IDs that record both
 // the action ID, which is a hash of the inputs to the action that produced
-// the packages or binary, and the content ID, which is a hash of the action
-// output, namely the archive or binary itself. The hash is the same one
+// the packages or binary, and their content IDs which are hashes of the
+// action outputs. The content IDs are hashes of the export and object files
+// in the case of gc package builds, or of the entire archive or binary, in the case
+// of gccgo builds or link actions. These hashes are the same
 // used by the build artifact cache (see cmd/go/internal/cache), but
 // truncated when stored in packages and binaries, as the full length is not
-// needed and is a bit unwieldy. The precise form is
+// needed and is a bit unwieldy. The precise forms are
 //
-//	actionID/[.../]contentID
+//	actionID/contentID(export)/contentID(object)
+//	actionID(link)/actionID(build)/contentID(build object)/contentID(link)
 //
-// where the actionID and contentID are prepared by buildid.HashToString below.
+// where the first form is used for build actions and the second form is used
+// for link actions. The actionID and contentID are prepared by buildid.HashToString below.
 // and are found by looking for the first or last slash.
-// Usually the buildID is simply actionID/contentID, but see below for an
-// exception.
+// gccgo actions use the same gccgo output for the export and object
+// content ids because they do not have separate export data files.
 //
 // The build ID serves two primary purposes.
 //
-// 1. The action ID half allows installed packages and binaries to serve as
+// 1. The action ID part allows installed packages and binaries to serve as
 // one-element cache entries. If we intend to build math.a with a given
 // set of inputs summarized in the action ID, and the installed math.a already
 // has that action ID, we can reuse the installed math.a instead of rebuilding it.
 //
-// 2. The content ID half allows the easy preparation of action IDs for steps
-// that consume a particular package or binary. The content hash of every
-// input file for a given action must be included in the action ID hash.
-// Storing the content ID in the build ID lets us read it from the file with
-// minimal I/O, instead of reading and hashing the entire file.
-// This is especially effective since packages and binaries are typically
+// 2. The content ID parts allow the easy preparation of action IDs for steps
+// that consume a particular package's export or object files or its binary.
+// The content hash of every input file for a given action must be included
+// in the action ID hash. Storing the content IDs in the build ID lets us read
+// it from the file with minimal I/O, instead of reading and hashing the entire
+// file. This is especially effective since packages and binaries are typically
 // the largest inputs to an action.
 //
-// Separating action ID from content ID is important for reproducible builds.
+// Separating action ID from content IDs is important for reproducible builds.
 // The compiler is compiled with itself. If an output were represented by its
-// own action ID (instead of content ID) when computing the action ID of
+// own action ID (instead of content IDs) when computing the action ID of
 // the next step in the build process, then the compiler could never have its
 // own input action ID as its output action ID (short of a miraculous hash collision).
 // Instead we use the content IDs to compute the next action ID, and because
@@ -71,20 +81,19 @@ import (
 // means knowing the content ID of main.a, which we did not keep.
 // To sidestep this problem, each binary actually stores an expanded build ID:
 //
-//	actionID(binary)/actionID(main.a)/contentID(main.a)/contentID(binary)
+//	actionID(binary)/actionID(main.a)/contentID(main.a object)/contentID(binary)
 //
-// (Note that this can be viewed equivalently as:
-//
-//	actionID(binary)/buildID(main.a)/contentID(binary)
-//
-// Storing the buildID(main.a) in the middle lets the computations that care
-// about the prefix or suffix halves ignore the middle and preserves the
-// original build ID as a contiguous string.)
+// where contentID(main.a object) only includes the hash of main.a's object
+// files but not its export data.
+// Storing the action and object content ids of the build action in the middle
+// lets the computations that care about the prefix or suffix halves ignore the middle,
+// while keeping the action and output info needed to check that the build
+// action does not need to be rerun.
 //
 // During the build, when it's time to build main.a, the gofmt binary has the
 // information needed to decide whether the eventual link would produce
 // the same binary: if the action ID for main.a's inputs matches and then
-// the action ID for the link step matches when assuming the given main.a
+// the action ID for the link step matches when assuming the given main.a's object's
 // content ID, then the binary as a whole is up-to-date and need not be rebuilt.
 //
 // This is all a bit complex and may be simplified once we can rely on the
@@ -94,8 +103,8 @@ import (
 
 const buildIDSeparator = "/"
 
-// actionID returns the action ID half of a build ID.
-func actionID(buildID string) string {
+// buildActionID returns the action ID part of a build ID.
+func buildActionID(buildID string) string {
 	i := strings.Index(buildID, buildIDSeparator)
 	if i < 0 {
 		return buildID
@@ -103,9 +112,18 @@ func actionID(buildID string) string {
 	return buildID[:i]
 }
 
-// contentID returns the content ID half of a build ID.
-func contentID(buildID string) string {
+// buildObjectID returns the content ID for the object data.
+func buildObjectID(buildID string) string {
 	return buildID[strings.LastIndex(buildID, buildIDSeparator)+1:]
+}
+
+// buildExportID returns the content ID for the export data.
+func buildExportID(buildID string) string {
+	if buildID == "" {
+		return ""
+	}
+	chopContent := buildID[:strings.LastIndex(buildID, buildIDSeparator)]
+	return chopContent[strings.LastIndex(chopContent, buildIDSeparator)+1:]
 }
 
 // toolID returns the unique ID to use for the current copy of the
@@ -140,58 +158,61 @@ func contentID(buildID string) string {
 // build setups agree on details like $GOROOT and file name paths, but at least the
 // tool IDs do not make it impossible.)
 func (b *Builder) toolID(name string) string {
-	b.id.Lock()
-	id := b.toolIDCache[name]
-	b.id.Unlock()
+	return b.toolIDCache.Do(name, func() string {
+		path := base.Tool(name)
+		desc := "go tool " + name
 
-	if id != "" {
-		return id
-	}
-
-	path := base.Tool(name)
-	desc := "go tool " + name
-
-	// Special case: undocumented -vettool overrides usual vet,
-	// for testing vet or supplying an alternative analysis tool.
-	if name == "vet" && VetTool != "" {
-		path = VetTool
-		desc = VetTool
-	}
-
-	cmdline := str.StringList(cfg.BuildToolexec, path, "-V=full")
-	cmd := exec.Command(cmdline[0], cmdline[1:]...)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if stderr.Len() > 0 {
-			os.Stderr.WriteString(stderr.String())
+		// Special case: -{vet,fix}tool overrides usual cmd/{vet,fix}
+		// for testing or supplying an alternative analysis tool.
+		// (We use only "vet" terminology in the action graph.)
+		if name == "vet" {
+			path = VetTool
+			desc = VetTool
 		}
-		base.Fatalf("go: error obtaining buildID for %s: %v", desc, err)
-	}
 
-	line := stdout.String()
-	f := strings.Fields(line)
-	if len(f) < 3 || f[0] != name && path != VetTool || f[1] != "version" || f[2] == "devel" && !strings.HasPrefix(f[len(f)-1], "buildID=") {
-		base.Fatalf("go: parsing buildID from %s -V=full: unexpected output:\n\t%s", desc, line)
-	}
-	if f[2] == "devel" {
-		// On the development branch, use the content ID part of the build ID.
-		id = contentID(f[len(f)-1])
-	} else {
+		cmdline := str.StringList(cfg.BuildToolexec, path, "-V=full")
+		cmd := exec.Command(cmdline[0], cmdline[1:]...)
+		var stdout, stderr strings.Builder
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			if stderr.Len() > 0 {
+				os.Stderr.WriteString(stderr.String())
+			}
+			base.Fatalf("go: error obtaining buildID for %s: %v", desc, err)
+		}
+
+		line := stdout.String()
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] != name && path != VetTool || f[1] != "version" || strings.Contains(f[2], "devel") && !strings.HasPrefix(f[len(f)-1], "buildID=") {
+			base.Fatalf("go: parsing buildID from %s -V=full: unexpected output:\n\t%s", desc, line)
+		}
+		if strings.Contains(f[2], "devel") {
+			// On the development branch, use the content ID part of the build ID.
+			return buildObjectID(f[len(f)-1])
+		}
 		// For a release, the output is like: "compile version go1.9.1 X:framepointer".
 		// Use the whole line.
-		id = strings.TrimSpace(line)
-	}
-
-	b.id.Lock()
-	b.toolIDCache[name] = id
-	b.id.Unlock()
-
-	return id
+		return strings.TrimSpace(line)
+	})
 }
 
-// gccToolID returns the unique ID to use for a tool that is invoked
+// gccToolID returns the unique ID to use for a C, C++, or Fortran compiler
+// driven by cgo. Those compilers are not otherwise invoked under -toolexec, so
+// their version probe is not run under -toolexec either (see
+// go.dev/issue/64580).
+func (b *Builder) gccToolID(name, language string) (id, exe string, err error) {
+	return b.gccToolIDPrefix(name, language, nil)
+}
+
+// gccgoToolID returns the unique ID to use for the gccgo compiler. gccgo is a
+// Go toolchain compiler, treated like cmd/compile, so its version probe is run
+// under cfg.BuildToolexec.
+func (b *Builder) gccgoToolID(name, language string) (id, exe string, err error) {
+	return b.gccToolIDPrefix(name, language, cfg.BuildToolexec)
+}
+
+// gccToolIDPrefix returns the unique ID to use for a tool that is invoked
 // by the GCC driver. This is used particularly for gccgo, but this can also
 // be used for gcc, g++, gfortran, etc.; those tools all use the GCC
 // driver under different names. The approach used here should also
@@ -201,43 +222,74 @@ func (b *Builder) toolID(name string) string {
 //
 // For these tools we have no -V=full option to dump the build ID,
 // but we can run the tool with -v -### to reliably get the compiler proper
-// and hash that. That will work in the presence of -toolexec.
+// and hash that.
 //
 // In order to get reproducible builds for released compilers, we
 // detect a released compiler by the absence of "experimental" in the
 // --version output, and in that case we just use the version string.
-func (b *Builder) gccToolID(name, language string) (string, error) {
+//
+// gccToolIDPrefix also returns the underlying executable for the compiler.
+// The caller assumes that stat of the exe can be used, combined with the id,
+// to detect changes in the underlying compiler. The returned exe can be empty,
+// which means to rely only on the id.
+//
+// prefix is prepended to the probe command line so that callers can run the
+// probe under cfg.BuildToolexec. Callers should generally use the gccToolID
+// and gccgoToolID wrappers rather than calling gccToolIDPrefix directly.
+func (b *Builder) gccToolIDPrefix(name, language string, prefix []string) (id, exe string, err error) {
+	//TODO: Use par.Cache instead of a mutex and a map. See Builder.toolID.
 	key := name + "." + language
 	b.id.Lock()
-	id := b.toolIDCache[key]
+	id = b.gccToolIDCache[key]
+	exe = b.gccToolIDCache[key+".exe"]
 	b.id.Unlock()
 
 	if id != "" {
-		return id, nil
+		return id, exe, nil
 	}
 
 	// Invoke the driver with -### to see the subcommands and the
 	// version strings. Use -x to set the language. Pretend to
 	// compile an empty file on standard input.
-	cmdline := str.StringList(cfg.BuildToolexec, name, "-###", "-x", language, "-c", "-")
+	cmdline := str.StringList(prefix, name, "-###", "-x", language, "-c", "-")
 	cmd := exec.Command(cmdline[0], cmdline[1:]...)
 	// Force untranslated output so that we see the string "version".
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%s: %v; output: %q", name, err, out)
+		return "", "", fmt.Errorf("%s: %v; output: %q", name, err, out)
 	}
 
 	version := ""
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		if fields := strings.Fields(line); len(fields) > 1 && fields[1] == "version" {
-			version = line
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if strings.HasSuffix(field, ":") {
+				// Avoid parsing fields of lines like "Configured with: …", which may
+				// contain arbitrary substrings.
+				break
+			}
+			if field == "version" && i < len(fields)-1 {
+				// Check that the next field is plausibly a version number.
+				// We require only that it begins with an ASCII digit,
+				// since we don't know what version numbering schemes a given
+				// C compiler may use. (Clang and GCC mostly seem to follow the scheme X.Y.Z,
+				// but in https://go.dev/issue/64619 we saw "8.3 [DragonFly]", and who knows
+				// what other C compilers like "zig cc" might report?)
+				next := fields[i+1]
+				if len(next) > 0 && next[0] >= '0' && next[0] <= '9' {
+					version = line
+					break
+				}
+			}
+		}
+		if version != "" {
 			break
 		}
 	}
 	if version == "" {
-		return "", fmt.Errorf("%s: can not find version number in %q", name, out)
+		return "", "", fmt.Errorf("%s: can not find version number in %q", name, out)
 	}
 
 	if !strings.Contains(version, "experimental") {
@@ -248,28 +300,28 @@ func (b *Builder) gccToolID(name, language string) (string, error) {
 		// a leading space is the compiler proper.
 		compiler := ""
 		for _, line := range lines {
-			if len(line) > 1 && line[0] == ' ' {
+			if strings.HasPrefix(line, " ") && !strings.HasPrefix(line, " (in-process)") {
 				compiler = line
 				break
 			}
 		}
 		if compiler == "" {
-			return "", fmt.Errorf("%s: can not find compilation command in %q", name, out)
+			return "", "", fmt.Errorf("%s: can not find compilation command in %q", name, out)
 		}
 
-		fields := strings.Fields(compiler)
+		fields, _ := quoted.Split(compiler)
 		if len(fields) == 0 {
-			return "", fmt.Errorf("%s: compilation command confusion %q", name, out)
+			return "", "", fmt.Errorf("%s: compilation command confusion %q", name, out)
 		}
-		exe := fields[0]
+		exe = fields[0]
 		if !strings.ContainsAny(exe, `/\`) {
-			if lp, err := exec.LookPath(exe); err == nil {
+			if lp, err := pathcache.LookPath(exe); err == nil {
 				exe = lp
 			}
 		}
 		id, err = buildid.ReadFile(exe)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 
 		// If we can't find a build ID, use a hash.
@@ -279,10 +331,11 @@ func (b *Builder) gccToolID(name, language string) (string, error) {
 	}
 
 	b.id.Lock()
-	b.toolIDCache[key] = id
+	b.gccToolIDCache[key] = id
+	b.gccToolIDCache[key+".exe"] = exe
 	b.id.Unlock()
 
-	return id, nil
+	return id, exe, nil
 }
 
 // Check if assembler used by gccgo is GNU as.
@@ -335,16 +388,7 @@ func (b *Builder) gccgoBuildIDFile(a *Action) (string, error) {
 		fmt.Fprintf(&buf, "\t"+`.section .note.GNU-split-stack,"",%s`+"\n", secType)
 	}
 
-	if cfg.BuildN || cfg.BuildX {
-		for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
-			b.Showcmd("", "echo '%s' >> %s", line, sfile)
-		}
-		if cfg.BuildN {
-			return sfile, nil
-		}
-	}
-
-	if err := os.WriteFile(sfile, buf.Bytes(), 0666); err != nil {
+	if err := b.Shell(a).writeFile(sfile, buf.Bytes()); err != nil {
 		return "", err
 	}
 
@@ -376,17 +420,42 @@ func (b *Builder) buildID(file string) string {
 
 // fileHash returns the content hash of the named file.
 func (b *Builder) fileHash(file string) string {
-	file, _ = fsys.OverlayPath(file)
-	sum, err := cache.FileHash(file)
+	sum, err := cache.FileHash(fsys.Actual(file))
 	if err != nil {
 		return ""
 	}
 	return buildid.HashToString(sum)
 }
 
+var (
+	counterCacheHit  = counter.New("go/buildcache/hit")
+	counterCacheMiss = counter.New("go/buildcache/miss")
+
+	stdlibRecompiled        = counter.New("go/buildcache/stdlib-recompiled")
+	stdlibRecompiledIncOnce = sync.OnceFunc(stdlibRecompiled.Inc)
+)
+
+// testRunAction returns the run action for a test given the link action
+// for the test binary, if the only (non-test-barrier) action that depend
+// on the link action is the run action.
+func testRunAction(a *Action) *Action {
+	if len(a.triggers) != 1 || a.triggers[0].Mode != "test barrier" {
+		return nil
+	}
+	var runAction *Action
+	for _, t := range a.triggers[0].triggers {
+		if t.Mode == "test run" {
+			if runAction != nil {
+				return nil
+			}
+			runAction = t
+		}
+	}
+	return runAction
+}
+
 // useCache tries to satisfy the action a, which has action ID actionHash,
-// by using a cached result from an earlier build. At the moment, the only
-// cached result is the installed package or binary at target.
+// by using a cached result from an earlier build.
 // If useCache decides that the cache can be used, it sets a.buildID
 // and a.built for use by parent actions and then returns true.
 // Otherwise it sets a.buildID to a temporary build ID for use in the build
@@ -397,7 +466,7 @@ func (b *Builder) fileHash(file string) string {
 // during a's work. The caller should defer b.flushOutput(a), to make sure
 // that flushOutput is eventually called regardless of whether the action
 // succeeds. The flushOutput call must happen after updateBuildID.
-func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, printOutput bool) bool {
+func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, printOutput bool) (ok bool) {
 	// The second half of the build ID here is a placeholder for the content hash.
 	// It's important that the overall buildID be unlikely verging on impossible
 	// to appear in the output by chance, but that should be taken care of by
@@ -409,13 +478,13 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 		a.json.ActionID = actionID
 	}
 	contentID := actionID // temporary placeholder, likely unique
-	a.buildID = actionID + buildIDSeparator + contentID
+	a.buildID = actionID + buildIDSeparator + contentID + buildIDSeparator + contentID
 
-	// Executable binaries also record the main build ID in the middle.
+	// Executable binaries also record the action and object content id of the build id in the middle.
 	// See "Build IDs" comment above.
 	if a.Mode == "link" {
 		mainpkg := a.Deps[0]
-		a.buildID = actionID + buildIDSeparator + mainpkg.buildID + buildIDSeparator + contentID
+		a.buildID = actionID + buildIDSeparator + buildActionID(mainpkg.buildID) + buildIDSeparator + buildObjectID(mainpkg.buildID) + buildIDSeparator + contentID
 	}
 
 	// If user requested -a, we force a rebuild, so don't use the cache.
@@ -428,6 +497,22 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 		a.output = []byte{}
 		return false
 	}
+
+	defer func() {
+		// Increment counters for cache hits and misses based on the return value
+		// of this function. Don't increment counters if we return early because of
+		// cfg.BuildA above because we don't even look at the cache in that case.
+		if ok {
+			counterCacheHit.Inc()
+		} else {
+			if a.Package != nil && a.Package.Standard {
+				stdlibRecompiledIncOnce()
+			}
+			counterCacheMiss.Inc()
+		}
+	}()
+
+	c := cache.Default()
 
 	if target != "" {
 		buildID, _ := buildid.ReadFile(target)
@@ -446,7 +531,9 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 		// already up-to-date, then to avoid a rebuild, report the package
 		// as up-to-date as well. See "Build IDs" comment above.
 		// TODO(rsc): Rewrite this code to use a TryCache func on the link action.
-		if !b.NeedExport && a.Mode == "build" && len(a.triggers) == 1 && a.triggers[0].Mode == "link" {
+		if !b.NeedExport && a.Mode == "build-export" && len(a.triggers) == 1 &&
+			len(a.triggers[0].triggers) == 1 && a.triggers[0].triggers[0].Mode == "link" {
+			buildAction, linkAction := a.triggers[0], a.triggers[0].triggers[0]
 			if id := strings.Split(buildID, buildIDSeparator); len(id) == 4 && id[1] == actionID {
 				// Temporarily assume a.buildID is the package build ID
 				// stored in the installed binary, and see if that makes
@@ -459,17 +546,16 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 				// other than a.buildID, b.linkActionID is only accessing
 				// build IDs of completed actions.
 				oldBuildID := a.buildID
-				a.buildID = id[1] + buildIDSeparator + id[2]
-				linkID := buildid.HashToString(b.linkActionID(a.triggers[0]))
+				a.buildID = id[1] + buildIDSeparator + id[2] + buildIDSeparator + id[2]
+				buildAction.buildID = a.buildID
+				linkID := buildid.HashToString(b.linkActionID(linkAction))
 				if id[0] == linkID {
 					// Best effort attempt to display output from the compile and link steps.
 					// If it doesn't work, it doesn't work: reusing the cached binary is more
 					// important than reprinting diagnostic information.
 					if printOutput {
-						if c := cache.Default(); c != nil {
-							showStdout(b, c, a.actionID, "stdout")      // compile output
-							showStdout(b, c, a.actionID, "link-stdout") // link output
-						}
+						showStdout(b, c, a, "stdout")      // compile output
+						showStdout(b, c, a, "link-stdout") // link output
 					}
 
 					// Poison a.Target to catch uses later in the build.
@@ -482,24 +568,28 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 				}
 				// Otherwise restore old build ID for main build.
 				a.buildID = oldBuildID
+				buildAction.buildID = ""
 			}
 		}
 	}
 
+	// TODO(matloob): If we end up caching all executables, the test executable will
+	// already be cached so building it won't do any work. But for now we won't
+	// cache all executables and instead only want to cache some:
+	// we only cache executables produced for 'go run' (and soon, for 'go tool').
+	//
 	// Special case for linking a test binary: if the only thing we
 	// want the binary for is to run the test, and the test result is cached,
 	// then to avoid the link step, report the link as up-to-date.
 	// We avoid the nested build ID problem in the previous special case
 	// by recording the test results in the cache under the action ID half.
-	if len(a.triggers) == 1 && a.triggers[0].TryCache != nil && a.triggers[0].TryCache(b, a.triggers[0]) {
+	if ra := testRunAction(a); ra != nil && ra.TryCache != nil && ra.TryCache(b, ra, a) {
 		// Best effort attempt to display output from the compile and link steps.
 		// If it doesn't work, it doesn't work: reusing the test result is more
 		// important than reprinting diagnostic information.
 		if printOutput {
-			if c := cache.Default(); c != nil {
-				showStdout(b, c, a.Deps[0].actionID, "stdout")      // compile output
-				showStdout(b, c, a.Deps[0].actionID, "link-stdout") // link output
-			}
+			showStdout(b, c, a.Deps[0], "stdout")      // compile output
+			showStdout(b, c, a.Deps[0], "link-stdout") // link output
 		}
 
 		// Poison a.Target to catch uses later in the build.
@@ -509,25 +599,40 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 	}
 
 	// Check to see if the action output is cached.
-	if c := cache.Default(); c != nil {
-		if file, _, err := c.GetFile(actionHash); err == nil {
-			if buildID, err := buildid.ReadFile(file); err == nil {
-				if printOutput {
-					showStdout(b, c, a.actionID, "stdout")
+	if file, _, err := cache.GetFile(c, actionHash); err == nil {
+		if a.Mode == "preprocess PGO profile" {
+			// Preprocessed PGO profiles don't embed a build ID, so
+			// skip the build ID lookup.
+			// TODO(prattmic): better would be to add a build ID to the format.
+			a.built = file
+			a.Target = "DO NOT USE - using cache"
+			return true
+		}
+		if buildID, err := buildid.ReadFile(file); err == nil {
+			if printOutput {
+				switch a.Mode {
+				case "link":
+					// The link output is stored using the build action's action ID.
+					// See corresponding code storing the link output in updateBuildID.
+					for _, a1 := range a.Deps {
+						showStdout(b, c, a1, "link-stdout") // link output
+					}
+				default:
+					showStdout(b, c, a, "stdout") // compile output
 				}
-				a.built = file
-				a.Target = "DO NOT USE - using cache"
-				a.buildID = buildID
-				if a.json != nil {
-					a.json.BuildID = a.buildID
-				}
-				if p := a.Package; p != nil && target != "" {
-					p.Stale = true
-					// Clearer than explaining that something else is stale.
-					p.StaleReason = "not installed but available in build cache"
-				}
-				return true
 			}
+			a.built = file
+			a.Target = "DO NOT USE - using cache"
+			a.buildID = buildID
+			if a.json != nil {
+				a.json.BuildID = a.buildID
+			}
+			if p := a.Package; p != nil && target != "" {
+				p.Stale = true
+				// Clearer than explaining that something else is stale.
+				p.StaleReason = "not installed but available in build cache"
+			}
+			return true
 		}
 	}
 
@@ -556,20 +661,21 @@ func (b *Builder) useCache(a *Action, actionHash cache.ActionID, target string, 
 	return false
 }
 
-func showStdout(b *Builder, c *cache.Cache, actionID cache.ActionID, key string) error {
-	stdout, stdoutEntry, err := c.GetBytes(cache.Subkey(actionID, key))
+func showStdout(b *Builder, c cache.Cache, a *Action, key string) error {
+	actionID := a.actionID
+
+	stdout, stdoutEntry, err := cache.GetBytes(c, cache.Subkey(actionID, key))
 	if err != nil {
 		return err
 	}
 
 	if len(stdout) > 0 {
+		sh := b.Shell(a)
 		if cfg.BuildX || cfg.BuildN {
-			b.Showcmd("", "%s  # internal", joinUnambiguously(str.StringList("cat", c.OutputFile(stdoutEntry.OutputID))))
+			sh.ShowCmd("", "%s  # internal", joinUnambiguously(str.StringList("cat", c.OutputFile(stdoutEntry.OutputID))))
 		}
 		if !cfg.BuildN {
-			b.output.Lock()
-			defer b.output.Unlock()
-			b.Print(string(stdout))
+			sh.Printf("%s", stdout)
 		}
 	}
 	return nil
@@ -577,9 +683,7 @@ func showStdout(b *Builder, c *cache.Cache, actionID cache.ActionID, key string)
 
 // flushOutput flushes the output being queued in a.
 func (b *Builder) flushOutput(a *Action) {
-	b.output.Lock()
-	defer b.output.Unlock()
-	b.Print(string(a.output))
+	b.Shell(a).Printf("%s", a.output)
 	a.output = nil
 }
 
@@ -591,90 +695,72 @@ func (b *Builder) flushOutput(a *Action) {
 // in the binary.
 //
 // Keep in sync with src/cmd/buildid/buildid.go
-func (b *Builder) updateBuildID(a *Action, target string, rewrite bool) error {
+func (b *Builder) updateBuildID(a *Action, target string) error {
+	sh := b.Shell(a)
+
 	if cfg.BuildX || cfg.BuildN {
-		if rewrite {
-			b.Showcmd("", "%s # internal", joinUnambiguously(str.StringList(base.Tool("buildid"), "-w", target)))
-		}
+		sh.ShowCmd("", "%s # internal", joinUnambiguously(str.StringList("go", "tool", "buildid", "-w", target)))
 		if cfg.BuildN {
 			return nil
 		}
 	}
 
+	c := cache.Default()
+
 	// Cache output from compile/link, even if we don't do the rest.
-	if c := cache.Default(); c != nil {
-		switch a.Mode {
-		case "build":
-			c.PutBytes(cache.Subkey(a.actionID, "stdout"), a.output)
-		case "link":
-			// Even though we don't cache the binary, cache the linker text output.
-			// We might notice that an installed binary is up-to-date but still
-			// want to pretend to have run the linker.
-			// Store it under the main package's action ID
-			// to make it easier to find when that's all we have.
-			for _, a1 := range a.Deps {
-				if p1 := a1.Package; p1 != nil && p1.Name == "main" {
-					c.PutBytes(cache.Subkey(a1.actionID, "link-stdout"), a.output)
-					break
-				}
+	switch a.Mode {
+	case "build":
+		cache.PutBytes(c, cache.Subkey(a.actionID, "stdout"), a.output)
+	case "link":
+		// Even though we don't cache the binary, cache the linker text output.
+		// We might notice that an installed binary is up-to-date but still
+		// want to pretend to have run the linker.
+		// Store it under the main package's action ID
+		// to make it easier to find when that's all we have.
+		for _, a1 := range a.Deps {
+			if p1 := a1.Package; p1 != nil && p1.Name == "main" {
+				cache.PutBytes(c, cache.Subkey(a1.actionID, "link-stdout"), a.output)
+				break
 			}
 		}
 	}
 
-	// Find occurrences of old ID and compute new content-based ID.
-	r, err := os.Open(target)
+	// We updated the export data to have the export content id by
+	// giving it the build id actionID/exportID/exportID, while the
+	// object data still has the original actionID/actionID/actionID.
+	// We'll have to update both of those to actionID/exportID/objectID.
+	objectBuildID := a.buildID
+	if a.Mode == "build" {
+		id := buildid.HashToString(a.actionID)
+		objectBuildID = id + buildIDSeparator + id + buildIDSeparator + id
+	}
+	matches, _, objectHash, err := b.findBuildIDs(a, target, objectBuildID)
 	if err != nil {
 		return err
-	}
-	matches, hash, err := buildid.FindAndHash(r, a.buildID, 0)
-	r.Close()
-	if err != nil {
-		return err
-	}
-	newID := a.buildID[:strings.LastIndex(a.buildID, buildIDSeparator)] + buildIDSeparator + buildid.HashToString(hash)
-	if len(newID) != len(a.buildID) {
-		return fmt.Errorf("internal error: build ID length mismatch %q vs %q", a.buildID, newID)
 	}
 
-	// Replace with new content-based ID.
-	a.buildID = newID
-	if a.json != nil {
-		a.json.BuildID = a.buildID
+	var newID string
+	if a.Mode == "build" {
+		exportID := buildExportID(a.Deps[0].buildID)
+		newID = buildActionID(a.buildID) + buildIDSeparator + exportID + buildIDSeparator + buildid.HashToString(objectHash)
+	} else {
+		newID = a.buildID[:strings.LastIndex(a.buildID, buildIDSeparator)] + buildIDSeparator + buildid.HashToString(objectHash)
+	}
+	if err := b.rewriteBuildID(a, target, newID, matches); err != nil {
+		return err
 	}
 	if len(matches) == 0 {
 		// Assume the user specified -buildid= to override what we were going to choose.
 		return nil
 	}
 
-	if rewrite {
-		w, err := os.OpenFile(target, os.O_RDWR, 0)
-		if err != nil {
-			return err
-		}
-		err = buildid.Rewrite(w, matches, newID)
-		if err != nil {
-			w.Close()
-			return err
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-	}
-
-	// Cache package builds, but not binaries (link steps).
-	// The expectation is that binaries are not reused
+	// Cache package builds, and cache executable builds if
+	// executable caching was requested. Executables are not
+	// cached by default because they are not reused
 	// nearly as often as individual packages, and they're
 	// much larger, so the cache-footprint-to-utility ratio
-	// of binaries is much lower for binaries.
-	// Not caching the link step also makes sure that repeated "go run" at least
-	// always rerun the linker, so that they don't get too fast.
-	// (We don't want people thinking go is a scripting language.)
-	// Note also that if we start caching binaries, then we will
-	// copy the binaries out of the cache to run them, and then
-	// that will mean the go process is itself writing a binary
-	// and then executing it, so we will need to defend against
-	// ETXTBSY problems as discussed in exec.go and golang.org/issue/22220.
-	if c := cache.Default(); c != nil && a.Mode == "build" {
+	// of executables is much lower for executables.
+	if a.Mode == "build" {
 		r, err := os.Open(target)
 		if err == nil {
 			if a.output == nil {
@@ -683,7 +769,7 @@ func (b *Builder) updateBuildID(a *Action, target string, rewrite bool) error {
 			outputID, _, err := c.Put(a.actionID, r)
 			r.Close()
 			if err == nil && cfg.BuildX {
-				b.Showcmd("", "%s # internal", joinUnambiguously(str.StringList("cp", target, c.OutputFile(outputID))))
+				sh.ShowCmd("", "%s # internal", joinUnambiguously(str.StringList("cp", target, c.OutputFile(outputID))))
 			}
 			if b.NeedExport {
 				if err != nil {
@@ -694,6 +780,118 @@ func (b *Builder) updateBuildID(a *Action, target string, rewrite bool) error {
 			}
 		}
 	}
+	if c, ok := c.(*cache.DiskCache); a.Mode == "link" && a.CacheExecutable && ok {
+		r, err := os.Open(target)
+		if err == nil {
+			if a.output == nil {
+				panic("internal error: a.output not set")
+			}
+			name := a.Package.Internal.ExeName
+			if name == "" {
+				name = a.Package.DefaultExecName()
+			}
+			outputID, _, err := c.PutExecutable(a.actionID, name+cfg.ExeSuffix, r)
+			r.Close()
+			a.cachedExecutable = c.OutputFile(outputID)
+			if err == nil && cfg.BuildX {
+				sh.ShowCmd("", "%s # internal", joinUnambiguously(str.StringList("cp", target, a.cachedExecutable)))
+			}
+		}
+	}
 
+	return nil
+}
+
+func (b *Builder) rewriteBuildID(a *Action, target, newID string, matches []int64) error {
+	if len(newID) != len(a.buildID) {
+		return fmt.Errorf("internal error: build ID length mismatch %q vs %q", a.buildID, newID)
+	}
+
+	// Replace with new content-based ID.
+	a.buildID = newID
+	if a.json != nil {
+		a.json.BuildID = a.buildID
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+
+	// Replace the build id in the file with the content-based ID.
+	w, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := buildid.Rewrite(w, matches, newID); err != nil {
+		w.Close()
+		return err
+	}
+	return w.Close()
+}
+
+func (b *Builder) findBuildIDs(a *Action, target, objectBuildID string) (matches []int64, exportHash, objectHash [32]byte, err error) {
+	var objectOffset int64 // where to start hashing the object data from
+	// Find occurrences of old ID and compute new content-based ID.
+	r, err := os.Open(target)
+	if err != nil {
+		return nil, exportHash, objectHash, err
+	}
+	defer func() {
+		if cerr := r.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	if v, err := archive.Parse(r, false); err == nil && len(v.Entries) > 0 && v.Entries[0].Type == archive.EntryPkgDef {
+		pkgEntry := v.Entries[0]
+		exportMatches, contentHash, err := buildid.FindAndHash(io.NewSectionReader(r, pkgEntry.Offset, pkgEntry.Size), a.buildID, 0)
+		if err != nil {
+			return nil, exportHash, objectHash, err
+		}
+		exportHash = contentHash
+		for _, m := range exportMatches {
+			matches = append(matches, pkgEntry.Offset+m)
+		}
+		objectOffset = pkgEntry.Offset + pkgEntry.Size
+	}
+
+	if _, err := r.Seek(objectOffset, io.SeekStart); err != nil {
+		return nil, exportHash, objectHash, err
+	}
+	objectMatches, objectHash, err := buildid.FindAndHash(r, objectBuildID, 0)
+	if err != nil {
+		return nil, exportHash, objectHash, err
+	}
+	for _, m := range objectMatches {
+		matches = append(matches, objectOffset+m)
+	}
+	return matches, exportHash, objectHash, nil
+}
+
+func (b *Builder) updateExportBuildID(a *Action, target string) error {
+	if cfg.BuildX || cfg.BuildN {
+		b.Shell(a).ShowCmd("", "%s # internal", joinUnambiguously(str.StringList("go", "tool", "buildid", "-w", target)))
+		if cfg.BuildN {
+			return nil
+		}
+	}
+
+	matches, exportHash, objectHash, err := b.findBuildIDs(a, target, a.buildID)
+	if err != nil {
+		return err
+	}
+	if exportHash == [32]byte{} {
+		exportHash = objectHash // gccgo does not have export data
+	}
+
+	exportHashStr := buildid.HashToString(exportHash)
+	newID := buildActionID(a.buildID) + buildIDSeparator + exportHashStr + buildIDSeparator + exportHashStr
+	if err := b.rewriteBuildID(a, target, newID, matches); err != nil {
+		return err
+	}
+
+	if b.NeedExport {
+		a.Package.Export = target
+		a.Package.BuildID = a.buildID
+	}
 	return nil
 }

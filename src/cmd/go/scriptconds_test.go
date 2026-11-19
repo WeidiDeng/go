@@ -5,23 +5,28 @@
 package main_test
 
 import (
-	"cmd/go/internal/script"
-	"cmd/go/internal/script/scripttest"
+	"cmd/go/internal/cfg"
+	"cmd/internal/script"
+	"cmd/internal/script/scripttest"
 	"errors"
 	"fmt"
 	"internal/buildcfg"
 	"internal/platform"
-	"internal/testenv"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
-	"strings"
+	"testing"
+
+	"golang.org/x/mod/semver"
 )
 
-func scriptConditions() map[string]script.Cond {
+func scriptConditions(t *testing.T) map[string]script.Cond {
 	conds := scripttest.DefaultConds()
+
+	scripttest.AddToolChainScriptConditions(t, conds, goHostOS, goHostArch)
 
 	add := func(name string, cond script.Cond) {
 		if _, ok := conds[name]; ok {
@@ -34,79 +39,38 @@ func scriptConditions() map[string]script.Cond {
 		return script.OnceCondition(summary, func() (bool, error) { return f(), nil })
 	}
 
-	add("asan", sysCondition("-asan", platform.ASanSupported, true))
-	add("buildmode", script.PrefixCondition("go supports -buildmode=<suffix>", hasBuildmode))
+	add("abscc", script.Condition("default $CC path is absolute and exists", defaultCCIsAbsolute))
 	add("case-sensitive", script.OnceCondition("$WORK filesystem is case-sensitive", isCaseSensitive))
-	add("cgo", script.BoolCondition("host CGO_ENABLED", canCgo))
-	add("cross", script.BoolCondition("cmd/go GOOS/GOARCH != GOHOSTOS/GOHOSTARCH", goHostOS != runtime.GOOS || goHostArch != runtime.GOARCH))
-	add("fuzz", sysCondition("-fuzz", platform.FuzzSupported, false))
-	add("fuzz-instrumented", sysCondition("-fuzz with instrumentation", platform.FuzzInstrumented, false))
+	add("cc", script.PrefixCondition("go env CC = <suffix> (ignoring the go/env file)", ccIs))
 	add("git", lazyBool("the 'git' executable exists and provides the standard CLI", hasWorkingGit))
-	add("GODEBUG", script.PrefixCondition("GODEBUG contains <suffix>", hasGodebug))
-	add("GOEXPERIMENT", script.PrefixCondition("GOEXPERIMENT <suffix> is enabled", hasGoexperiment))
-	add("link", lazyBool("testenv.HasLink()", testenv.HasLink))
-	add("mismatched-goroot", script.Condition("test's GOROOT_FINAL does not match the real GOROOT", isMismatchedGoroot))
-	add("msan", sysCondition("-msan", platform.MSanSupported, true))
-	add("net", lazyBool("testenv.HasExternalNetwork()", testenv.HasExternalNetwork))
-	add("race", sysCondition("-race", platform.RaceDetectorSupported, true))
-	add("symlink", lazyBool("testenv.HasSymlink()", testenv.HasSymlink))
+	add("git-sha256", script.OnceCondition("the local 'git' version is recent enough to support sha256 object/commit hashes", gitSupportsSHA256))
 	add("trimpath", script.OnceCondition("test binary was built with -trimpath", isTrimpath))
+	add("default-cgo", lazyBool("when CGO_ENABLED=1|0 was set in make.bash", defaultCgo))
+	add("default-pie", script.Condition("-buildmode=default resolves to -buildmode=pie", defaultPIE))
 
 	return conds
 }
 
-func isMismatchedGoroot(s *script.State) (bool, error) {
-	gorootFinal, _ := s.LookupEnv("GOROOT_FINAL")
-	if gorootFinal == "" {
-		gorootFinal, _ = s.LookupEnv("GOROOT")
-	}
-	return gorootFinal != testGOROOT, nil
-}
-
-func sysCondition(flag string, f func(goos, goarch string) bool, needsCgo bool) script.Cond {
-	return script.Condition(
-		"GOOS/GOARCH supports "+flag,
-		func(s *script.State) (bool, error) {
-			GOOS, _ := s.LookupEnv("GOOS")
-			GOARCH, _ := s.LookupEnv("GOARCH")
-			cross := goHostOS != GOOS || goHostArch != GOARCH
-			return (!needsCgo || (canCgo && !cross)) && f(GOOS, GOARCH), nil
-		})
-}
-
-func hasBuildmode(s *script.State, mode string) (bool, error) {
+func defaultCCIsAbsolute(s *script.State) (bool, error) {
 	GOOS, _ := s.LookupEnv("GOOS")
 	GOARCH, _ := s.LookupEnv("GOARCH")
-	return platform.BuildModeSupported(runtime.Compiler, mode, GOOS, GOARCH), nil
-}
-
-func hasGodebug(s *script.State, value string) (bool, error) {
-	godebug, _ := s.LookupEnv("GODEBUG")
-	for _, p := range strings.Split(godebug, ",") {
-		if strings.TrimSpace(p) == value {
+	defaultCC := cfg.DefaultCC(GOOS, GOARCH)
+	if filepath.IsAbs(defaultCC) {
+		if _, err := exec.LookPath(defaultCC); err == nil {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-func hasGoexperiment(s *script.State, value string) (bool, error) {
+func ccIs(s *script.State, want string) (bool, error) {
+	CC, _ := s.LookupEnv("CC")
+	if CC != "" {
+		return CC == want, nil
+	}
 	GOOS, _ := s.LookupEnv("GOOS")
 	GOARCH, _ := s.LookupEnv("GOARCH")
-	goexp, _ := s.LookupEnv("GOEXPERIMENT")
-	flags, err := buildcfg.ParseGOEXPERIMENT(GOOS, GOARCH, goexp)
-	if err != nil {
-		return false, err
-	}
-	for _, exp := range flags.All() {
-		if value == exp {
-			return true, nil
-		}
-		if strings.TrimPrefix(value, "no") == strings.TrimPrefix(exp, "no") {
-			return false, nil
-		}
-	}
-	return false, fmt.Errorf("unrecognized GOEXPERIMENT %q", value)
+	return cfg.DefaultCC(GOOS, GOARCH) == want, nil
 }
 
 func isCaseSensitive() (bool, error) {
@@ -155,4 +119,46 @@ func hasWorkingGit() bool {
 	}
 	_, err := exec.LookPath("git")
 	return err == nil
+}
+
+// Capture the major, minor and (optionally) patch version, but ignore anything later
+var gitVersLineExtract = regexp.MustCompile(`git version\s+(\d+\.\d+(?:\.\d+)?)`)
+
+func gitVersion() (string, error) {
+	gitOut, runErr := exec.Command("git", "version").CombinedOutput()
+	if runErr != nil {
+		return "v0", fmt.Errorf("failed to execute git version: %w", runErr)
+	}
+	matches := gitVersLineExtract.FindSubmatch(gitOut)
+	if len(matches) < 2 {
+		return "v0", fmt.Errorf("git version extraction regexp did not match version line: %q", gitOut)
+	}
+	return "v" + string(matches[1]), nil
+}
+
+func hasAtLeastGitVersion(minVers string) (bool, error) {
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		return false, gitVersErr
+	}
+	return semver.Compare(minVers, gitVers) <= 0, nil
+}
+
+func gitSupportsSHA256() (bool, error) {
+	return hasAtLeastGitVersion("v2.29")
+}
+
+func defaultCgo() bool {
+	return buildcfg.DefaultCGO_ENABLED == "1" || buildcfg.DefaultCGO_ENABLED == "0"
+}
+
+// defaultPIE reports whether -buildmode=default resolves to -buildmode=pie for
+// the script's GOOS/GOARCH. It assumes -race is not in effect, which is the only
+// case where the resolved default buildmode depends on the race flag (PIE is not
+// the default with -race on windows). Scripts that build with -race must not rely
+// on this condition.
+func defaultPIE(s *script.State) (bool, error) {
+	GOOS, _ := s.LookupEnv("GOOS")
+	GOARCH, _ := s.LookupEnv("GOARCH")
+	return platform.DefaultPIE(GOOS, GOARCH, false), nil
 }

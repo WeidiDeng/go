@@ -36,48 +36,17 @@ TEXT _rt0_386_lib(SB),NOSPLIT,$0
 	MOVL	12(BP), AX
 	MOVL	AX, _rt0_386_lib_argv<>(SB)
 
-	// Synchronous initialization.
-	CALL	runtime·libpreinit(SB)
+	CALL	runtime·libInit(SB)
 
-	SUBL	$8, SP
-
-	// Create a new thread to do the runtime initialization.
-	MOVL	_cgo_sys_thread_create(SB), AX
-	TESTL	AX, AX
-	JZ	nocgo
-
-	// Align stack to call C function.
-	// We moved SP to BP above, but BP was clobbered by the libpreinit call.
-	MOVL	SP, BP
-	ANDL	$~15, SP
-
-	MOVL	$_rt0_386_lib_go(SB), BX
-	MOVL	BX, 0(SP)
-	MOVL	$0, 4(SP)
-
-	CALL	AX
-
-	MOVL	BP, SP
-
-	JMP	restore
-
-nocgo:
-	MOVL	$0x800000, 0(SP)                    // stacksize = 8192KB
-	MOVL	$_rt0_386_lib_go(SB), AX
-	MOVL	AX, 4(SP)                           // fn
-	CALL	runtime·newosproc0(SB)
-
-restore:
-	ADDL	$8, SP
 	POPL	DI
 	POPL	SI
 	POPL	BX
 	POPL	BP
 	RET
 
-// _rt0_386_lib_go initializes the Go runtime.
+// rt0_lib_go initializes the Go runtime.
 // This is started in a separate thread by _rt0_386_lib.
-TEXT _rt0_386_lib_go(SB),NOSPLIT,$8
+TEXT runtime·rt0_lib_go<ABIInternal>(SB),NOSPLIT,$8
 	MOVL	_rt0_386_lib_argc<>(SB), AX
 	MOVL	AX, 0(SP)
 	MOVL	_rt0_386_lib_argv<>(SB), AX
@@ -157,9 +126,8 @@ notintel:
 	JZ	bad_proc
 
 nocpuinfo:
-	// if there is an _cgo_init, call it to let it
-	// initialize and to set up GS.  if not,
-	// we set up GS ourselves.
+	// If there is an _cgo_init, call it to initialize and, on platforms
+	// that need it, set up GS. Otherwise, we set up GS ourselves.
 	MOVL	_cgo_init(SB), AX
 	TESTL	AX, AX
 	JZ	needtls
@@ -171,8 +139,8 @@ nocpuinfo:
 	MOVL	$runtime·tls_g(SB), 8(SP)	// arg 3: &tls_g
 #else
 	MOVL	$0, BX
-	MOVL	BX, 12(SP)	// arg 3,4: not used when using platform's TLS
-	MOVL	BX, 8(SP)
+	MOVL	BX, 12(SP)	// arg 4: not used when using platform's TLS
+	MOVL	BX, 8(SP)	// arg 3: not used when using platform's TLS
 #endif
 	MOVL	$setg_gcc<>(SB), BX
 	MOVL	BX, 4(SP)	// arg 2: setg_gcc
@@ -182,14 +150,11 @@ nocpuinfo:
 	// update stackguard after _cgo_init
 	MOVL	$runtime·g0(SB), CX
 	MOVL	(g_stack+stack_lo)(CX), AX
-	ADDL	$const__StackGuard, AX
+	ADDL	$const_stackGuard, AX
 	MOVL	AX, g_stackguard0(CX)
 	MOVL	AX, g_stackguard1(CX)
 
-#ifndef GOOS_windows
-	// skip runtime·ldt0setup(SB) and tls test after _cgo_init for non-windows
 	JMP ok
-#endif
 needtls:
 #ifdef GOOS_openbsd
 	// skip runtime·ldt0setup(SB) and tls test on OpenBSD in all cases
@@ -199,8 +164,11 @@ needtls:
 	// skip runtime·ldt0setup(SB) and tls test on Plan 9 in all cases
 	JMP	ok
 #endif
-
-	// set up %gs
+#ifdef GOOS_windows
+	// The Windows loader has already set up TLS.
+	JMP ok
+#else
+	// Set up %gs.
 	CALL	ldt0setup<>(SB)
 
 	// store through it, to make sure it works
@@ -210,6 +178,7 @@ needtls:
 	CMPL	AX, $0x123
 	JEQ	ok
 	MOVL	AX, 0	// abort
+#endif
 ok:
 	// set up m and g "registers"
 	get_tls(BX)
@@ -287,10 +256,8 @@ TEXT gogo<>(SB), NOSPLIT, $0
 	get_tls(CX)
 	MOVL	DX, g(CX)
 	MOVL	gobuf_sp(BX), SP	// restore SP
-	MOVL	gobuf_ret(BX), AX
 	MOVL	gobuf_ctxt(BX), DX
 	MOVL	$0, gobuf_sp(BX)	// clear to help garbage collector
-	MOVL	$0, gobuf_ret(BX)
 	MOVL	$0, gobuf_ctxt(BX)
 	MOVL	gobuf_pc(BX), BX
 	JMP	BX
@@ -394,6 +361,35 @@ bad:
 	CALL	AX
 	INT	$3
 
+// func switchToCrashStack0(fn func())
+TEXT runtime·switchToCrashStack0(SB), NOSPLIT, $0-4
+	MOVL 	fn+0(FP), AX
+
+	get_tls2(CX, DI)
+	MOVL	g(CX), BX	// BX = g
+	MOVL	g_m(BX), DX	// DX = curm
+
+	// set g to gcrash
+	LEAL	runtime·gcrash(SB), BX // g = &gcrash
+	MOVL	DX, g_m(BX)            // g.m = curm
+	MOVL	BX, m_g0(DX)           // curm.g0 = g
+	get_tls2(CX, DI)
+	MOVL	BX, g(CX)
+
+	// switch to crashstack
+	MOVL	(g_stack+stack_hi)(BX), DX
+	SUBL	$(4*8), DX
+	MOVL	DX, SP
+
+	// call target function
+	MOVL	AX, DX
+	MOVL	0(AX), AX
+	CALL	AX
+
+	// should never return
+	CALL	runtime·abort(SB)
+	UNDEF
+
 /*
  * support for morestack
  */
@@ -404,11 +400,19 @@ bad:
 // the top of a stack (for example, morestack calling newstack
 // calling the scheduler calling newm calling gc), so we must
 // record an argument size. For that purpose, it has no arguments.
-TEXT runtime·morestack(SB),NOSPLIT,$0-0
+TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	get_tls(CX)
-	MOVL	g(CX), BX
-	MOVL	g_m(BX), BX
+	MOVL	g(CX), DI
+	MOVL	g_m(DI), BX
+
+	// Set g->sched to context in f.
+	MOVL	0(SP), AX	// f's PC
+	MOVL	AX, (g_sched+gobuf_pc)(DI)
+	LEAL	4(SP), AX	// f's SP
+	MOVL	AX, (g_sched+gobuf_sp)(DI)
+	MOVL	DX, (g_sched+gobuf_ctxt)(DI)
+
 	MOVL	m_g0(BX), SI
 	CMPL	g(CX), SI
 	JNE	3(PC)
@@ -432,13 +436,6 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	get_tls(CX)
 	MOVL	g(CX), SI
 	MOVL	SI, (m_morebuf+gobuf_g)(BX)
-
-	// Set g->sched to context in f.
-	MOVL	0(SP), AX	// f's PC
-	MOVL	AX, (g_sched+gobuf_pc)(SI)
-	LEAL	4(SP), AX	// f's SP
-	MOVL	AX, (g_sched+gobuf_sp)(SI)
-	MOVL	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	MOVL	m_g0(BX), BP
@@ -565,12 +562,15 @@ CALLFN(·call268435456, 268435456)
 CALLFN(·call536870912, 536870912)
 CALLFN(·call1073741824, 1073741824)
 
-TEXT runtime·procyield(SB),NOSPLIT,$0-0
+TEXT runtime·procyieldAsm(SB),NOSPLIT,$0-0
 	MOVL	cycles+0(FP), AX
+	TESTL	AX, AX
+	JZ	done
 again:
 	PAUSE
 	SUBL	$1, AX
 	JNZ	again
+done:
 	RET
 
 TEXT ·publicationBarrier(SB),NOSPLIT,$0-0
@@ -591,7 +591,6 @@ TEXT gosave_systemstack_switch<>(SB),NOSPLIT,$0
 	MOVL	AX, (g_sched+gobuf_sp)(BX)
 	MOVL	$runtime·systemstack_switch(SB), AX
 	MOVL	AX, (g_sched+gobuf_pc)(BX)
-	MOVL	$0, (g_sched+gobuf_ret)(BX)
 	// Assert ctxt is zero. See func save.
 	MOVL	(g_sched+gobuf_ctxt)(BX), AX
 	TESTL	AX, AX
@@ -631,7 +630,7 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-12
 	// We get called to create new OS threads too, and those
 	// come in on the m->g0 stack already. Or we might already
 	// be on the m->gsignal stack.
-	get_tls(CX)
+	get_tls2(CX, DI)
 	MOVL	g(CX), DI
 	CMPL	DI, $0
 	JEQ	nosave	// Don't even have a G yet.
@@ -642,7 +641,7 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-12
 	CMPL	DI, SI
 	JEQ	noswitch
 	CALL	gosave_systemstack_switch<>(SB)
-	get_tls(CX)
+	get_tls2(CX, BP)
 	MOVL	SI, g(CX)
 	MOVL	(g_sched+gobuf_sp)(SI), SP
 
@@ -658,7 +657,7 @@ noswitch:
 	CALL	AX
 
 	// Restore registers, g, stack pointer.
-	get_tls(CX)
+	get_tls2(CX, DI)
 	MOVL	8(SP), DI
 	MOVL	(g_stack+stack_hi)(DI), SI
 	SUBL	4(SP), SI
@@ -685,17 +684,25 @@ nosave:
 TEXT ·cgocallback(SB),NOSPLIT,$12-12  // Frame size must match commented places below
 	NO_LOCAL_POINTERS
 
-	// If g is nil, Go did not create the current thread.
+	// Skip cgocallbackg, just dropm when fn is nil, and frame is the saved g.
+	// It is used to dropm while thread is exiting.
+	MOVL	fn+0(FP), AX
+	CMPL	AX, $0
+	JNE	loadg
+	// Restore the g from frame.
+	get_tls(CX)
+	MOVL	frame+4(FP), BX
+	MOVL	BX, g(CX)
+	JMP	dropm
+
+loadg:
+	// If g is nil, Go did not create the current thread,
+	// or if this thread never called into Go on pthread platforms.
 	// Call needm to obtain one for temporary use.
 	// In this case, we're running on the thread stack, so there's
 	// lots of space, but the linker doesn't know. Hide the call from
 	// the linker analysis by using an indirect call through AX.
 	get_tls(CX)
-#ifdef GOOS_windows
-	MOVL	$0, BP
-	CMPL	CX, $0
-	JEQ	2(PC) // TODO
-#endif
 	MOVL	g(CX), BP
 	CMPL	BP, $0
 	JEQ	needm
@@ -703,9 +710,9 @@ TEXT ·cgocallback(SB),NOSPLIT,$12-12  // Frame size must match commented places
 	MOVL	BP, savedm-4(SP) // saved copy of oldm
 	JMP	havem
 needm:
-	MOVL	$runtime·needm(SB), AX
+	MOVL	$runtime·needAndBindM(SB), AX
 	CALL	AX
-	MOVL	$0, savedm-4(SP) // dropm on return
+	MOVL	$0, savedm-4(SP)
 	get_tls(CX)
 	MOVL	g(CX), BP
 	MOVL	g_m(BP), BP
@@ -780,13 +787,29 @@ havem:
 	MOVL	0(SP), AX
 	MOVL	AX, (g_sched+gobuf_sp)(SI)
 
-	// If the m on entry was nil, we called needm above to borrow an m
-	// for the duration of the call. Since the call is over, return it with dropm.
+	// If the m on entry was nil, we called needm above to borrow an m,
+	// 1. for the duration of the call on non-pthread platforms,
+	// 2. or the duration of the C thread alive on pthread platforms.
+	// If the m on entry wasn't nil,
+	// 1. the thread might be a Go thread,
+	// 2. or it wasn't the first call from a C thread on pthread platforms,
+	//    since then we skip dropm to reuse the m in the first call.
 	MOVL	savedm-4(SP), DX
 	CMPL	DX, $0
-	JNE 3(PC)
+	JNE	droppedm
+
+	// Skip dropm to reuse it in the next call, when a pthread key has been created.
+	MOVL	_cgo_pthread_key_created(SB), DX
+	// It means cgo is disabled when _cgo_pthread_key_created is a nil pointer, need dropm.
+	CMPL	DX, $0
+	JEQ	dropm
+	CMPL	(DX), $0
+	JNE	droppedm
+
+dropm:
 	MOVL	$runtime·dropm(SB), AX
 	CALL	AX
+droppedm:
 
 	// Done!
 	RET
@@ -794,23 +817,13 @@ havem:
 // void setg(G*); set g. for use by needm.
 TEXT runtime·setg(SB), NOSPLIT, $0-4
 	MOVL	gg+0(FP), BX
-#ifdef GOOS_windows
-	CMPL	BX, $0
-	JNE	settls
-	MOVL	$0, 0x14(FS)
-	RET
-settls:
-	MOVL	g_m(BX), AX
-	LEAL	m_tls(AX), AX
-	MOVL	AX, 0x14(FS)
-#endif
 	get_tls(CX)
 	MOVL	BX, g(CX)
 	RET
 
 // void setg_gcc(G*); set g. for use by gcc
 TEXT setg_gcc<>(SB), NOSPLIT, $0
-	get_tls(AX)
+	get_tls2(AX, DX)
 	MOVL	gg+0(FP), DX
 	MOVL	DX, g(AX)
 	RET
@@ -866,6 +879,7 @@ rdtsc:
 	RDTSC
 	JMP done
 
+#ifndef GOOS_windows
 TEXT ldt0setup<>(SB),NOSPLIT,$16-0
 	// set up ldt 7 to point at m0.tls
 	// ldt 1 would be fine on Linux, but on OS X, 7 is as low as we can go.
@@ -876,438 +890,9 @@ TEXT ldt0setup<>(SB),NOSPLIT,$16-0
 	MOVL	$32, 8(SP)	// sizeof(tls array)
 	CALL	runtime·setldt(SB)
 	RET
+#endif
 
 TEXT runtime·emptyfunc(SB),0,$0-0
-	RET
-
-// hash function using AES hardware instructions
-TEXT runtime·memhash(SB),NOSPLIT,$0-16
-	CMPB	runtime·useAeshash(SB), $0
-	JEQ	noaes
-	MOVL	p+0(FP), AX	// ptr to data
-	MOVL	s+8(FP), BX	// size
-	LEAL	ret+12(FP), DX
-	JMP	aeshashbody<>(SB)
-noaes:
-	JMP	runtime·memhashFallback(SB)
-
-TEXT runtime·strhash(SB),NOSPLIT,$0-12
-	CMPB	runtime·useAeshash(SB), $0
-	JEQ	noaes
-	MOVL	p+0(FP), AX	// ptr to string object
-	MOVL	4(AX), BX	// length of string
-	MOVL	(AX), AX	// string data
-	LEAL	ret+8(FP), DX
-	JMP	aeshashbody<>(SB)
-noaes:
-	JMP	runtime·strhashFallback(SB)
-
-// AX: data
-// BX: length
-// DX: address to put return value
-TEXT aeshashbody<>(SB),NOSPLIT,$0-0
-	MOVL	h+4(FP), X0	            // 32 bits of per-table hash seed
-	PINSRW	$4, BX, X0	            // 16 bits of length
-	PSHUFHW	$0, X0, X0	            // replace size with its low 2 bytes repeated 4 times
-	MOVO	X0, X1                      // save unscrambled seed
-	PXOR	runtime·aeskeysched(SB), X0 // xor in per-process seed
-	AESENC	X0, X0                      // scramble seed
-
-	CMPL	BX, $16
-	JB	aes0to15
-	JE	aes16
-	CMPL	BX, $32
-	JBE	aes17to32
-	CMPL	BX, $64
-	JBE	aes33to64
-	JMP	aes65plus
-
-aes0to15:
-	TESTL	BX, BX
-	JE	aes0
-
-	ADDL	$16, AX
-	TESTW	$0xff0, AX
-	JE	endofpage
-
-	// 16 bytes loaded at this address won't cross
-	// a page boundary, so we can load it directly.
-	MOVOU	-16(AX), X1
-	ADDL	BX, BX
-	PAND	masks<>(SB)(BX*8), X1
-
-final1:
-	PXOR	X0, X1	// xor data with seed
-	AESENC	X1, X1  // scramble combo 3 times
-	AESENC	X1, X1
-	AESENC	X1, X1
-	MOVL	X1, (DX)
-	RET
-
-endofpage:
-	// address ends in 1111xxxx. Might be up against
-	// a page boundary, so load ending at last byte.
-	// Then shift bytes down using pshufb.
-	MOVOU	-32(AX)(BX*1), X1
-	ADDL	BX, BX
-	PSHUFB	shifts<>(SB)(BX*8), X1
-	JMP	final1
-
-aes0:
-	// Return scrambled input seed
-	AESENC	X0, X0
-	MOVL	X0, (DX)
-	RET
-
-aes16:
-	MOVOU	(AX), X1
-	JMP	final1
-
-aes17to32:
-	// make second starting seed
-	PXOR	runtime·aeskeysched+16(SB), X1
-	AESENC	X1, X1
-
-	// load data to be hashed
-	MOVOU	(AX), X2
-	MOVOU	-16(AX)(BX*1), X3
-
-	// xor with seed
-	PXOR	X0, X2
-	PXOR	X1, X3
-
-	// scramble 3 times
-	AESENC	X2, X2
-	AESENC	X3, X3
-	AESENC	X2, X2
-	AESENC	X3, X3
-	AESENC	X2, X2
-	AESENC	X3, X3
-
-	// combine results
-	PXOR	X3, X2
-	MOVL	X2, (DX)
-	RET
-
-aes33to64:
-	// make 3 more starting seeds
-	MOVO	X1, X2
-	MOVO	X1, X3
-	PXOR	runtime·aeskeysched+16(SB), X1
-	PXOR	runtime·aeskeysched+32(SB), X2
-	PXOR	runtime·aeskeysched+48(SB), X3
-	AESENC	X1, X1
-	AESENC	X2, X2
-	AESENC	X3, X3
-
-	MOVOU	(AX), X4
-	MOVOU	16(AX), X5
-	MOVOU	-32(AX)(BX*1), X6
-	MOVOU	-16(AX)(BX*1), X7
-
-	PXOR	X0, X4
-	PXOR	X1, X5
-	PXOR	X2, X6
-	PXOR	X3, X7
-
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	PXOR	X6, X4
-	PXOR	X7, X5
-	PXOR	X5, X4
-	MOVL	X4, (DX)
-	RET
-
-aes65plus:
-	// make 3 more starting seeds
-	MOVO	X1, X2
-	MOVO	X1, X3
-	PXOR	runtime·aeskeysched+16(SB), X1
-	PXOR	runtime·aeskeysched+32(SB), X2
-	PXOR	runtime·aeskeysched+48(SB), X3
-	AESENC	X1, X1
-	AESENC	X2, X2
-	AESENC	X3, X3
-
-	// start with last (possibly overlapping) block
-	MOVOU	-64(AX)(BX*1), X4
-	MOVOU	-48(AX)(BX*1), X5
-	MOVOU	-32(AX)(BX*1), X6
-	MOVOU	-16(AX)(BX*1), X7
-
-	// scramble state once
-	AESENC	X0, X4
-	AESENC	X1, X5
-	AESENC	X2, X6
-	AESENC	X3, X7
-
-	// compute number of remaining 64-byte blocks
-	DECL	BX
-	SHRL	$6, BX
-
-aesloop:
-	// scramble state, xor in a block
-	MOVOU	(AX), X0
-	MOVOU	16(AX), X1
-	MOVOU	32(AX), X2
-	MOVOU	48(AX), X3
-	AESENC	X0, X4
-	AESENC	X1, X5
-	AESENC	X2, X6
-	AESENC	X3, X7
-
-	// scramble state
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	ADDL	$64, AX
-	DECL	BX
-	JNE	aesloop
-
-	// 3 more scrambles to finish
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	AESENC	X4, X4
-	AESENC	X5, X5
-	AESENC	X6, X6
-	AESENC	X7, X7
-
-	PXOR	X6, X4
-	PXOR	X7, X5
-	PXOR	X5, X4
-	MOVL	X4, (DX)
-	RET
-
-TEXT runtime·memhash32(SB),NOSPLIT,$0-12
-	CMPB	runtime·useAeshash(SB), $0
-	JEQ	noaes
-	MOVL	p+0(FP), AX	// ptr to data
-	MOVL	h+4(FP), X0	// seed
-	PINSRD	$1, (AX), X0	// data
-	AESENC	runtime·aeskeysched+0(SB), X0
-	AESENC	runtime·aeskeysched+16(SB), X0
-	AESENC	runtime·aeskeysched+32(SB), X0
-	MOVL	X0, ret+8(FP)
-	RET
-noaes:
-	JMP	runtime·memhash32Fallback(SB)
-
-TEXT runtime·memhash64(SB),NOSPLIT,$0-12
-	CMPB	runtime·useAeshash(SB), $0
-	JEQ	noaes
-	MOVL	p+0(FP), AX	// ptr to data
-	MOVQ	(AX), X0	// data
-	PINSRD	$2, h+4(FP), X0	// seed
-	AESENC	runtime·aeskeysched+0(SB), X0
-	AESENC	runtime·aeskeysched+16(SB), X0
-	AESENC	runtime·aeskeysched+32(SB), X0
-	MOVL	X0, ret+8(FP)
-	RET
-noaes:
-	JMP	runtime·memhash64Fallback(SB)
-
-// simple mask to get rid of data in the high part of the register.
-DATA masks<>+0x00(SB)/4, $0x00000000
-DATA masks<>+0x04(SB)/4, $0x00000000
-DATA masks<>+0x08(SB)/4, $0x00000000
-DATA masks<>+0x0c(SB)/4, $0x00000000
-
-DATA masks<>+0x10(SB)/4, $0x000000ff
-DATA masks<>+0x14(SB)/4, $0x00000000
-DATA masks<>+0x18(SB)/4, $0x00000000
-DATA masks<>+0x1c(SB)/4, $0x00000000
-
-DATA masks<>+0x20(SB)/4, $0x0000ffff
-DATA masks<>+0x24(SB)/4, $0x00000000
-DATA masks<>+0x28(SB)/4, $0x00000000
-DATA masks<>+0x2c(SB)/4, $0x00000000
-
-DATA masks<>+0x30(SB)/4, $0x00ffffff
-DATA masks<>+0x34(SB)/4, $0x00000000
-DATA masks<>+0x38(SB)/4, $0x00000000
-DATA masks<>+0x3c(SB)/4, $0x00000000
-
-DATA masks<>+0x40(SB)/4, $0xffffffff
-DATA masks<>+0x44(SB)/4, $0x00000000
-DATA masks<>+0x48(SB)/4, $0x00000000
-DATA masks<>+0x4c(SB)/4, $0x00000000
-
-DATA masks<>+0x50(SB)/4, $0xffffffff
-DATA masks<>+0x54(SB)/4, $0x000000ff
-DATA masks<>+0x58(SB)/4, $0x00000000
-DATA masks<>+0x5c(SB)/4, $0x00000000
-
-DATA masks<>+0x60(SB)/4, $0xffffffff
-DATA masks<>+0x64(SB)/4, $0x0000ffff
-DATA masks<>+0x68(SB)/4, $0x00000000
-DATA masks<>+0x6c(SB)/4, $0x00000000
-
-DATA masks<>+0x70(SB)/4, $0xffffffff
-DATA masks<>+0x74(SB)/4, $0x00ffffff
-DATA masks<>+0x78(SB)/4, $0x00000000
-DATA masks<>+0x7c(SB)/4, $0x00000000
-
-DATA masks<>+0x80(SB)/4, $0xffffffff
-DATA masks<>+0x84(SB)/4, $0xffffffff
-DATA masks<>+0x88(SB)/4, $0x00000000
-DATA masks<>+0x8c(SB)/4, $0x00000000
-
-DATA masks<>+0x90(SB)/4, $0xffffffff
-DATA masks<>+0x94(SB)/4, $0xffffffff
-DATA masks<>+0x98(SB)/4, $0x000000ff
-DATA masks<>+0x9c(SB)/4, $0x00000000
-
-DATA masks<>+0xa0(SB)/4, $0xffffffff
-DATA masks<>+0xa4(SB)/4, $0xffffffff
-DATA masks<>+0xa8(SB)/4, $0x0000ffff
-DATA masks<>+0xac(SB)/4, $0x00000000
-
-DATA masks<>+0xb0(SB)/4, $0xffffffff
-DATA masks<>+0xb4(SB)/4, $0xffffffff
-DATA masks<>+0xb8(SB)/4, $0x00ffffff
-DATA masks<>+0xbc(SB)/4, $0x00000000
-
-DATA masks<>+0xc0(SB)/4, $0xffffffff
-DATA masks<>+0xc4(SB)/4, $0xffffffff
-DATA masks<>+0xc8(SB)/4, $0xffffffff
-DATA masks<>+0xcc(SB)/4, $0x00000000
-
-DATA masks<>+0xd0(SB)/4, $0xffffffff
-DATA masks<>+0xd4(SB)/4, $0xffffffff
-DATA masks<>+0xd8(SB)/4, $0xffffffff
-DATA masks<>+0xdc(SB)/4, $0x000000ff
-
-DATA masks<>+0xe0(SB)/4, $0xffffffff
-DATA masks<>+0xe4(SB)/4, $0xffffffff
-DATA masks<>+0xe8(SB)/4, $0xffffffff
-DATA masks<>+0xec(SB)/4, $0x0000ffff
-
-DATA masks<>+0xf0(SB)/4, $0xffffffff
-DATA masks<>+0xf4(SB)/4, $0xffffffff
-DATA masks<>+0xf8(SB)/4, $0xffffffff
-DATA masks<>+0xfc(SB)/4, $0x00ffffff
-
-GLOBL masks<>(SB),RODATA,$256
-
-// these are arguments to pshufb. They move data down from
-// the high bytes of the register to the low bytes of the register.
-// index is how many bytes to move.
-DATA shifts<>+0x00(SB)/4, $0x00000000
-DATA shifts<>+0x04(SB)/4, $0x00000000
-DATA shifts<>+0x08(SB)/4, $0x00000000
-DATA shifts<>+0x0c(SB)/4, $0x00000000
-
-DATA shifts<>+0x10(SB)/4, $0xffffff0f
-DATA shifts<>+0x14(SB)/4, $0xffffffff
-DATA shifts<>+0x18(SB)/4, $0xffffffff
-DATA shifts<>+0x1c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x20(SB)/4, $0xffff0f0e
-DATA shifts<>+0x24(SB)/4, $0xffffffff
-DATA shifts<>+0x28(SB)/4, $0xffffffff
-DATA shifts<>+0x2c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x30(SB)/4, $0xff0f0e0d
-DATA shifts<>+0x34(SB)/4, $0xffffffff
-DATA shifts<>+0x38(SB)/4, $0xffffffff
-DATA shifts<>+0x3c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x40(SB)/4, $0x0f0e0d0c
-DATA shifts<>+0x44(SB)/4, $0xffffffff
-DATA shifts<>+0x48(SB)/4, $0xffffffff
-DATA shifts<>+0x4c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x50(SB)/4, $0x0e0d0c0b
-DATA shifts<>+0x54(SB)/4, $0xffffff0f
-DATA shifts<>+0x58(SB)/4, $0xffffffff
-DATA shifts<>+0x5c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x60(SB)/4, $0x0d0c0b0a
-DATA shifts<>+0x64(SB)/4, $0xffff0f0e
-DATA shifts<>+0x68(SB)/4, $0xffffffff
-DATA shifts<>+0x6c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x70(SB)/4, $0x0c0b0a09
-DATA shifts<>+0x74(SB)/4, $0xff0f0e0d
-DATA shifts<>+0x78(SB)/4, $0xffffffff
-DATA shifts<>+0x7c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x80(SB)/4, $0x0b0a0908
-DATA shifts<>+0x84(SB)/4, $0x0f0e0d0c
-DATA shifts<>+0x88(SB)/4, $0xffffffff
-DATA shifts<>+0x8c(SB)/4, $0xffffffff
-
-DATA shifts<>+0x90(SB)/4, $0x0a090807
-DATA shifts<>+0x94(SB)/4, $0x0e0d0c0b
-DATA shifts<>+0x98(SB)/4, $0xffffff0f
-DATA shifts<>+0x9c(SB)/4, $0xffffffff
-
-DATA shifts<>+0xa0(SB)/4, $0x09080706
-DATA shifts<>+0xa4(SB)/4, $0x0d0c0b0a
-DATA shifts<>+0xa8(SB)/4, $0xffff0f0e
-DATA shifts<>+0xac(SB)/4, $0xffffffff
-
-DATA shifts<>+0xb0(SB)/4, $0x08070605
-DATA shifts<>+0xb4(SB)/4, $0x0c0b0a09
-DATA shifts<>+0xb8(SB)/4, $0xff0f0e0d
-DATA shifts<>+0xbc(SB)/4, $0xffffffff
-
-DATA shifts<>+0xc0(SB)/4, $0x07060504
-DATA shifts<>+0xc4(SB)/4, $0x0b0a0908
-DATA shifts<>+0xc8(SB)/4, $0x0f0e0d0c
-DATA shifts<>+0xcc(SB)/4, $0xffffffff
-
-DATA shifts<>+0xd0(SB)/4, $0x06050403
-DATA shifts<>+0xd4(SB)/4, $0x0a090807
-DATA shifts<>+0xd8(SB)/4, $0x0e0d0c0b
-DATA shifts<>+0xdc(SB)/4, $0xffffff0f
-
-DATA shifts<>+0xe0(SB)/4, $0x05040302
-DATA shifts<>+0xe4(SB)/4, $0x09080706
-DATA shifts<>+0xe8(SB)/4, $0x0d0c0b0a
-DATA shifts<>+0xec(SB)/4, $0xffff0f0e
-
-DATA shifts<>+0xf0(SB)/4, $0x04030201
-DATA shifts<>+0xf4(SB)/4, $0x08070605
-DATA shifts<>+0xf8(SB)/4, $0x0c0b0a09
-DATA shifts<>+0xfc(SB)/4, $0xff0f0e0d
-
-GLOBL shifts<>(SB),RODATA,$256
-
-TEXT ·checkASM(SB),NOSPLIT,$0-1
-	// check that masks<>(SB) and shifts<>(SB) are aligned to 16-byte
-	MOVL	$masks<>(SB), AX
-	MOVL	$shifts<>(SB), BX
-	ORL	BX, AX
-	TESTL	$15, AX
-	SETEQ	ret+0(FP)
-	RET
-
-TEXT runtime·return0(SB), NOSPLIT, $0
-	MOVL	$0, AX
 	RET
 
 // Called from cgo wrappers, this function returns g->m->curg.stack.hi.
@@ -1357,47 +942,57 @@ TEXT runtime·float64touint32(SB),NOSPLIT,$12-12
 	MOVL	AX, ret+8(FP)
 	RET
 
-// gcWriteBarrier performs a heap pointer write and informs the GC.
+// gcWriteBarrier informs the GC about heap pointer writes.
 //
-// gcWriteBarrier does NOT follow the Go ABI. It takes two arguments:
-// - DI is the destination of the write
-// - AX is the value being written at DI
+// gcWriteBarrier returns space in a write barrier buffer which
+// should be filled in by the caller.
+// gcWriteBarrier does NOT follow the Go ABI. It accepts the
+// number of bytes of buffer needed in DI, and returns a pointer
+// to the buffer space in DI.
 // It clobbers FLAGS. It does not clobber any general-purpose registers,
 // but may clobber others (e.g., SSE registers).
-TEXT runtime·gcWriteBarrier(SB),NOSPLIT,$28
+// Typical use would be, when doing *(CX+88) = AX
+//     CMPL    $0, runtime.writeBarrier(SB)
+//     JEQ     dowrite
+//     CALL    runtime.gcBatchBarrier2(SB)
+//     MOVL    AX, (DI)
+//     MOVL    88(CX), DX
+//     MOVL    DX, 4(DI)
+// dowrite:
+//     MOVL    AX, 88(CX)
+TEXT gcWriteBarrier<>(SB),NOSPLIT,$28
 	// Save the registers clobbered by the fast path. This is slightly
 	// faster than having the caller spill these.
 	MOVL	CX, 20(SP)
 	MOVL	BX, 24(SP)
+retry:
 	// TODO: Consider passing g.m.p in as an argument so they can be shared
 	// across a sequence of write barriers.
-	get_tls(BX)
+	get_tls2(BX, CX) // Preserve AX by using the saved CX as scratch.
 	MOVL	g(BX), BX
 	MOVL	g_m(BX), BX
 	MOVL	m_p(BX), BX
-	MOVL	(p_wbBuf+wbBuf_next)(BX), CX
-	// Increment wbBuf.next position.
-	LEAL	8(CX), CX
-	MOVL	CX, (p_wbBuf+wbBuf_next)(BX)
+	// Get current buffer write position.
+	MOVL	(p_wbBuf+wbBuf_next)(BX), CX	// original next position
+	ADDL	DI, CX				// new next position
+	// Is the buffer full?
 	CMPL	CX, (p_wbBuf+wbBuf_end)(BX)
-	// Record the write.
-	MOVL	AX, -8(CX)	// Record value
-	MOVL	(DI), BX	// TODO: This turns bad writes into bad reads.
-	MOVL	BX, -4(CX)	// Record *slot
-	// Is the buffer full? (flags set in CMPL above)
-	JEQ	flush
-ret:
+	JA	flush
+	// Commit to the larger buffer.
+	MOVL	CX, (p_wbBuf+wbBuf_next)(BX)
+	// Make return value (the original next position)
+	SUBL	DI, CX
+	MOVL	CX, DI
+	// Restore registers.
 	MOVL	20(SP), CX
 	MOVL	24(SP), BX
-	// Do the write.
-	MOVL	AX, (DI)
 	RET
 
 flush:
 	// Save all general purpose registers since these could be
 	// clobbered by wbBufFlush and were not saved by the caller.
-	MOVL	DI, 0(SP)	// Also first argument to wbBufFlush
-	MOVL	AX, 4(SP)	// Also second argument to wbBufFlush
+	MOVL	DI, 0(SP)
+	MOVL	AX, 4(SP)
 	// BX already saved
 	// CX already saved
 	MOVL	DX, 8(SP)
@@ -1405,7 +1000,6 @@ flush:
 	MOVL	SI, 16(SP)
 	// DI already saved
 
-	// This takes arguments DI and AX
 	CALL	runtime·wbBufFlush(SB)
 
 	MOVL	0(SP), DI
@@ -1413,167 +1007,82 @@ flush:
 	MOVL	8(SP), DX
 	MOVL	12(SP), BP
 	MOVL	16(SP), SI
-	JMP	ret
+	JMP	retry
 
-// Note: these functions use a special calling convention to save generated code space.
-// Arguments are passed in registers, but the space for those arguments are allocated
-// in the caller's stack frame. These stubs write the args into that stack space and
-// then tail call to the corresponding runtime handler.
-// The tail call makes these stubs disappear in backtraces.
-TEXT runtime·panicIndex(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicIndex(SB)
-TEXT runtime·panicIndexU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicIndexU(SB)
-TEXT runtime·panicSliceAlen(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAlen(SB)
-TEXT runtime·panicSliceAlenU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAlenU(SB)
-TEXT runtime·panicSliceAcap(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAcap(SB)
-TEXT runtime·panicSliceAcapU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAcapU(SB)
-TEXT runtime·panicSliceB(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSliceB(SB)
-TEXT runtime·panicSliceBU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSliceBU(SB)
-TEXT runtime·panicSlice3Alen(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3Alen(SB)
-TEXT runtime·panicSlice3AlenU(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3AlenU(SB)
-TEXT runtime·panicSlice3Acap(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3Acap(SB)
-TEXT runtime·panicSlice3AcapU(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3AcapU(SB)
-TEXT runtime·panicSlice3B(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSlice3B(SB)
-TEXT runtime·panicSlice3BU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSlice3BU(SB)
-TEXT runtime·panicSlice3C(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSlice3C(SB)
-TEXT runtime·panicSlice3CU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSlice3CU(SB)
-TEXT runtime·panicSliceConvert(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSliceConvert(SB)
+TEXT runtime·gcWriteBarrier1<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$4, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier2<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$8, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier3<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$12, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier4<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$16, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier5<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$20, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier6<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$24, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier7<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$28, DI
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
+	MOVL	$32, DI
+	JMP	gcWriteBarrier<>(SB)
 
-// Extended versions for 64-bit indexes.
-TEXT runtime·panicExtendIndex(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendIndex(SB)
-TEXT runtime·panicExtendIndexU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendIndexU(SB)
-TEXT runtime·panicExtendSliceAlen(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAlen(SB)
-TEXT runtime·panicExtendSliceAlenU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAlenU(SB)
-TEXT runtime·panicExtendSliceAcap(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAcap(SB)
-TEXT runtime·panicExtendSliceAcapU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAcapU(SB)
-TEXT runtime·panicExtendSliceB(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceB(SB)
-TEXT runtime·panicExtendSliceBU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceBU(SB)
-TEXT runtime·panicExtendSlice3Alen(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3Alen(SB)
-TEXT runtime·panicExtendSlice3AlenU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3AlenU(SB)
-TEXT runtime·panicExtendSlice3Acap(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3Acap(SB)
-TEXT runtime·panicExtendSlice3AcapU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3AcapU(SB)
-TEXT runtime·panicExtendSlice3B(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3B(SB)
-TEXT runtime·panicExtendSlice3BU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3BU(SB)
-TEXT runtime·panicExtendSlice3C(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3C(SB)
-TEXT runtime·panicExtendSlice3CU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3CU(SB)
+TEXT runtime·panicBounds<ABIInternal>(SB),NOSPLIT,$40-0
+	NO_LOCAL_POINTERS
+	// Save all int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	MOVL	AX, 8(SP)
+	MOVL	CX, 12(SP)
+	MOVL	DX, 16(SP)
+	MOVL	BX, 20(SP)
+	// skip SP @ 24(SP)
+	MOVL	BP, 28(SP)
+	MOVL	SI, 32(SP)
+	MOVL	DI, 36(SP)
+
+	MOVL	SP, AX		// hide SP read from vet
+	MOVL	40(AX), AX	// PC immediately after call to panicBounds
+	MOVL	AX, 0(SP)
+	LEAL	8(SP), AX
+	MOVL	AX, 4(SP)
+	CALL	runtime·panicBounds32<ABIInternal>(SB)
+	RET
+
+TEXT runtime·panicExtend<ABIInternal>(SB),NOSPLIT,$40-0
+	NO_LOCAL_POINTERS
+	// Save all int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	MOVL	AX, 8(SP)
+	MOVL	CX, 12(SP)
+	MOVL	DX, 16(SP)
+	MOVL	BX, 20(SP)
+	// skip SP @ 24(SP)
+	MOVL	BP, 28(SP)
+	MOVL	SI, 32(SP)
+	MOVL	DI, 36(SP)
+
+	MOVL	SP, AX		// hide SP read from vet
+	MOVL	40(AX), AX	// PC immediately after call to panicExtend
+	MOVL	AX, 0(SP)
+	LEAL	8(SP), AX
+	MOVL	AX, 4(SP)
+	CALL	runtime·panicBounds32X<ABIInternal>(SB)
+	RET
 
 #ifdef GOOS_android
 // Use the free TLS_SLOT_APP slot #2 on Android Q.
 // Earlier androids are set up in gcc_android.c.
 DATA runtime·tls_g+0(SB)/4, $8
+GLOBL runtime·tls_g+0(SB), NOPTR, $4
+#endif
+#ifdef GOOS_windows
+DATA runtime·tls_g+0(SB)/4, $0
 GLOBL runtime·tls_g+0(SB), NOPTR, $4
 #endif

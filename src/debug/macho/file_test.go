@@ -8,16 +8,20 @@ import (
 	"bytes"
 	"internal/obscuretestdata"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 )
 
 type fileTest struct {
-	file        string
-	hdr         FileHeader
-	loads       []any
-	sections    []*SectionHeader
-	relocations map[string][]Reloc
+	file         string
+	hdr          FileHeader
+	loads        []any
+	sections     []*SectionHeader
+	relocations  map[string][]Reloc
+	importedSyms []string
 }
 
 var fileTests = []fileTest{
@@ -45,6 +49,7 @@ var fileTests = []fileTest{
 			{"__dyld", "__DATA", 0x2014, 0x1c, 0x1014, 0x2, 0x0, 0x0, 0x0},
 			{"__jump_table", "__IMPORT", 0x3000, 0xa, 0x2000, 0x6, 0x0, 0x0, 0x4000008},
 		},
+		nil,
 		nil,
 	},
 	{
@@ -74,6 +79,7 @@ var fileTests = []fileTest{
 			{"__la_symbol_ptr", "__DATA", 0x100001058, 0x10, 0x1058, 0x2, 0x0, 0x0, 0x7},
 		},
 		nil,
+		nil,
 	},
 	{
 		"testdata/gcc-amd64-darwin-exec-debug.base64",
@@ -102,6 +108,7 @@ var fileTests = []fileTest{
 			{"__debug_str", "__DWARF", 0x10000215c, 0x60, 0x115c, 0x0, 0x0, 0x0, 0x0},
 		},
 		nil,
+		nil,
 	},
 	{
 		"testdata/clang-386-darwin-exec-with-rpath.base64",
@@ -126,6 +133,7 @@ var fileTests = []fileTest{
 		},
 		nil,
 		nil,
+		nil,
 	},
 	{
 		"testdata/clang-amd64-darwin-exec-with-rpath.base64",
@@ -148,6 +156,7 @@ var fileTests = []fileTest{
 			nil, // LC_FUNCTION_STARTS
 			nil, // LC_DATA_IN_CODE
 		},
+		nil,
 		nil,
 		nil,
 	},
@@ -185,6 +194,7 @@ var fileTests = []fileTest{
 				},
 			},
 		},
+		nil,
 	},
 	{
 		"testdata/clang-amd64-darwin.obj.base64",
@@ -221,6 +231,15 @@ var fileTests = []fileTest{
 				},
 			},
 		},
+		[]string{"_printf"},
+	},
+	{
+		"testdata/clang-amd64-darwin-ld-r.obj.base64",
+		FileHeader{0xfeedfacf, CpuAmd64, 0x3, 0x1, 0x4, 0x1c0, 0x2000},
+		nil,
+		nil,
+		nil,
+		[]string{"_printf"},
 	},
 }
 
@@ -345,6 +364,17 @@ func TestOpen(t *testing.T) {
 				}
 			}
 		}
+
+		if tt.importedSyms != nil {
+			ss, err := f.ImportedSymbols()
+			if err != nil {
+				t.Errorf("open %s: fail to read imported symbols: %v", tt.file, err)
+			}
+			want := tt.importedSyms
+			if !slices.Equal(ss, want) {
+				t.Errorf("open %s: imported symbols differ:\n\thave %v\n\twant %v", tt.file, ss, want)
+			}
+		}
 	}
 }
 
@@ -421,5 +451,68 @@ func TestOpenBadDysymCmd(t *testing.T) {
 	_, err := openObscured("testdata/gcc-amd64-darwin-exec-with-bad-dysym.base64")
 	if err == nil {
 		t.Fatal("openObscured did not fail when opening a file with an invalid dynamic symbol table command")
+	}
+}
+
+func TestOpenSplitDWARF(t *testing.T) {
+	// Test that we can load DWARF from a split .dSYM directory.
+	// We prepare two files
+	// - a.out is the executable
+	// - a.out.dSYM/Contents/Resources/DWARF/a.out is the DWARF
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "a.out")
+	b, err := obscuretestdata.ReadFile("testdata/clang-arm64-darwin-exec.base64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, b, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := Open(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.DWARF(); err == nil {
+		t.Fatal("expected error reading DWARF without dSYM file, got nil")
+	}
+
+	dsymDir := filepath.Join(exe+".dSYM", "Contents", "Resources", "DWARF")
+	if err := os.MkdirAll(dsymDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dsymFile := filepath.Join(dsymDir, "a.out")
+
+	// Copy a dSYM file from a different build (with a different UUID),
+	// and verify that loading DWARF fails due to UUID mismatch.
+	b, err = obscuretestdata.ReadFile("testdata/gcc-amd64-darwin-exec-debug.base64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dsymFile, b, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.DWARF(); err == nil {
+		t.Fatal("expected error reading DWARF with mismatched dSYM UUID, got nil")
+	}
+
+	// Copy the matching dSYM file from the same build.
+	b, err = obscuretestdata.ReadFile("testdata/clang-arm64-darwin-exec-debug.base64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dsymFile, b, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := f.DWARF()
+	if err != nil {
+		t.Fatalf("reading DWARF with dSYM file: %v", err)
+	}
+	e, err := d.Reader().Next()
+	if err != nil || e == nil {
+		t.Fatalf("expected non-empty DWARF, got entry=%v, err=%v", e, err)
 	}
 }

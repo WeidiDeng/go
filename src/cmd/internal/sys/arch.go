@@ -4,25 +4,26 @@
 
 package sys
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"internal/goarch"
+)
 
-// ArchFamily represents a family of one or more related architectures.
-// For example, ppc64 and ppc64le are both members of the PPC64 family.
-type ArchFamily byte
+// TODO: just use goarch.ArchFamilyType directly
+type ArchFamily = goarch.ArchFamilyType
 
 const (
-	NoArch ArchFamily = iota
-	AMD64
-	ARM
-	ARM64
-	I386
-	Loong64
-	MIPS
-	MIPS64
-	PPC64
-	RISCV64
-	S390X
-	Wasm
+	AMD64   = goarch.AMD64
+	ARM     = goarch.ARM
+	ARM64   = goarch.ARM64
+	I386    = goarch.I386
+	Loong64 = goarch.LOONG64
+	MIPS    = goarch.MIPS
+	MIPS64  = goarch.MIPS64
+	PPC64   = goarch.PPC64
+	RISCV64 = goarch.RISCV64
+	S390X   = goarch.S390X
+	Wasm    = goarch.WASM
 )
 
 // Arch represents an individual architecture.
@@ -142,8 +143,9 @@ var ArchLoong64 = &Arch{
 	PtrSize:        8,
 	RegSize:        8,
 	MinLC:          4,
-	Alignment:      8, // Unaligned accesses are not guaranteed to be fast
-	CanMergeLoads:  false,
+	Alignment:      1,
+	CanMergeLoads:  true,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 8, // LR
 }
@@ -157,6 +159,7 @@ var ArchMIPS = &Arch{
 	MinLC:          4,
 	Alignment:      4,
 	CanMergeLoads:  false,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 4, // LR
 }
@@ -170,6 +173,7 @@ var ArchMIPSLE = &Arch{
 	MinLC:          4,
 	Alignment:      4,
 	CanMergeLoads:  false,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 4, // LR
 }
@@ -183,6 +187,7 @@ var ArchMIPS64 = &Arch{
 	MinLC:          4,
 	Alignment:      8,
 	CanMergeLoads:  false,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 8, // LR
 }
@@ -196,6 +201,7 @@ var ArchMIPS64LE = &Arch{
 	MinLC:          4,
 	Alignment:      8,
 	CanMergeLoads:  false,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 8, // LR
 }
@@ -208,7 +214,7 @@ var ArchPPC64 = &Arch{
 	RegSize:       8,
 	MinLC:         4,
 	Alignment:     1,
-	CanMergeLoads: false,
+	CanMergeLoads: true,
 	HasLR:         true,
 	// PIC code on ppc64le requires 32 bytes of stack, and it's
 	// easier to just use that much stack always.
@@ -234,9 +240,10 @@ var ArchRISCV64 = &Arch{
 	ByteOrder:      binary.LittleEndian,
 	PtrSize:        8,
 	RegSize:        8,
-	MinLC:          4,
+	MinLC:          2,
 	Alignment:      8, // riscv unaligned loads work, but are really slow (trap + simulated by OS)
 	CanMergeLoads:  false,
+	CanJumpTable:   true,
 	HasLR:          true,
 	FixedFrameSize: 8, // LR
 }
@@ -262,6 +269,19 @@ var ArchWasm = &Arch{
 	RegSize:        8,
 	MinLC:          1,
 	Alignment:      1,
+	CanMergeLoads:  true,
+	HasLR:          false,
+	FixedFrameSize: 0,
+}
+
+var ArchWasm32 = &Arch{
+	Name:           "wasm32",
+	Family:         Wasm,
+	ByteOrder:      binary.LittleEndian,
+	PtrSize:        4,
+	RegSize:        8,
+	MinLC:          1,
+	Alignment:      1,
 	CanMergeLoads:  false,
 	HasLR:          false,
 	FixedFrameSize: 0,
@@ -282,4 +302,5 @@ var Archs = [...]*Arch{
 	ArchRISCV64,
 	ArchS390X,
 	ArchWasm,
+	ArchWasm32,
 }

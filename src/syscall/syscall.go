@@ -16,16 +16,19 @@
 // the manuals for the appropriate operating system.
 // These calls return err == nil to indicate success; otherwise
 // err is an operating system error describing the failure.
-// On most systems, that error has type syscall.Errno.
+// On most systems, that error has type [Errno].
 //
-// Deprecated: this package is locked down. Callers should use the
-// corresponding package in the golang.org/x/sys repository instead.
-// That is also where updates required by new systems or versions
-// should be applied. See https://golang.org/s/go1.4-syscall for more
-// information.
+// NOTE: Most of the functions, types, and constants defined in
+// this package are also available in the [golang.org/x/sys] package.
+// That package has more system call support than this one,
+// and most new code should prefer that package where possible.
+// See https://golang.org/s/go1.4-syscall for more information.
 package syscall
 
-import "internal/bytealg"
+import (
+	"internal/bytealg"
+	"unsafe"
+)
 
 //go:generate go run ./mksyscall_windows.go -systemdll -output zsyscall_windows.go syscall_windows.go security_windows.go
 
@@ -44,32 +47,36 @@ func StringByteSlice(s string) []byte {
 
 // ByteSliceFromString returns a NUL-terminated slice of bytes
 // containing the text of s. If s contains a NUL byte at any
-// location, it returns (nil, EINVAL).
+// location, it returns (nil, [EINVAL]).
 func ByteSliceFromString(s string) ([]byte, error) {
+	return byteSliceFromString(s, make([]byte, len(s)+1))
+}
+
+// byteSliceFromString requires buf to have length len(s)+1.
+// The exported wrappers allocate buf so it can be stack allocated after inlining.
+//
+//go:noinline
+func byteSliceFromString(s string, buf []byte) ([]byte, error) {
 	if bytealg.IndexByteString(s, 0) != -1 {
 		return nil, EINVAL
 	}
-	a := make([]byte, len(s)+1)
-	copy(a, s)
-	return a, nil
+	copy(buf, s)
+	return buf, nil
 }
 
 // StringBytePtr returns a pointer to a NUL-terminated array of bytes.
 // If s contains a NUL byte this function panics instead of returning
 // an error.
 //
-// Deprecated: Use BytePtrFromString instead.
+// Deprecated: Use [BytePtrFromString] instead.
 func StringBytePtr(s string) *byte { return &StringByteSlice(s)[0] }
 
 // BytePtrFromString returns a pointer to a NUL-terminated array of
 // bytes containing the text of s. If s contains a NUL byte at any
-// location, it returns (nil, EINVAL).
+// location, it returns (nil, [EINVAL]).
 func BytePtrFromString(s string) (*byte, error) {
-	a, err := ByteSliceFromString(s)
-	if err != nil {
-		return nil, err
-	}
-	return &a[0], nil
+	a, err := byteSliceFromString(s, make([]byte, len(s)+1))
+	return unsafe.SliceData(a), err
 }
 
 // Single-word zero for use when we need a valid pointer to 0 bytes.
@@ -104,3 +111,7 @@ func Exit(code int)
 // runtimeSetenv and runtimeUnsetenv are provided by the runtime.
 func runtimeSetenv(k, v string)
 func runtimeUnsetenv(k string)
+
+// runtimeClearenv is provided by the runtime (on platforms without
+// clearenv(3), it is just a wrapper around runtimeUnsetenv).
+func runtimeClearenv(env map[string]int)

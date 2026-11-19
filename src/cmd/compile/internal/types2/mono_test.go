@@ -5,7 +5,6 @@
 package types2_test
 
 import (
-	"cmd/compile/internal/syntax"
 	"cmd/compile/internal/types2"
 	"errors"
 	"fmt"
@@ -15,18 +14,13 @@ import (
 
 func checkMono(t *testing.T, body string) error {
 	src := "package x; import `unsafe`; var _ unsafe.Pointer;\n" + body
-	file, err := syntax.Parse(syntax.NewFileBase("x.go"), strings.NewReader(src), nil, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := []*syntax.File{file}
 
 	var buf strings.Builder
 	conf := types2.Config{
 		Error:    func(err error) { fmt.Fprintln(&buf, err) },
 		Importer: defaultImporter(),
 	}
-	conf.Check("x", files, nil)
+	typecheck(src, &conf, nil)
 	if buf.Len() == 0 {
 		return nil
 	}
@@ -85,4 +79,8 @@ var bads = []string{
 	"type U[_ any] int; const X = unsafe.Sizeof(func() { type A[T any] U[A[*T]] })",
 	"func F[T any]() { type A = *T; F[A]() }",
 	"type A[T any] struct { _ A[*T] }",
+	"type T struct{}; func (t T) M[P any]() { t.M[*P]() }",
+	"type T struct{}; func (t T) A[P any]() { t.B[*P]() }; func (t T) B[Q any]() { t.A[*Q]() }",
+	"type G[T any] int; func (g G[T]) M[P any]() { g.M[*P]() }",
+	"type G[T any] int; func (g G[T]) A[P any]() { g.B[*P]() }; func (g G[T]) B[Q any]() { g.A[*Q]() }",
 }

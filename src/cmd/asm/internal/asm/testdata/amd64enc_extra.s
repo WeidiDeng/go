@@ -891,7 +891,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$0
 	VPEXTRW $17, X20, (SP)(AX*2)      // 62e37d0815244411 or 62e3fd0815244411
 	VPEXTRW $127, X20, (SP)(AX*2)     // 62e37d081524447f or 62e3fd081524447f
 	// EVEX: embedded zeroing.
-	VADDPD.Z X30, X1, X0      // 6291f58858c6
+	VADDPD.Z X30, X1, K7, X0  // 6291f58f58c6
 	VMAXPD.Z (AX), Z2, K1, Z1 // 62f1edc95f08
 	// EVEX: embedded rounding.
 	VADDPD.RU_SAE Z3, Z2, K1, Z1   // 62f1ed5958cb
@@ -1055,5 +1055,20 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$0
 	TPAUSE BX // 660faef3
 	UMONITOR BX // f30faef3
 	UMWAIT BX // f20faef3
+
+	RDPID DX                                // f30fc7fa
+	RDPID R11                               // f3410fc7fb
+
+	ENDBR64					// f30f1efa
+
+	// High byte registers are allowed when no REX prefix is needed.
+	ADDB $1, CH                             // 80c501
+	MOVB AH, BL                             // 88e3
+	MOVBLZX AH, AX                          // 0fb6c4
+	MOVBLSX BH, DX                          // 0fbed7
+	MOVB (BX)(CX*4), AH                     // 8a248b
+	MOVB DH, (AX)                           // 8830
+	MOVBWZX CH, BX                          // 660fb6dd
+
 	// End of tests.
 	RET

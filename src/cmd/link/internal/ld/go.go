@@ -50,11 +50,7 @@ func ldpkg(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, filename s
 	// process header lines
 	for data != "" {
 		var line string
-		if i := strings.Index(data, "\n"); i >= 0 {
-			line, data = data[:i], data[i+1:]
-		} else {
-			line, data = data, ""
-		}
+		line, data, _ = strings.Cut(data, "\n")
 		if line == "main" {
 			lib.Main = true
 		}
@@ -121,6 +117,12 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 				lib = f[3]
 			}
 
+			if strings.Contains(local, ",") || strings.Contains(remote, ",") {
+				fmt.Fprintf(os.Stderr, "%s: %s: invalid symbol in cgo_import_dynamic directive: %q\n", os.Args[0], file, f)
+				nerrors++
+				return
+			}
+
 			if *FlagD {
 				fmt.Fprintf(os.Stderr, "%s: %s: cannot use dynamic imports with -d flag\n", os.Args[0], file)
 				nerrors++
@@ -141,10 +143,14 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 			}
 
 			q := ""
-			if i := strings.Index(remote, "#"); i >= 0 {
-				remote, q = remote[:i], remote[i+1:]
+			if before, after, found := strings.Cut(remote, "#"); found {
+				remote, q = before, after
 			}
 			s := l.LookupOrCreateSym(local, 0)
+			// export overrides import
+			if l.AttrCgoExportStatic(s) || l.AttrCgoExportDynamic(s) {
+				continue
+			}
 			st := l.SymType(s)
 			if st == 0 || st == sym.SXREF || st == sym.SBSS || st == sym.SNOPTRBSS || st == sym.SHOSTOBJ {
 				l.SetSymDynimplib(s, lib)
@@ -169,6 +175,11 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 				break
 			}
 			local := f[1]
+			if strings.Contains(local, ",") {
+				fmt.Fprintf(os.Stderr, "%s: %s: invalid symbol in cgo_import_static directive: %q\n", os.Args[0], file, f)
+				nerrors++
+				return
+			}
 
 			s := l.LookupOrCreateSym(local, 0)
 			su := l.MakeSymbolUpdater(s)
@@ -185,6 +196,11 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 			remote := local
 			if len(f) > 2 {
 				remote = f[2]
+			}
+			if strings.Contains(local, ",") || strings.Contains(remote, ",") {
+				fmt.Fprintf(os.Stderr, "%s: %s: invalid symbol in %s directive: %q\n", os.Args[0], file, f[0], f)
+				nerrors++
+				return
 			}
 			// The compiler adds a fourth argument giving
 			// the definition ABI of function symbols.
@@ -212,9 +228,10 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 				}
 			}
 
-			// export overrides import, for openbsd/cgo.
-			// see issue 4878.
-			if l.SymDynimplib(s) != "" {
+			// If we saw a cgo_import_dynamic before this cgo_export, the
+			// export overrides the import (for example on openbsd/cgo, see
+			// issue 4878).
+			if l.SymDynimplib(s) != "" || l.SymType(s) == sym.SDYNIMPORT {
 				l.SetSymDynimplib(s, "")
 				l.SetSymDynimpvers(s, "")
 				l.SetSymExtname(s, "")
@@ -262,6 +279,11 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 		case "cgo_dynamic_linker":
 			if len(f) != 2 {
 				break
+			}
+			if strings.Contains(f[1], ",") {
+				fmt.Fprintf(os.Stderr, "%s: %s: invalid path in cgo_dynamic_linker directive: %q\n", os.Args[0], file, f[1])
+				nerrors++
+				return
 			}
 
 			if *flagInterpreter == "" {
@@ -361,7 +383,7 @@ func adddynlib(ctxt *Link, lib string) {
 		du := ctxt.loader.MakeSymbolUpdater(ctxt.Dynamic)
 		Elfwritedynent(ctxt.Arch, du, elf.DT_NEEDED, uint64(dsu.Addstring(lib)))
 	} else {
-		Errorf(nil, "adddynlib: unsupported binary format")
+		Errorf("adddynlib: unsupported binary format")
 	}
 }
 
@@ -450,50 +472,5 @@ func (ctxt *Link) addexport() {
 
 	for _, lib := range dedupLibraries(ctxt, dynlib) {
 		adddynlib(ctxt, lib)
-	}
-}
-
-type Pkg struct {
-	mark    bool
-	checked bool
-	path    string
-	impby   []*Pkg
-}
-
-var pkgall []*Pkg
-
-func (p *Pkg) cycle() *Pkg {
-	if p.checked {
-		return nil
-	}
-
-	if p.mark {
-		nerrors++
-		fmt.Printf("import cycle:\n")
-		fmt.Printf("\t%s\n", p.path)
-		return p
-	}
-
-	p.mark = true
-	for _, q := range p.impby {
-		if bad := q.cycle(); bad != nil {
-			p.mark = false
-			p.checked = true
-			fmt.Printf("\timports %s\n", p.path)
-			if bad == p {
-				return nil
-			}
-			return bad
-		}
-	}
-
-	p.checked = true
-	p.mark = false
-	return nil
-}
-
-func importcycles() {
-	for _, p := range pkgall {
-		p.cycle()
 	}
 }

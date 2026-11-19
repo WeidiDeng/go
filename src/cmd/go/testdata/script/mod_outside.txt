@@ -1,4 +1,3 @@
-env GO111MODULE=on
 [short] skip
 
 # This script tests commands in module mode outside of any module.
@@ -173,13 +172,15 @@ go build -n fmt
 go build ./newgo/newgo.go
 
 # 'go doc' without arguments implicitly operates on the current directory, and should fail.
-# TODO(golang.org/issue/32027): currently, it succeeds.
 cd needmod
-go doc
+! go doc
+stderr '^doc: go: go.mod file not found in current directory or any parent directory; see ''go help modules''$'
 cd ..
 
-# 'go doc' of a non-module directory should also succeed.
-go doc ./needmod
+# 'go doc' of a non-module directory should also fail.
+! go doc ./needmod
+stderr '^doc: go: go.mod file not found in current directory or any parent directory; see ''go help modules''$'
+
 
 # 'go doc' should succeed for standard-library packages.
 go doc fmt
@@ -202,12 +203,6 @@ stderr '^go: ''go install'' requires a version when current directory is not in 
 # resolved to a module.
 ! go install ./needmod/needmod.go
 stderr 'needmod[/\\]needmod.go:10:2: no required module provides package example.com/version: go.mod file not found in current directory or any parent directory; see ''go help modules''$'
-
-# 'go install' for a package in GOROOT should succeed.
-# (It must be non-stale here so that the test does not write to GOROOT).
-! stale cmd/addr2line
-go install cmd/addr2line
-! stderr .
 
 # 'go run' should fail if a package argument must be resolved to a module.
 ! go run example.com/printversion

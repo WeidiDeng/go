@@ -8,14 +8,16 @@ package sha512
 
 import (
 	"bytes"
-	"crypto/internal/boring"
-	"crypto/rand"
+	"crypto/internal/cryptotest"
 	"encoding"
 	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
+	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type sha512Test struct {
@@ -679,6 +681,12 @@ func testHash(t *testing.T, name, in, outHex string, oneShotResult []byte, diges
 }
 
 func TestGolden(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+		testGolden(t)
+	})
+}
+
+func testGolden(t *testing.T) {
 	tests := []struct {
 		name        string
 		oneShotHash func(in []byte) []byte
@@ -719,6 +727,12 @@ func TestGolden(t *testing.T) {
 }
 
 func TestGoldenMarshal(t *testing.T) {
+	cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+		testGoldenMarshal(t)
+	})
+}
+
+func testGoldenMarshal(t *testing.T) {
 	tests := []struct {
 		name    string
 		newHash func() hash.Hash
@@ -744,8 +758,20 @@ func TestGoldenMarshal(t *testing.T) {
 					return
 				}
 
+				stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+				if err != nil {
+					t.Errorf("could not marshal: %v", err)
+					return
+				}
+				stateAppend = stateAppend[4:]
+
 				if string(state) != test.halfState {
 					t.Errorf("New%s(%q) state = %q, want %q", tt.name, test.in, state, test.halfState)
+					continue
+				}
+
+				if string(stateAppend) != test.halfState {
+					t.Errorf("New%s(%q) stateAppend = %q, want %q", tt.name, test.in, stateAppend, test.halfState)
 					continue
 				}
 
@@ -821,21 +847,6 @@ func TestBlockSize(t *testing.T) {
 	}
 }
 
-// Tests that blockGeneric (pure Go) and block (in assembly for some architectures) match.
-func TestBlockGeneric(t *testing.T) {
-	if boring.Enabled {
-		t.Skip("BoringCrypto doesn't expose digest")
-	}
-	gen, asm := New().(*digest), New().(*digest)
-	buf := make([]byte, BlockSize*20) // arbitrary factor
-	rand.Read(buf)
-	blockGeneric(gen, buf)
-	block(asm, buf)
-	if *gen != *asm {
-		t.Error("block and blockGeneric resulted in different states")
-	}
-}
-
 // Tests for unmarshaling hashes that have hashed a large amount of data
 // The initial hash generation is omitted from the test, because it takes a long time.
 // The test contains some already-generated states, and their expected sums
@@ -893,33 +904,113 @@ func TestLargeHashes(t *testing.T) {
 }
 
 func TestAllocations(t *testing.T) {
-	if boring.Enabled {
-		t.Skip("BoringCrypto doesn't allocate the same way as stdlib")
-	}
-	in := []byte("hello, world!")
-	out := make([]byte, 0, Size)
-	h := New()
-	n := int(testing.AllocsPerRun(10, func() {
-		h.Reset()
-		h.Write(in)
-		out = h.Sum(out[:0])
-	}))
-	if n > 0 {
-		t.Errorf("allocs = %d, want 0", n)
+	cryptotest.SkipTestAllocations(t)
+	if n := testing.AllocsPerRun(10, func() {
+		in := []byte("hello, world!")
+		out := make([]byte, 0, Size)
+
+		{
+			h := New()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+		{
+			h := New512_224()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+		{
+			h := New512_256()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+		{
+			h := New384()
+			h.Reset()
+			h.Write(in)
+			out = h.Sum(out[:0])
+		}
+
+		Sum512(in)
+		Sum384(in)
+		Sum512_224(in)
+		Sum512_256(in)
+	}); n > 0 {
+		t.Errorf("allocs = %v, want 0", n)
 	}
 }
 
+func TestHash(t *testing.T) {
+	t.Run("SHA-384", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			cryptotest.TestHash(t, New384)
+		})
+	})
+	t.Run("SHA-512/224", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			cryptotest.TestHash(t, New512_224)
+		})
+	})
+	t.Run("SHA-512/256", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			cryptotest.TestHash(t, New512_256)
+		})
+	})
+	t.Run("SHA-512", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			cryptotest.TestHash(t, New)
+		})
+	})
+}
+
+func TestExtraMethods(t *testing.T) {
+	t.Run("SHA-384", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			h := maybeCloner(New384())
+			cryptotest.NoExtraMethods(t, h, "MarshalBinary", "UnmarshalBinary", "AppendBinary")
+		})
+	})
+	t.Run("SHA-512/224", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			h := maybeCloner(New512_224())
+			cryptotest.NoExtraMethods(t, h, "MarshalBinary", "UnmarshalBinary", "AppendBinary")
+		})
+	})
+	t.Run("SHA-512/256", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			h := maybeCloner(New512_256())
+			cryptotest.NoExtraMethods(t, h, "MarshalBinary", "UnmarshalBinary", "AppendBinary")
+		})
+	})
+	t.Run("SHA-512", func(t *testing.T) {
+		cryptotest.TestAllImplementations(t, "sha512", func(t *testing.T) {
+			h := maybeCloner(New())
+			cryptotest.NoExtraMethods(t, h, "MarshalBinary", "UnmarshalBinary", "AppendBinary")
+		})
+	})
+}
+
+func maybeCloner(h hash.Hash) any {
+	if c, ok := h.(hash.Cloner); ok {
+		return &c
+	}
+	return &h
+}
+
 var bench = New()
-var buf = make([]byte, 8192)
 
 func benchmarkSize(b *testing.B, size int) {
+	buf := make([]byte, size)
 	sum := make([]byte, bench.Size())
 	b.Run("New", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(size))
 		for i := 0; i < b.N; i++ {
 			bench.Reset()
-			bench.Write(buf[:size])
+			bench.Write(buf)
 			bench.Sum(sum[:0])
 		}
 	})
@@ -927,14 +1018,14 @@ func benchmarkSize(b *testing.B, size int) {
 		b.ReportAllocs()
 		b.SetBytes(int64(size))
 		for i := 0; i < b.N; i++ {
-			Sum384(buf[:size])
+			Sum384(buf)
 		}
 	})
 	b.Run("Sum512", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(size))
 		for i := 0; i < b.N; i++ {
-			Sum512(buf[:size])
+			Sum512(buf)
 		}
 	})
 }
@@ -949,4 +1040,53 @@ func BenchmarkHash1K(b *testing.B) {
 
 func BenchmarkHash8K(b *testing.B) {
 	benchmarkSize(b, 8192)
+}
+
+func BenchmarkHash256K(b *testing.B) {
+	benchmarkSize(b, 256*1024)
+}
+
+func BenchmarkHash1M(b *testing.B) {
+	benchmarkSize(b, 1024*1024)
+}
+
+var sinkSTW []byte
+
+// BenchmarkSTW reports how long a garbage collection had to wait while a hash
+// ran alongside it, as gcwait-ns/op. Assembly is not preemptible, so a call
+// that covers the whole input blocks every goroutine in the process for as
+// long as it runs; bounding the call gives the collector a way in between
+// chunks. Run with GOMAXPROCS>=2 so the two actually overlap.
+func BenchmarkSTW(b *testing.B) {
+	buf := make([]byte, 64<<20)
+	var total time.Duration
+	var iters int
+	b.SetBytes(int64(len(buf)))
+	for b.Loop() {
+		done := make(chan struct{})
+		var began atomic.Int64
+		go func() {
+			defer close(done)
+			began.Store(time.Now().UnixNano())
+			h := New()
+			h.Write(buf)
+			sinkSTW = h.Sum(nil)
+		}()
+		start := time.Now()
+		runtime.GC() // one per iteration, so the mean is well defined
+		end := time.Now()
+		<-done
+
+		// Count the iteration only if the hash had started before the
+		// collection finished. Otherwise there was nothing to overlap and the
+		// sample says nothing about preemptibility.
+		if t := began.Load(); t != 0 && t < end.UnixNano() {
+			total += end.Sub(start)
+			iters++
+		}
+	}
+	if iters == 0 {
+		b.Skip("no iteration overlapped a collection")
+	}
+	b.ReportMetric(float64(total.Nanoseconds())/float64(iters), "gcwait-ns/op")
 }

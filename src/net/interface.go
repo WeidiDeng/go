@@ -6,9 +6,10 @@ package net
 
 import (
 	"errors"
-	"internal/itoa"
+	"internal/strconv"
 	"sync"
 	"time"
+	_ "unsafe"
 )
 
 // BUG(mikio): On JS, methods and functions related to
@@ -25,13 +26,30 @@ var (
 	errNoSuchMulticastInterface = errors.New("no such multicast network interface")
 )
 
+// An interfaceAddr is the Addr of an OpError about a network
+// interface: its name, or its index when it was asked for by index,
+// printed in decimal as an IPv6 zone names an interface either way.
+type interfaceAddr struct {
+	name  string
+	index int
+}
+
+func (a interfaceAddr) Network() string { return "ip+net" }
+
+func (a interfaceAddr) String() string {
+	if a.name != "" {
+		return a.name
+	}
+	return strconv.Itoa(a.index)
+}
+
 // Interface represents a mapping between network interface name
 // and index. It also represents network interface facility
 // information.
 type Interface struct {
 	Index        int          // positive integer that starts at one, zero is never used
 	MTU          int          // maximum transmission unit
-	Name         string       // e.g., "en0", "lo0", "eth0.100"
+	Name         string       // e.g., "en0", "lo0", "eth0.100"; may be the empty string
 	HardwareAddr HardwareAddr // IEEE MAC-48, EUI-48 and EUI-64 form
 	Flags        Flags        // e.g., FlagUp, FlagLoopback, FlagMulticast
 }
@@ -80,7 +98,7 @@ func (ifi *Interface) Addrs() ([]Addr, error) {
 	}
 	ifat, err := interfaceAddrTable(ifi)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: ifi.Name}, Err: err}
 	}
 	return ifat, err
 }
@@ -93,7 +111,7 @@ func (ifi *Interface) MulticastAddrs() ([]Addr, error) {
 	}
 	ifat, err := interfaceMulticastAddrTable(ifi)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: ifi.Name}, Err: err}
 	}
 	return ifat, err
 }
@@ -114,7 +132,7 @@ func Interfaces() ([]Interface, error) {
 // addresses.
 //
 // The returned list does not identify the associated interface; use
-// Interfaces and Interface.Addrs for more detail.
+// Interfaces and [Interface.Addrs] for more detail.
 func InterfaceAddrs() ([]Addr, error) {
 	ifat, err := interfaceAddrTable(nil)
 	if err != nil {
@@ -127,18 +145,18 @@ func InterfaceAddrs() ([]Addr, error) {
 //
 // On Solaris, it returns one of the logical network interfaces
 // sharing the logical data link; for more precision use
-// InterfaceByName.
+// [InterfaceByName].
 func InterfaceByIndex(index int) (*Interface, error) {
 	if index <= 0 {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterfaceIndex}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: errInvalidInterfaceIndex}
 	}
 	ift, err := interfaceTable(index)
 	if err != nil {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: err}
 	}
 	ifi, err := interfaceByIndex(ift, index)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: err}
 	}
 	return ifi, err
 }
@@ -159,7 +177,7 @@ func InterfaceByName(name string) (*Interface, error) {
 	}
 	ift, err := interfaceTable(0)
 	if err != nil {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: name}, Err: err}
 	}
 	if len(ift) != 0 {
 		zoneCache.update(ift, false)
@@ -169,7 +187,7 @@ func InterfaceByName(name string) (*Interface, error) {
 			return &ifi, nil
 		}
 	}
-	return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errNoSuchInterface}
+	return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: name}, Err: errNoSuchInterface}
 }
 
 // An ipv6ZoneCache represents a cache holding partial network
@@ -210,9 +228,11 @@ func (zc *ipv6ZoneCache) update(ift []Interface, force bool) (updated bool) {
 	zc.toIndex = make(map[string]int, len(ift))
 	zc.toName = make(map[int]string, len(ift))
 	for _, ifi := range ift {
-		zc.toIndex[ifi.Name] = ifi.Index
-		if _, ok := zc.toName[ifi.Index]; !ok {
-			zc.toName[ifi.Index] = ifi.Name
+		if ifi.Name != "" {
+			zc.toIndex[ifi.Name] = ifi.Index
+			if _, ok := zc.toName[ifi.Index]; !ok {
+				zc.toName[ifi.Index] = ifi.Name
+			}
 		}
 	}
 	return true
@@ -233,7 +253,7 @@ func (zc *ipv6ZoneCache) name(index int) string {
 		zoneCache.RUnlock()
 	}
 	if !ok { // last resort
-		name = itoa.Uitoa(uint(index))
+		name = strconv.Itoa(index)
 	}
 	return name
 }

@@ -21,11 +21,14 @@ var testExprs = []testEntry{
 	dup(`'a'`),
 	dup(`"foo"`),
 	dup("`bar`"),
+	dup("any"),
 
 	// func and composite literals
 	{"func(){}", "(func() literal)"},
 	{"func(x int) complex128 {}", "(func(x int) complex128 literal)"},
 	{"[]int{1, 2, 3}", "[]int{…}"},
+	{"{1, 2, 3}", "{…}"},
+	dup("{}"),
 
 	// type expressions
 	dup("[1 << 10]byte"),
@@ -46,13 +49,17 @@ var testExprs = []testEntry{
 	// new interfaces
 	dup("interface{int}"),
 	dup("interface{~int}"),
-	dup("interface{~int}"),
+
+	// generic constraints
+	dup("interface{~a | ~b | ~c; ~int | ~string; float64; m()}"),
 	dup("interface{int | string}"),
 	dup("interface{~int | ~string; float64; m()}"),
-
-	// See above.
-	// dup("interface{type a, b, c; ~int | ~string; float64; m()}"),
 	dup("interface{~T[int, string] | string}"),
+
+	// generic types
+	dup("x[T]"),
+	dup("x[N | A | S]"),
+	dup("x[N, A]"),
 
 	// non-type expressions
 	dup("(x)"),
@@ -101,6 +108,12 @@ var testExprs = []testEntry{
 	dup("f(s...)"),
 	dup("f(a, s...)"),
 
+	// generic functions
+	dup("f[T]()"),
+	dup("f[T](T)"),
+	dup("f[T, T1]()"),
+	dup("f[T, T1](T, T1)"),
+
 	dup("*x"),
 	dup("&x"),
 	dup("x + y"),
@@ -108,6 +121,7 @@ var testExprs = []testEntry{
 }
 
 func TestExprString(t *testing.T) {
+	t.Parallel()
 	for _, test := range testExprs {
 		x, err := parser.ParseExpr(test.src)
 		if err != nil {

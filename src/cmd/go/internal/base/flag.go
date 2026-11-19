@@ -6,6 +6,7 @@ package base
 
 import (
 	"flag"
+	"fmt"
 
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
@@ -53,19 +54,32 @@ func (f explicitStringFlag) Set(v string) error {
 
 // AddBuildFlagsNX adds the -n and -x build flags to the flag set.
 func AddBuildFlagsNX(flags *flag.FlagSet) {
-	flags.BoolVar(&cfg.BuildN, "n", false, "")
-	flags.BoolVar(&cfg.BuildX, "x", false, "")
+	flags.BoolVar(&cfg.BuildN, "n", false, "print commands but do not run them")
+	flags.BoolVar(&cfg.BuildX, "x", false, "print commands as they are executed")
+}
+
+// AddChdirFlag adds the -C flag to the flag set.
+func AddChdirFlag(flags *flag.FlagSet) {
+	// The usage message is used in chdir_test.go
+	// to identify that the -C flag is from AddChdirFlag.
+	flags.Func("C", "change to `dir` before running the command", ChdirFlag)
 }
 
 // AddModFlag adds the -mod build flag to the flag set.
 func AddModFlag(flags *flag.FlagSet) {
-	flags.Var(explicitStringFlag{value: &cfg.BuildMod, explicit: &cfg.BuildModExplicit}, "mod", "")
+	flags.Var(explicitStringFlag{value: &cfg.BuildMod, explicit: &cfg.BuildModExplicit}, "mod", "module download `mode` to use: readonly, vendor, mod")
 }
 
 // AddModCommonFlags adds the module-related flags common to build commands
 // and 'go mod' subcommands.
 func AddModCommonFlags(flags *flag.FlagSet) {
-	flags.BoolVar(&cfg.ModCacheRW, "modcacherw", false, "")
-	flags.StringVar(&cfg.ModFile, "modfile", "", "")
-	flags.StringVar(&fsys.OverlayFile, "overlay", "", "")
+	flags.BoolVar(&cfg.ModCacheRW, "modcacherw", false, "leave newly-created directories in the module cache read-write instead of making them read-only")
+	flags.StringVar(&cfg.ModFile, "modfile", "", "read (and possibly write) an alternate go.mod `file` instead of the one in the module root directory")
+	flags.StringVar(&fsys.OverlayFile, "overlay", "", "read a JSON config `file` that provides an overlay for build operations")
+}
+
+func ChdirFlag(s string) error {
+	// main handles -C by removing it from the command line.
+	// If we see one during flag parsing, that's an error.
+	return fmt.Errorf("-C flag must be first flag on command line")
 }

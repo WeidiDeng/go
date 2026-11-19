@@ -6,12 +6,11 @@ package main_test
 
 import (
 	"bytes"
-	"cmd/go/internal/script"
+	"cmd/internal/script"
 	"flag"
 	"internal/diff"
 	"internal/testenv"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"text/template"
@@ -38,12 +37,8 @@ func checkScriptReadme(t *testing.T, engine *script.Engine, env []string) {
 	}
 	args.Conditions = conds.String()
 
-	if !testenv.HasExec() {
-		t.Skipf("updating script README requires os/exec")
-	}
-
 	doc := new(strings.Builder)
-	cmd := exec.Command(testGo, "doc", "cmd/go/internal/script")
+	cmd := testenv.Command(t, testGo, "doc", "cmd/internal/script")
 	cmd.Env = env
 	cmd.Stdout = doc
 	if err := cmd.Run(); err != nil {
@@ -125,7 +120,6 @@ Scripts also have access to other environment variables, including:
 	GOPATH=$WORK/gopath
 	GOPROXY=<local module proxy serving from cmd/go/testdata/mod>
 	GOROOT=<actual GOROOT>
-	GOROOT_FINAL=<actual GOROOT_FINAL>
 	TESTGO_GOROOT=<GOROOT used to build cmd/go, for use in tests that may change GOROOT>
 	HOME=/no-home
 	PATH=<actual PATH>

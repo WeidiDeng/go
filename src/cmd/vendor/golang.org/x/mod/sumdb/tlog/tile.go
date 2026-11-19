@@ -22,13 +22,13 @@ import (
 // of the form tile/H/L/NNN[.p/W].
 // The .p/W suffix is present only for partial tiles, meaning W < 2**H.
 // The NNN element is an encoding of N into 3-digit path elements.
-// All but the last path element begins with an "x".
+// All but the last path element begin with an "x".
 // For example,
 // Tile{H: 3, L: 4, N: 1234067, W: 1}'s path
 // is tile/3/4/x001/x234/067.p/1, and
 // Tile{H: 3, L: 4, N: 1234067, W: 8}'s path
 // is tile/3/4/x001/x234/067.
-// See Tile's Path method and the ParseTilePath function.
+// See the [Tile.Path] method and the [ParseTilePath] function.
 //
 // The special level L=-1 holds raw record data instead of hashes.
 // In this case, the level encodes into a tile path as the path element
@@ -46,7 +46,7 @@ type Tile struct {
 // TileForIndex returns the tile of fixed height h ≥ 1
 // and least width storing the given hash storage index.
 //
-// If h ≤ 0, TileForIndex panics.
+// If h ≤ 0, [TileForIndex] panics.
 func TileForIndex(h int, index int64) Tile {
 	if h <= 0 {
 		panic(fmt.Sprintf("TileForIndex: invalid height %d", h))
@@ -105,7 +105,7 @@ func tileHash(data []byte) Hash {
 // size newTreeSize to replace a tree of size oldTreeSize.
 // (No tiles need to be published for a tree of size zero.)
 //
-// If h ≤ 0, TileForIndex panics.
+// If h ≤ 0, NewTiles panics.
 func NewTiles(h int, oldTreeSize, newTreeSize int64) []Tile {
 	if h <= 0 {
 		panic(fmt.Sprintf("NewTiles: invalid height %d", h))
@@ -115,16 +115,14 @@ func NewTiles(h int, oldTreeSize, newTreeSize int64) []Tile {
 	for level := uint(0); newTreeSize>>(H*level) > 0; level++ {
 		oldN := oldTreeSize >> (H * level)
 		newN := newTreeSize >> (H * level)
+		if oldN == newN {
+			continue
+		}
 		for n := oldN >> H; n < newN>>H; n++ {
 			tiles = append(tiles, Tile{H: h, L: int(level), N: n, W: 1 << H})
 		}
 		n := newN >> H
-		maxW := int(newN - n<<H)
-		minW := 1
-		if oldN > n<<H {
-			minW = int(oldN - n<<H)
-		}
-		for w := minW; w <= maxW; w++ {
+		if w := int(newN - n<<H); w > 0 {
 			tiles = append(tiles, Tile{H: h, L: int(level), N: n, W: w})
 		}
 	}
@@ -272,7 +270,7 @@ type TileReader interface {
 // TileHashReader returns a HashReader that satisfies requests
 // by loading tiles of the given tree.
 //
-// The returned HashReader checks that loaded tiles are
+// The returned [HashReader] checks that loaded tiles are
 // valid for the given tree. Therefore, any hashes returned
 // by the HashReader are already proven to be in the tree.
 func TileHashReader(tree Tree, tr TileReader) HashReader {
@@ -302,13 +300,13 @@ func tileParent(t Tile, k int, n int64) Tile {
 func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
 	h := r.tr.Height()
 
-	tileOrder := make(map[Tile]int) // tileOrder[tileKey(tiles[i])] = i
+	tileOrder := make(map[Tile]int) // tileOrder[tiles[i]] = i
 	var tiles []Tile
 
 	// Plan to fetch tiles necessary to recompute tree hash.
 	// If it matches, those tiles are authenticated.
 	stx := subTreeIndex(0, r.tree.N, nil)
-	stxTileOrder := make([]int, len(stx))
+	stxTileOrder := make([]int, len(stx)) // stx[i] is in tiles[stxTileOrder[i]]
 	for i, x := range stx {
 		tile, _, _ := tileForIndex(h, x)
 		tile = tileParent(tile, 0, r.tree.N)
@@ -325,7 +323,7 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
 	// along with any parent tiles needed
 	// for authentication. For most calls,
 	// the parents are being fetched anyway.
-	indexTileOrder := make([]int, len(indexes))
+	indexTileOrder := make([]int, len(indexes)) // indexes[i] is in tiles[indexTileOrder[i]]
 	for i, x := range indexes {
 		if x >= StoredHashIndex(0, r.tree.N) {
 			return nil, fmt.Errorf("indexes not in tree")
@@ -379,19 +377,38 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
 		}
 	}
 
+	// At this point, for example if h = 2, N = 15, indexes = [(0, 01)]:
+	//
+	//                 s3
+	//           ┌───────┴───────┐
+	//           ∘               ∘              s2        <- 1/000.p/3
+	//       ┌───┴───┐       ┌───┴───┐       ┌───┴───┐
+	//       ∘       ∘       ∘       ∘       ∘       ∘      s1     s0
+	//     ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐    |
+	//     00  01  02  03  04  05  06  07  08  09  10  11  12  13  14
+	//
+	//     └── 0/000 ───┘  └── 0/001 ───┘  └── 0/002 ───┘ └ 0/003.p/3 ┘
+	//
+	// stx = [s3, s2, s1, s0]
+	//
+	// tiles = [1/000.p/3, 0/003.p/3, 0/000]
+	//                                  ┬
+	//          └──── for stx ─────┘ for idx
+
 	// Authenticate the initial tiles against the tree hash.
 	// They are arranged so that parents are authenticated before children.
 	// First the tiles needed for the tree hash.
-	th, err := HashFromTile(tiles[stxTileOrder[len(stx)-1]], data[stxTileOrder[len(stx)-1]], stx[len(stx)-1])
-	if err != nil {
-		return nil, err
-	}
-	for i := len(stx) - 2; i >= 0; i-- {
+	var th Hash
+	for i := len(stx) - 1; i >= 0; i-- {
 		h, err := HashFromTile(tiles[stxTileOrder[i]], data[stxTileOrder[i]], stx[i])
 		if err != nil {
 			return nil, err
 		}
-		th = NodeHash(h, th)
+		if i == len(stx)-1 {
+			th = h
+		} else {
+			th = NodeHash(h, th)
+		}
 	}
 	if th != r.tree.Hash {
 		// The tiles do not support the tree hash.
@@ -399,8 +416,8 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
 		return nil, fmt.Errorf("downloaded inconsistent tile")
 	}
 
-	// Authenticate full tiles against their parents.
-	for i := len(stx); i < len(tiles); i++ {
+	// Authenticate remaining full tiles against their parents.
+	for i := stxTileOrder[len(stx)-1] + 1; i < len(tiles); i++ {
 		tile := tiles[i]
 		p := tileParent(tile, 1, r.tree.N)
 		j, ok := tileOrder[p]

@@ -9,9 +9,71 @@ import (
 	"go/ast"
 	"go/token"
 	"strings"
+	"sync"
 )
 
 const debugResolve = false
+
+// ResolveFile applies the parser's deprecated
+// [ast.Ident]-to-[ast.Object] resolution to the specified file's
+// syntax tree. This is the same operation that is skipped on files
+// parsed with the [SkipObjectResolution] mode flag.
+//
+// ResolveFile is idempotent and concurrency safe.
+// Once ResolveFile returns, the file is resolved.
+//
+// Resolution error messages are discarded.
+//
+// Deprecated: [ast.Object] should not be used in new designs; use the
+// [go/types] package instead. This function is provided to ease
+// migration in applications that have disabled legacy object
+// resolution by default but still need it in some circumstances.
+func ResolveFile(file *ast.File) {
+	doIt := func() {
+		if file.Scope == nil {
+			// Inv: File.Scope is set by the parser or by
+			// the first doIt call for a file, and never
+			// cleared, so nil implies that the file was
+			// parsed without resolution and that only
+			// ResolveFile will set it.
+
+			var dummy token.File // only for declErr messages (discarded) and panics
+			resolveFile(file, &dummy, func(token.Pos, string) {})
+
+			if file.Scope == nil {
+				panic("nil File.Scope")
+			}
+		}
+	}
+
+	// Rather than add a sync.Once field to ast.File itself,
+	// we use a "singleflight"-like pattern to ensure that all
+	// doIt operations on a given file are mutually exclusive.
+	v, _ := resolveOnces.LoadOrStore(file, new(resolveOnce))
+	r := v.(*resolveOnce)
+	r.once.Do(func() {
+		defer func() {
+			if e := recover(); e != nil {
+				r.panicValue = e
+			}
+		}()
+		doIt()
+	})
+	if r.panicValue != nil {
+		panic(r.panicValue)
+	}
+	// A successful resolution is permanent, so the synchronization state
+	// can be discarded. Failed resolutions remain cached so that callers do
+	// not silently accept a partially resolved file or retry it unsafely.
+	resolveOnces.CompareAndDelete(file, r)
+}
+
+type resolveOnce struct {
+	once       sync.Once
+	panicValue any
+}
+
+var resolveOnces sync.Map // *ast.File -> *resolveOnce
 
 // resolveFile walks the given file to resolve identifiers within the file
 // scope, updating ast.Ident.Obj fields with declaration information.
@@ -136,7 +198,7 @@ func (r *resolver) declare(decl, data any, scope *ast.Scope, kind ast.ObjKind, i
 		obj.Decl = decl
 		obj.Data = data
 		// Identifiers (for receiver type parameters) are written to the scope, but
-		// never set as the resolved object. See issue #50956.
+		// never set as the resolved object. See go.dev/issue/50956.
 		if _, ok := decl.(*ast.Ident); !ok {
 			ident.Obj = obj
 		}
@@ -209,7 +271,7 @@ func (r *resolver) resolve(ident *ast.Ident, collectUnresolved bool) {
 			}
 			assert(obj.Name != "", "obj with no name")
 			// Identifiers (for receiver type parameters) are written to the scope,
-			// but never set as the resolved object. See issue #50956.
+			// but never set as the resolved object. See go.dev/issue/50956.
 			if _, ok := obj.Decl.(*ast.Ident); !ok {
 				ident.Obj = obj
 			}
@@ -234,7 +296,7 @@ func (r *resolver) walkExprs(list []ast.Expr) {
 
 func (r *resolver) walkLHS(list []ast.Expr) {
 	for _, expr := range list {
-		expr := unparen(expr)
+		expr := ast.Unparen(expr)
 		if _, ok := expr.(*ast.Ident); !ok && expr != nil {
 			ast.Walk(r, expr)
 		}
@@ -285,7 +347,7 @@ func (r *resolver) Visit(node ast.Node) ast.Visitor {
 		}
 		for _, e := range n.Elts {
 			if kv, _ := e.(*ast.KeyValueExpr); kv != nil {
-				// See issue #45160: try to resolve composite lit keys, but don't
+				// See go.dev/issue/45160: try to resolve composite lit keys, but don't
 				// collect them as unresolved if resolution failed. This replicates
 				// existing behavior when resolving during parsing.
 				if ident, _ := kv.Key.(*ast.Ident); ident != nil {

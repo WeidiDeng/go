@@ -55,6 +55,8 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
+	"internal/goexperiment"
+	"internal/stringslite"
 )
 
 type suspendGState struct {
@@ -113,6 +115,19 @@ func suspendG(gp *g) suspendGState {
 	const yieldDelay = 10 * 1000
 	var nextYield int64
 
+	// Sending signals in a loop risks live-lock. The target M acknowledges the
+	// signal from inside its signal handler, before returning to the OS and
+	// subsequently making progress on gp. A fast sender can notice the
+	// acknowledgement and queue up a new signal before the OS's
+	// end-of-signal-handler path finishes, causing the OS to immediately
+	// re-enter the signal handler. Measure the round-trip time so we can, on
+	// occasion, pause for several times that long so gp can make forward
+	// progress. See https://go.dev/issue/82146.
+	const groupAcks = 4 // acknowledgements per group
+	var acks int        // acknowledgements seen in this group
+	var lastAck int64   // when we saw the latest one
+	var minAckRTT int64 // shortest time between them
+
 	// Drive the goroutine to a preemption point.
 	stopped := false
 	var asyncM *m
@@ -133,7 +148,7 @@ func suspendG(gp *g) suspendGState {
 			dumpgstatus(gp)
 			throw("invalid g status")
 
-		case _Gdead:
+		case _Gdead, _Gdeadextra:
 			// Nothing to suspend.
 			//
 			// preemptStop may need to be cleared, but
@@ -159,7 +174,7 @@ func suspendG(gp *g) suspendGState {
 			s = _Gwaiting
 			fallthrough
 
-		case _Grunnable, _Gsyscall, _Gwaiting:
+		case _Grunnable, _Gsyscall, _Gwaiting, _Gleaked:
 			// Claim goroutine by setting scan bit.
 			// This may race with execution or readying of gp.
 			// The scan bit keeps it from transition state.
@@ -172,7 +187,7 @@ func suspendG(gp *g) suspendGState {
 			// _Gscan bit and thus own the stack.
 			gp.preemptStop = false
 			gp.preempt = false
-			gp.stackguard0 = gp.stack.lo + _StackGuard
+			gp.stackguard0 = gp.stack.lo + stackGuard
 
 			// The goroutine was already at a safe-point
 			// and we've now locked that in.
@@ -189,10 +204,16 @@ func suspendG(gp *g) suspendGState {
 			return suspendGState{g: gp, stopped: stopped}
 
 		case _Grunning:
-			// Optimization: if there is already a pending preemption request
-			// (from the previous loop iteration), don't bother with the atomics.
-			if gp.preemptStop && gp.preempt && gp.stackguard0 == stackPreempt && asyncM == gp.m && asyncM.preemptGen.Load() == asyncGen {
-				break
+			// Avoid taking the scan bit while a preemption request is pending
+			// or its retry deadline has not expired. The synchronous request
+			// must still be set so the target can stop while we wait.
+			if gp.preemptStop && gp.preempt && gp.stackguard0 == stackPreempt {
+				if asyncM != nil && asyncM == gp.m && asyncM.preemptGen.Load() == asyncGen {
+					break
+				}
+				if nextPreemptM != 0 && nanotime() < nextPreemptM {
+					break
+				}
 			}
 
 			// Temporarily block state transitions.
@@ -209,28 +230,61 @@ func suspendG(gp *g) suspendGState {
 			asyncM2 := gp.m
 			asyncGen2 := asyncM2.preemptGen.Load()
 			needAsync := asyncM != asyncM2 || asyncGen != asyncGen2
+			acked := asyncM == asyncM2 && asyncGen != asyncGen2
 			asyncM = asyncM2
 			asyncGen = asyncGen2
 
-			casfrom_Gscanstatus(gp, _Gscanrunning, _Grunning)
-
-			// Send asynchronous preemption. We do this
-			// after CASing the G back to _Grunning
-			// because preemptM may be synchronous and we
-			// don't want to catch the G just spinning on
-			// its status.
+			// Send asynchronous preemption. preemptM releases the _Gscan bit.
 			if preemptMSupported && debug.asyncpreemptoff == 0 && needAsync {
+				now := nanotime()
+
+				// When we need to signal more than once, measure the interval
+				// between the acknowledgements from gp's M. If we've sent
+				// several in a row without gp reaching a safe point, use the
+				// intervals to estimate the full time cost for gp's M (on its
+				// current processor) to enter, run, and exit the signal
+				// handler. Then, delay the next signal by several times that so
+				// the thread can make real progress and avoid live-lock.
+				if !acked {
+					acks = 0
+				} else {
+					acks++
+					if d := now - lastAck; acks == 2 || (acks > 2 && d < minAckRTT) {
+						minAckRTT = d
+					}
+					lastAck = now
+					if acks == groupAcks {
+						// Aim to bound gp's signal-handling overhead at 50%.
+						// The cost for gp's M to handle a signal may exceed our
+						// estimate by one sampling interval; add that back in.
+						//
+						// We don't set a cap on minAckRTT, or the resulting
+						// total delay. If a the program is exhibiting very slow
+						// acks, we don't have evidence to defend sending more
+						// signals at a fast cadence.
+						nextPreemptM = now + groupAcks*(minAckRTT+yieldDelay/2)
+						acks = 0
+					}
+				}
+
 				// Rate limit preemptM calls. This is
 				// particularly important on Windows
 				// where preemptM is actually
 				// synchronous and the spin loop here
 				// can lead to live-lock.
-				now := nanotime()
 				if now >= nextPreemptM {
-					nextPreemptM = now + yieldDelay/2
-					preemptM(asyncM)
+					preemptM(gp)
+					// Start the delay after preemptM returns. On Windows,
+					// the call can take longer than the delay, so using now
+					// could immediately suspend the target again.
+					nextPreemptM = nanotime() + yieldDelay/2
+					break
 				}
+				// No request was sent. Don't let the pending-request
+				// check above suppress retries after the delay expires.
+				asyncM = nil
 			}
+			casfrom_Gscanstatus(gp, _Gscanrunning, _Grunning)
 		}
 
 		// TODO: Don't busy wait. This loop should really only
@@ -268,6 +322,7 @@ func resumeG(state suspendGState) {
 
 	case _Grunnable | _Gscan,
 		_Gwaiting | _Gscan,
+		_Gleaked | _Gscan,
 		_Gsyscall | _Gscan:
 		casfrom_Gscanstatus(gp, s, s&^_Gscan)
 	}
@@ -284,28 +339,59 @@ func resumeG(state suspendGState) {
 //
 //go:nosplit
 func canPreemptM(mp *m) bool {
-	return mp.locks == 0 && mp.mallocing == 0 && mp.preemptoff == "" && mp.p.ptr().status == _Prunning
+	return mp.locks == 0 && mp.mallocing == 0 && mp.preemptoff == "" && mp.p.ptr().status == _Prunning && mp.curg != nil && readgstatus(mp.curg)&^_Gscan != _Gsyscall
 }
 
 //go:generate go run mkpreempt.go
 
 // asyncPreempt saves all user registers and calls asyncPreempt2.
 //
-// When stack scanning encounters an asyncPreempt frame, it scans that
+// It saves GP registers (anything that might contain a pointer) to the G stack.
+// Hence, when stack scanning encounters an asyncPreempt frame, it scans that
 // frame and its parent frame conservatively.
+//
+// On some platforms, it saves large additional scalar-only register state such
+// as vector registers to an "extended register state" on the P.
 //
 // asyncPreempt is implemented in assembly.
 func asyncPreempt()
 
+// asyncPreempt2 is the Go continuation of asyncPreempt.
+//
+// It must be deeply nosplit because there's untyped data on the stack from
+// asyncPreempt.
+//
+// It must not have any write barriers because we need to limit the amount of
+// stack it uses.
+//
 //go:nosplit
+//go:nowritebarrierrec
 func asyncPreempt2() {
+	// We can't grow the stack with untyped data from asyncPreempt, so switch to
+	// the system stack right away.
+	mcall(func(gp *g) {
+		gp.asyncSafePoint = true
+
+		// Move the extended register state from the P to the G. We do this now that
+		// we're on the system stack to avoid stack splits.
+		xRegSave(gp)
+
+		if gp.preemptStop {
+			preemptPark(gp)
+		} else {
+			gopreempt_m(gp)
+		}
+		// The above functions never return.
+	})
+
+	// Do not grow the stack below here!
+
 	gp := getg()
-	gp.asyncSafePoint = true
-	if gp.preemptStop {
-		mcall(preemptPark)
-	} else {
-		mcall(gopreempt_m)
-	}
+
+	// Put the extended register state back on the M so resumption can find it.
+	// We can't do this in asyncPreemptM because the park calls never return.
+	xRegRestore(gp)
+
 	gp.asyncSafePoint = false
 }
 
@@ -318,19 +404,13 @@ func init() {
 	total := funcMaxSPDelta(f)
 	f = findfunc(abi.FuncPCABIInternal(asyncPreempt2))
 	total += funcMaxSPDelta(f)
+	f = findfunc(abi.FuncPCABIInternal(xRegRestore))
+	total += funcMaxSPDelta(f)
 	// Add some overhead for return PCs, etc.
 	asyncPreemptStack = uintptr(total) + 8*goarch.PtrSize
-	if asyncPreemptStack > _StackLimit {
-		// We need more than the nosplit limit. This isn't
-		// unsafe, but it may limit asynchronous preemption.
-		//
-		// This may be a problem if we start using more
-		// registers. In that case, we should store registers
-		// in a context object. If we pre-allocate one per P,
-		// asyncPreempt can spill just a few registers to the
-		// stack, then grab its context object and spill into
-		// it. When it enters the runtime, it would allocate a
-		// new context for the P.
+	if asyncPreemptStack > stackNosplit {
+		// We need more than the nosplit limit. This isn't unsafe, but it may
+		// limit asynchronous preemption. Consider moving state into xRegState.
 		print("runtime: asyncPreemptStack=", asyncPreemptStack, "\n")
 		throw("async stack too large")
 	}
@@ -379,13 +459,29 @@ func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) (bool, uintptr) {
 		return false, 0
 	}
 
+	// If we're in the middle of a secret computation, we can't
+	// allow any conservative scanning of stacks, as that may lead
+	// to secrets leaking out from the stack into work buffers.
+	// Additionally, the preemption code will store the
+	// machine state (including registers which may contain confidential
+	// information) into the preemption buffers.
+	//
+	// TODO(dmo): there's technically nothing stopping us from doing the
+	// preemption, granted that don't conservatively scan and we clean up after
+	// ourselves. This is made slightly harder by the xRegs cached allocations
+	// that can move between Gs and Ps. In any case, for the intended users (cryptography code)
+	// they are unlikely get stuck in unterminating loops.
+	if goexperiment.RuntimeSecret && gp.secret > 0 {
+		return false, 0
+	}
+
 	// Check if PC is an unsafe-point.
 	f := findfunc(pc)
 	if !f.valid() {
 		// Not Go code.
 		return false, 0
 	}
-	if (GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "mips64" || GOARCH == "mips64le") && lr == pc+8 && funcspdelta(f, pc, nil) == 0 {
+	if (GOARCH == "mips" || GOARCH == "mipsle" || GOARCH == "mips64" || GOARCH == "mips64le") && lr == pc+8 && funcspdelta(f, pc) == 0 {
 		// We probably stopped at a half-executed CALL instruction,
 		// where the LR is updated but the PC has not. If we preempt
 		// here we'll see a seemingly self-recursive call, which is in
@@ -396,14 +492,14 @@ func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) (bool, uintptr) {
 		// use the LR for unwinding, which will be bad.
 		return false, 0
 	}
-	up, startpc := pcdatavalue2(f, _PCDATA_UnsafePoint, pc)
-	if up == _PCDATA_UnsafePointUnsafe {
+	up, startpc := pcdatavalue2(f, abi.PCDATA_UnsafePoint, pc)
+	if up == abi.UnsafePointUnsafe {
 		// Unsafe-point marked by compiler. This includes
 		// atomic sequences (e.g., write barrier) and nosplit
 		// functions (except at calls).
 		return false, 0
 	}
-	if fd := funcdata(f, _FUNCDATA_LocalsPointerMaps); fd == nil || f.flag&funcFlag_ASM != 0 {
+	if fd := funcdata(f, abi.FUNCDATA_LocalsPointerMaps); fd == nil || f.flag&abi.FuncFlagAsm != 0 {
 		// This is assembly code. Don't assume it's well-formed.
 		// TODO: Empirically we still need the fd == nil check. Why?
 		//
@@ -413,38 +509,39 @@ func isAsyncSafePoint(gp *g, pc, sp, lr uintptr) (bool, uintptr) {
 		// except the ones that have funcFlag_SPWRITE set in f.flag.
 		return false, 0
 	}
-	name := funcname(f)
-	if inldata := funcdata(f, _FUNCDATA_InlTree); inldata != nil {
-		inltree := (*[1 << 20]inlinedCall)(inldata)
-		ix := pcdatavalue(f, _PCDATA_InlTreeIndex, pc, nil)
-		if ix >= 0 {
-			name = funcnameFromNameOff(f, inltree[ix].nameOff)
-		}
-	}
-	if hasPrefix(name, "runtime.") ||
-		hasPrefix(name, "runtime/internal/") ||
-		hasPrefix(name, "reflect.") {
+	// Check the inner-most name
+	u, uf := newInlineUnwinder(f, pc)
+	name := u.srcFunc(uf).name()
+	if stringslite.HasPrefix(name, "runtime.") ||
+		stringslite.HasPrefix(name, "internal/runtime/") ||
+		stringslite.HasPrefix(name, "reflect.") {
 		// For now we never async preempt the runtime or
 		// anything closely tied to the runtime. Known issues
 		// include: various points in the scheduler ("don't
 		// preempt between here and here"), much of the defer
 		// implementation (untyped info on stack), bulk write
-		// barriers (write barrier check),
-		// reflect.{makeFuncStub,methodValueCall}.
+		// barriers (write barrier check), atomic functions in
+		// internal/runtime/atomic, reflect.{makeFuncStub,methodValueCall}.
+		//
+		// Note that this is a subset of the runtimePkgs in pkgspecial.go
+		// and these checks are theoretically redundant because the compiler
+		// marks "all points" in runtime functions as unsafe for async preemption.
+		// But for some reason, we can't eliminate these checks until https://go.dev/issue/72031
+		// is resolved.
 		//
 		// TODO(austin): We should improve this, or opt things
 		// in incrementally.
 		return false, 0
 	}
 	switch up {
-	case _PCDATA_Restart1, _PCDATA_Restart2:
+	case abi.UnsafePointRestart1, abi.UnsafePointRestart2:
 		// Restartable instruction sequence. Back off PC to
 		// the start PC.
 		if startpc == 0 || startpc > pc || pc-startpc > 20 {
 			throw("bad restart PC")
 		}
 		return true, startpc
-	case _PCDATA_RestartAtEntry:
+	case abi.UnsafePointRestartAtEntry:
 		// Restart from the function entry at resumption.
 		return true, f.entry()
 	}

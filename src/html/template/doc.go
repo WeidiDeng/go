@@ -5,16 +5,16 @@
 /*
 Package template (html/template) implements data-driven templates for
 generating HTML output safe against code injection. It provides the
-same interface as package text/template and should be used instead of
-text/template whenever the output is HTML.
+same interface as [text/template] and should be used instead of
+[text/template] whenever the output is HTML.
 
 The documentation here focuses on the security features of the package.
 For information about how to program the templates themselves, see the
-documentation for text/template.
+documentation for [text/template].
 
 # Introduction
 
-This package wraps package text/template so you can share its template API
+This package wraps [text/template] so you can share its template API
 to parse and execute HTML templates safely.
 
 	tmpl, err := template.New("name").Parse(...)
@@ -27,6 +27,9 @@ defined in the docs for ErrorCode.
 HTML templates treat data values as plain text which should be encoded so they
 can be safely embedded in an HTML document. The escaping is contextual, so
 actions can appear within JavaScript, CSS, and URI contexts.
+
+Comments are stripped from output, except for those passed in via the
+[HTML], [CSS], and [JS] types for their respective contexts.
 
 The security model used by this package assumes that template authors are
 trusted, while Execute's data parameter is not. More details are
@@ -139,7 +142,6 @@ how {{.}} appears when used in the context to the left.
 	<a href="?q={{.}}">              O&#39;Reilly%3a%20How%20are%3ci%3e...%3f
 	<a onx='f("{{.}}")'>             O\x27Reilly: How are \x3ci\x3eyou...?
 	<a onx='f({{.}})'>               "O\x27Reilly: How are \x3ci\x3eyou...?"
-	<a onx='pattern = /{{.}}/;'>     O\x27Reilly: How are \x3ci\x3eyou...\x3f
 
 If used in an unsafe context, then the value might be filtered out:
 
@@ -208,9 +210,85 @@ instead of the
 
 that would have been produced if {{.}} was a regular string.
 
+# JavaScript
+
+This package escapes template actions in JavaScript contexts depending
+on where the action appears. For example, in the template
+
+	<script>
+	let x = {{.}};
+	let y = "{{.}}, world.";
+	let z = `{{.}}, world.`;
+	</script>
+
+if {{.}} is "hello" then the template output is
+
+	<script>
+	let x = "hello";
+	let y = "hello, world.";
+	let z = `hello, world.`;
+	</script>
+
+with double quotes added to the first substitution but not the second or third.
+
+Template actions in JavaScript may appear in a <script> element
+(either with no type attribute, or one of the types shown below)
+or an HTML on* handler. Actions appearing in any other location may
+not be detected.
+
+	<script>let x = {{.}};</script>                               // script
+	<script type="module">let x = {{.}};</script>                 // script
+	<script type="text/javascript">let x = {{.}};</script>        // script
+	<script type="application/javascript">let x = {{.}};</script> // script
+	<script type="application/json">{{.}}</script>                // JSON
+	<script type="application/ld+json">{{.}}</script>             // JSON
+	<button onclick="f({{.}})">                                   // event handler
+
+This package interprets a subset of JavaScript syntax.
+Template actions in JavaScript are safe when all of the following hold:
+
+  - The script the action appears in consists of only
+    declarations, assignments, literals, and calls.
+
+  - The action is a standalone value, or is inside a quoted string
+    or template literal (without ${...}).
+
+  - The interpolated value is used as data, not as an object property key,
+    and is not passed to APIs that interpret strings as code, HTML, or URLs.
+    This package does not sanitize HTML or URLs inside JavaScript.
+
+The following are safe uses of actions in JavaScript:
+
+	let a = {{.}};                 // entire initializer
+	window.b = {{.}};              // entire right-hand side
+	const c = [{{.X}}, {{.Y}}];    // entire array element
+	const d = {key: {{.}}};        // entire property value
+	f({{.}});                      // entire call argument
+	let e = "Hello, {{.}}.";       // double-quoted string
+	let g = 'Hello, {{.}}.';       // single-quoted string
+	let h = `Hello, {{.}}.`;       // template literal, no ${...}
+
+Outside of the cases described above, escaping is best-effort
+and safety cannot be assured.
+
+The following is a non-exhaustive list of unsafe uses of actions in JavaScript:
+
+	let a = x + {{.}};             // UNSAFE: operator
+	let b = /{{.}}/;               // UNSAFE: regular expression
+	let c = `${x}{{.}}`;           // UNSAFE: template literal with ${...}
+	let d = { {{.}}: 1 };          // UNSAFE: property key
+	let e = obj[{{.}}];            // UNSAFE: property lookup
+	if ({{.}}) { ... }             // UNSAFE: control flow
+	el.innerHTML = {{.}};          // UNSAFE: value interpreted as HTML
+
+To pass template data to a complex JavaScript program,
+use a dedicated <script> element to initialize variables
+and keep complex program logic in separate elements
+or external files.
+
 # Security Model
 
-https://rawgit.com/mikesamuel/sanitized-jquery-templates/trunk/safetemplate.html#problem_definition defines "safe" as used by this package.
+https://web.archive.org/web/20160501113828/http://js-quasis-libraries-and-repl.googlecode.com/svn/trunk/safetemplate.html#problem_definition defines "safe" as used by this package.
 
 This package assumes that template authors are trusted, that Execute's data
 parameter is not, and seeks to preserve the properties below in the face
@@ -231,5 +309,10 @@ Least Surprise Property:
 "A developer (or code reviewer) familiar with HTML, CSS, and JavaScript, who
 knows that contextual autoescaping happens should be able to look at a {{.}}
 and correctly infer what sanitization happens."
+
+Interpolation of template actions into JavaScript contexts outside of the
+safe subset documented in the JavaScript section above is outside the scope
+of this package's security model. Incorrect escaping outside of the safe subset
+may be a bug but is not considered a security issue.
 */
 package template

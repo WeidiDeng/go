@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	cmdcover "cmd/cover"
+	"cmp"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -19,6 +20,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,12 +36,7 @@ const (
 // test. At one point this was created via "go build"; we now reuse the unit
 // test executable itself.
 func testcover(t testing.TB) string {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Helper()
-		t.Fatal(err)
-	}
-	return exe
+	return testenv.Executable(t)
 }
 
 // testTempDir is a temporary directory created in TestMain.
@@ -92,7 +90,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "debug: preserving tmpdir %s\n", topTmpdir)
 	}
 	os.Setenv("CMDCOVER_TEST_RUN_MAIN", "normal")
-	os.Exit(m.Run())
+	m.Run()
 }
 
 var tdmu sync.Mutex
@@ -113,8 +111,6 @@ func tempDir(t *testing.T) string {
 // "-toolexec" wrapper program to invoke the cover test executable
 // itself via "go test -cover".
 func TestCoverWithToolExec(t *testing.T) {
-	testenv.MustHaveExec(t)
-
 	toolexecArg := "-toolexec=" + testcover(t)
 
 	t.Run("CoverHTML", func(t *testing.T) {
@@ -125,6 +121,9 @@ func TestCoverWithToolExec(t *testing.T) {
 	})
 	t.Run("FuncWithDuplicateLines", func(t *testing.T) {
 		testFuncWithDuplicateLines(t, toolexecArg)
+	})
+	t.Run("MissingTrailingNewlineIssue58370", func(t *testing.T) {
+		testMissingTrailingNewlineIssue58370(t, toolexecArg)
 	})
 }
 
@@ -166,10 +165,10 @@ func TestCover(t *testing.T) {
 
 	// testcover -mode=count -var=thisNameMustBeVeryLongToCauseOverflowOfCounterIncrementStatementOntoNextLineForTest -o ./testdata/test_cover.go testdata/test_line.go
 	coverOutput := filepath.Join(dir, "test_cover.go")
-	cmd := exec.Command(testcover(t), "-mode=count", "-var=thisNameMustBeVeryLongToCauseOverflowOfCounterIncrementStatementOntoNextLineForTest", "-o", coverOutput, coverInput)
+	cmd := testenv.Command(t, testcover(t), "-mode=count", "-var=thisNameMustBeVeryLongToCauseOverflowOfCounterIncrementStatementOntoNextLineForTest", "-o", coverOutput, coverInput)
 	run(cmd, t)
 
-	cmd = exec.Command(testcover(t), "-mode=set", "-var=Not_an-identifier", "-o", coverOutput, coverInput)
+	cmd = testenv.Command(t, testcover(t), "-mode=set", "-var=Not_an-identifier", "-o", coverOutput, coverInput)
 	err = cmd.Run()
 	if err == nil {
 		t.Error("Expected cover to fail with an error")
@@ -188,7 +187,7 @@ func TestCover(t *testing.T) {
 	}
 
 	// go run ./testdata/main.go ./testdata/test.go
-	cmd = exec.Command(testenv.GoToolPath(t), "run", tmpTestMain, coverOutput)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "run", tmpTestMain, coverOutput)
 	run(cmd, t)
 
 	file, err = os.ReadFile(coverOutput)
@@ -229,7 +228,7 @@ func TestDirectives(t *testing.T) {
 	sourceDirectives := findDirectives(source)
 
 	// testcover -mode=atomic ./testdata/directives.go
-	cmd := exec.Command(testcover(t), "-mode=atomic", testDirectives)
+	cmd := testenv.Command(t, testcover(t), "-mode=atomic", testDirectives)
 	cmd.Stderr = os.Stderr
 	output, err := cmd.Output()
 	if err != nil {
@@ -260,7 +259,7 @@ func TestDirectives(t *testing.T) {
 	// come before the beginning of the named declaration and after the end
 	// of the previous declaration.
 	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, testDirectives, output, 0)
+	astFile, err := parser.ParseFile(fset, testDirectives, output, parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,11 +334,9 @@ func findDirectives(source []byte) []directiveInfo {
 // Makes sure that `cover -func=profile.cov` reports accurate coverage.
 // Issue #20515.
 func TestCoverFunc(t *testing.T) {
-	testenv.MustHaveExec(t)
-
 	// testcover -func ./testdata/profile.cov
 	coverProfile := filepath.Join(testdata, "profile.cov")
-	cmd := exec.Command(testcover(t), "-func", coverProfile)
+	cmd := testenv.Command(t, testcover(t), "-func", coverProfile)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -364,12 +361,12 @@ func testCoverHTML(t *testing.T, toolexecArg string) {
 
 	// go test -coverprofile testdata/html/html.cov cmd/cover/testdata/html
 	htmlProfile := filepath.Join(dir, "html.cov")
-	cmd := exec.Command(testenv.GoToolPath(t), "test", toolexecArg, "-coverprofile", htmlProfile, "cmd/cover/testdata/html")
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "test", toolexecArg, "-coverprofile", htmlProfile, "cmd/cover/testdata/html")
 	cmd.Env = append(cmd.Environ(), "CMDCOVER_TOOLEXEC=true")
 	run(cmd, t)
 	// testcover -html testdata/html/html.cov -o testdata/html/html.html
 	htmlHTML := filepath.Join(dir, "html.html")
-	cmd = exec.Command(testcover(t), "-html", htmlProfile, "-o", htmlHTML)
+	cmd = testenv.Command(t, testcover(t), "-html", htmlProfile, "-o", htmlHTML)
 	run(cmd, t)
 
 	// Extract the parts of the HTML with comment markers,
@@ -466,13 +463,13 @@ lab:
 	}
 
 	// go test -covermode=count -coverprofile TMPDIR/htmlunformatted.cov
-	cmd := exec.Command(testenv.GoToolPath(t), "test", "-test.v", toolexecArg, "-covermode=count", "-coverprofile", htmlUProfile)
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "test", "-test.v", toolexecArg, "-covermode=count", "-coverprofile", htmlUProfile)
 	cmd.Env = append(cmd.Environ(), "CMDCOVER_TOOLEXEC=true")
 	cmd.Dir = htmlUDir
 	run(cmd, t)
 
 	// testcover -html TMPDIR/htmlunformatted.cov -o unformatted.html
-	cmd = exec.Command(testcover(t), "-html", htmlUProfile, "-o", htmlUHTML)
+	cmd = testenv.Command(t, testcover(t), "-html", htmlUProfile, "-o", htmlUHTML)
 	cmd.Dir = htmlUDir
 	run(cmd, t)
 }
@@ -542,13 +539,13 @@ func testFuncWithDuplicateLines(t *testing.T, toolexecArg string) {
 	}
 
 	// go test -cover -covermode count -coverprofile TMPDIR/linedup.out
-	cmd := exec.Command(testenv.GoToolPath(t), "test", toolexecArg, "-cover", "-covermode", "count", "-coverprofile", lineDupProfile)
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "test", toolexecArg, "-cover", "-covermode", "count", "-coverprofile", lineDupProfile)
 	cmd.Env = append(cmd.Environ(), "CMDCOVER_TOOLEXEC=true")
 	cmd.Dir = lineDupDir
 	run(cmd, t)
 
 	// testcover -func=TMPDIR/linedup.out
-	cmd = exec.Command(testcover(t), "-func", lineDupProfile)
+	cmd = testenv.Command(t, testcover(t), "-func", lineDupProfile)
 	cmd.Dir = lineDupDir
 	run(cmd, t)
 }
@@ -573,4 +570,347 @@ func runExpectingError(c *exec.Cmd, t *testing.T) string {
 		return fmt.Sprintf("unexpected pass for %+v", c.Args)
 	}
 	return string(out)
+}
+
+// Test instrumentation of package that ends before an expected
+// trailing newline following package clause. Issue #58370.
+func testMissingTrailingNewlineIssue58370(t *testing.T, toolexecArg string) {
+	testenv.MustHaveGoBuild(t)
+	dir := tempDir(t)
+
+	t.Parallel()
+
+	noeolDir := filepath.Join(dir, "issue58370")
+	noeolGo := filepath.Join(noeolDir, "noeol.go")
+	noeolTestGo := filepath.Join(noeolDir, "noeol_test.go")
+
+	if err := os.Mkdir(noeolDir, 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(noeolDir, "go.mod"), []byte("module noeol\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	const noeolContents = `package noeol`
+	if err := os.WriteFile(noeolGo, []byte(noeolContents), 0444); err != nil {
+		t.Fatal(err)
+	}
+	const noeolTestContents = `
+package noeol
+import "testing"
+func TestCoverage(t *testing.T) { }
+`
+	if err := os.WriteFile(noeolTestGo, []byte(noeolTestContents), 0444); err != nil {
+		t.Fatal(err)
+	}
+
+	// go test -covermode atomic
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "test", toolexecArg, "-covermode", "atomic")
+	cmd.Env = append(cmd.Environ(), "CMDCOVER_TOOLEXEC=true")
+	cmd.Dir = noeolDir
+	run(cmd, t)
+}
+
+func TestSrcPathWithNewline(t *testing.T) {
+	testenv.MustHaveExec(t)
+	t.Parallel()
+
+	// srcPath is intentionally not clean so that the path passed to testcover
+	// will not normalize the trailing / to a \ on Windows.
+	srcPath := t.TempDir() + string(filepath.Separator) + "\npackage main\nfunc main() { panic(string([]rune{'u', 'h', '-', 'o', 'h'}))\n/*/main.go"
+	mainSrc := ` package main
+
+func main() {
+	/* nothing here */
+	println("ok")
+}
+`
+	if err := os.MkdirAll(filepath.Dir(srcPath), 0777); err != nil {
+		t.Skipf("creating directory with bogus path: %v", err)
+	}
+	if err := os.WriteFile(srcPath, []byte(mainSrc), 0666); err != nil {
+		t.Skipf("writing file with bogus directory: %v", err)
+	}
+
+	cmd := testenv.Command(t, testcover(t), "-mode=atomic", srcPath)
+	cmd.Stderr = new(bytes.Buffer)
+	out, err := cmd.Output()
+	t.Logf("%v:\n%s", cmd, out)
+	t.Logf("stderr:\n%s", cmd.Stderr)
+	if err == nil {
+		t.Errorf("unexpected success; want failure due to newline in file path")
+	}
+}
+
+func TestAlignment(t *testing.T) {
+	// Test that cover data structures are aligned appropriately. See issue 58936.
+	testenv.MustHaveGoRun(t)
+	t.Parallel()
+
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "test", "-cover", filepath.Join(testdata, "align.go"), filepath.Join(testdata, "align_test.go"))
+	run(cmd, t)
+}
+
+// lineRange represents a coverage range as a pair of line numbers (1-indexed, inclusive).
+type lineRange struct {
+	start, end int
+}
+
+// parseBrackets strips bracket markers (U+00AB «, U+00BB ») from src,
+// returning the cleaned Go source and a list of expected coverage ranges
+// as line number pairs (1-indexed, inclusive).
+func parseBrackets(src []byte) ([]byte, []lineRange) {
+	const (
+		open  = "\u00ab" // «
+		close = "\u00bb" // »
+	)
+	var (
+		cleaned []byte
+		ranges  []lineRange
+		stack   []int // stack of open marker byte positions in cleaned
+	)
+	i := 0
+	for i < len(src) {
+		if bytes.HasPrefix(src[i:], []byte(open)) {
+			stack = append(stack, len(cleaned))
+			i += len(open)
+		} else if bytes.HasPrefix(src[i:], []byte(close)) {
+			if len(stack) == 0 {
+				panic("unmatched close bracket at offset " + strconv.Itoa(i))
+			}
+			startPos := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			endPos := len(cleaned)
+			// Convert byte positions to line numbers.
+			startLine := 1 + bytes.Count(cleaned[:startPos], []byte{'\n'})
+			endLine := 1 + bytes.Count(cleaned[:endPos], []byte{'\n'})
+			// If endPos is at the start of a line (after \n), the range
+			// actually ended on the previous line.
+			if endPos > 0 && cleaned[endPos-1] == '\n' {
+				endLine--
+			}
+			if endLine < startLine {
+				endLine = startLine
+			}
+			ranges = append(ranges, lineRange{startLine, endLine})
+			i += len(close)
+		} else {
+			cleaned = append(cleaned, src[i])
+			i++
+		}
+	}
+	if len(stack) != 0 {
+		panic("unmatched open bracket(s)")
+	}
+	return cleaned, ranges
+}
+
+// coverRanges runs the cover tool on src and returns the coverage ranges
+// as line number pairs (1-indexed, inclusive).
+func coverRanges(t *testing.T, src []byte) []lineRange {
+	t.Helper()
+	tmpdir := t.TempDir()
+	srcPath := filepath.Join(tmpdir, "test.go")
+	if err := os.WriteFile(srcPath, src, 0666); err != nil {
+		t.Fatalf("writing test file: %v", err)
+	}
+
+	cmd := testenv.Command(t, testcover(t), "-mode=set", srcPath)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("cover failed: %v\nOutput: %s", err, out)
+	}
+
+	outStr := string(out)
+	// Skip the //line directive that cover adds at the top.
+	if _, after, ok := strings.Cut(outStr, "\n"); ok {
+		outStr = after
+	}
+
+	// Parse the coverage struct's Pos array to extract ranges.
+	// Format: startLine, endLine, (endCol<<16)|startCol, // [index]
+	re := regexp.MustCompile(`(\d+), (\d+), (0x[0-9a-f]+), // \[\d+\]`)
+	matches := re.FindAllStringSubmatch(outStr, -1)
+
+	var result []lineRange
+	for _, m := range matches {
+		startLine, _ := strconv.Atoi(m[1])
+		endLine, _ := strconv.Atoi(m[2])
+		var packed int
+		fmt.Sscanf(m[3], "0x%x", &packed)
+		endCol := (packed >> 16) & 0xFFFF
+		startCol := packed & 0xFFFF
+		// Skip zero-width ranges (comment-only or empty blocks).
+		if startLine == endLine && startCol == endCol {
+			continue
+		}
+		// The range [start, end) is half-open. When endCol==1, the
+		// range reaches the beginning of endLine but includes no
+		// content on it, so the last covered line is endLine-1.
+		if endCol == 1 && endLine > startLine {
+			endLine--
+		}
+		result = append(result, lineRange{startLine, endLine})
+	}
+	return result
+}
+
+// compareRanges is a test helper that compares got and want line ranges.
+// Both slices are sorted before comparison since the cover tool's output
+// order (AST walk order) may differ from source order (marker order).
+func compareRanges(t *testing.T, src []byte, got, want []lineRange) {
+	t.Helper()
+	lines := strings.Split(string(src), "\n")
+	snippet := func(r lineRange) string {
+		start, end := r.start-1, r.end
+		if start < 0 {
+			start = 0
+		}
+		if end > len(lines) {
+			end = len(lines)
+		}
+		s := strings.Join(lines[start:end], "\n")
+		if len(s) > 120 {
+			s = s[:117] + "..."
+		}
+		return s
+	}
+
+	sortRanges := func(rs []lineRange) []lineRange {
+		s := append([]lineRange(nil), rs...)
+		slices.SortFunc(s, func(a, b lineRange) int {
+			if c := cmp.Compare(a.start, b.start); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.end, b.end)
+		})
+		return s
+	}
+
+	gotSorted := sortRanges(got)
+	wantSorted := sortRanges(want)
+
+	if len(gotSorted) != len(wantSorted) {
+		t.Errorf("got %d ranges, want %d", len(gotSorted), len(wantSorted))
+		for i, r := range gotSorted {
+			t.Logf("  got[%d]: lines %d-%d %q", i, r.start, r.end, snippet(r))
+		}
+		for i, r := range wantSorted {
+			t.Logf("  want[%d]: lines %d-%d %q", i, r.start, r.end, snippet(r))
+		}
+		return
+	}
+	for i := range wantSorted {
+		if gotSorted[i] != wantSorted[i] {
+			t.Errorf("range %d: got lines %d-%d %q, want lines %d-%d %q",
+				i, gotSorted[i].start, gotSorted[i].end, snippet(gotSorted[i]),
+				wantSorted[i].start, wantSorted[i].end, snippet(wantSorted[i]))
+		}
+	}
+}
+
+// TestCommentedOutCodeExclusion tests that comment-only and blank lines
+// are excluded from coverage ranges using a bracket-marker testdata file.
+func TestCommentedOutCodeExclusion(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	markedSrc, err := os.ReadFile(filepath.Join(testdata, "ranges", "ranges.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, want := parseBrackets(markedSrc)
+	got := coverRanges(t, src)
+	compareRanges(t, src, got, want)
+}
+
+// TestLineDirective verifies that //line directives don't affect coverage
+// line number calculations (we use physical lines, not remapped ones).
+func TestLineDirective(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	// Source with //line directive that would remap lines if not handled correctly.
+	testSrc := `package main
+
+import "fmt"
+
+func main() {
+	//line other.go:100
+«	x := 1
+»	// comment that should be excluded
+«	y := 2
+»	//line other.go:200
+«	fmt.Println(x, y)
+»}`
+
+	src, want := parseBrackets([]byte(testSrc))
+	got := coverRanges(t, src)
+	compareRanges(t, src, got, want)
+}
+
+// TestCommentExclusionBasic is a simple test verifying that a comment splits
+// a single block into two separate coverage ranges.
+func TestCommentExclusionBasic(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	testSrc := `package main
+
+func main() {
+«	x := 1
+»	// this comment should split the block
+«	y := 2
+»}`
+
+	src, want := parseBrackets([]byte(testSrc))
+	got := coverRanges(t, src)
+	compareRanges(t, src, got, want)
+}
+
+// TestStatementCountsAfterCommentSplit verifies that splitting a basic block
+// at blank or comment-only lines preserves the statement count of the block.
+func TestStatementCountsAfterCommentSplit(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	src := []byte(`package main
+
+func main() {
+	a := 1
+	b := 2
+
+	c := 3
+	d := 4
+
+	if a == 0 {
+		return
+	}
+
+	println(a + b + c + d)
+}`)
+	tmpdir := t.TempDir()
+	srcPath := filepath.Join(tmpdir, "test.go")
+	if err := os.WriteFile(srcPath, src, 0666); err != nil {
+		t.Fatal(err)
+	}
+	cmd := testenv.Command(t, testcover(t), "-mode=set", srcPath)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("cover failed: %v\nOutput: %s", err, out)
+	}
+
+	re := regexp.MustCompile(`(?s)NumStmt: \[\d+\]uint16\{(.*?)\n\t\}`)
+	m := re.FindSubmatch(out)
+	if m == nil {
+		t.Fatalf("NumStmt array not found in output:\n%s", out)
+	}
+	var got []int
+	for _, entry := range regexp.MustCompile(`(?m)^\s*(\d+),`).FindAllSubmatch(m[1], -1) {
+		n, err := strconv.Atoi(string(entry[1]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	want := []int{2, 2, 1, 1, 1}
+	if !slices.Equal(got, want) {
+		t.Errorf("NumStmt = %v, want %v", got, want)
+	}
 }

@@ -7,14 +7,17 @@ package ppc64
 import (
 	"bytes"
 	"fmt"
+	"internal/buildcfg"
 	"internal/testenv"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+
+	"internal/abi"
 
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
@@ -29,7 +32,7 @@ var platformEnvs = [][]string{
 const invalidPCAlignSrc = `
 TEXT test(SB),0,$0-0
 ADD $2, R3
-PCALIGN $64
+PCALIGN $128
 RET
 `
 
@@ -167,11 +170,7 @@ PNOP
 func TestPfxAlign(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
-	dir, err := os.MkdirTemp("", "testpfxalign")
-	if err != nil {
-		t.Fatalf("could not create directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	pgms := []struct {
 		text   []byte
@@ -188,22 +187,22 @@ func TestPfxAlign(t *testing.T) {
 
 	for _, pgm := range pgms {
 		tmpfile := filepath.Join(dir, "x.s")
-		err = os.WriteFile(tmpfile, pgm.text, 0644)
+		err := os.WriteFile(tmpfile, pgm.text, 0644)
 		if err != nil {
 			t.Fatalf("can't write output: %v\n", err)
 		}
-		cmd := exec.Command(testenv.GoToolPath(t), "tool", "asm", "-S", "-o", filepath.Join(dir, "test.o"), tmpfile)
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-S", "-o", filepath.Join(dir, "test.o"), tmpfile)
 		cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=ppc64le")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Errorf("Failed to compile %v: %v\n", pgm, err)
 		}
 		if !strings.Contains(string(out), pgm.align) {
-			t.Errorf(fmt.Sprintf("Fatal, misaligned text with prefixed instructions:\n%s\n", string(out)))
+			t.Errorf("Fatal, misaligned text with prefixed instructions:\n%s", out)
 		}
 		hasNop := strings.Contains(string(out), "00 00 00 60")
 		if hasNop != pgm.hasNop {
-			t.Errorf(fmt.Sprintf("Fatal, prefixed instruction is missing nop padding:\n%s\n", string(out)))
+			t.Errorf("Fatal, prefixed instruction is missing nop padding:\n%s", out)
 		}
 	}
 }
@@ -217,11 +216,7 @@ func TestLarge(t *testing.T) {
 	}
 	testenv.MustHaveGoBuild(t)
 
-	dir, err := os.MkdirTemp("", "testlarge")
-	if err != nil {
-		t.Fatalf("could not create directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// A few interesting test cases for long conditional branch fixups
 	tests := []struct {
@@ -281,14 +276,14 @@ func TestLarge(t *testing.T) {
 		gen(buf, test.jmpinsn)
 
 		tmpfile := filepath.Join(dir, "x.s")
-		err = os.WriteFile(tmpfile, buf.Bytes(), 0644)
+		err := os.WriteFile(tmpfile, buf.Bytes(), 0644)
 		if err != nil {
 			t.Fatalf("can't write output: %v\n", err)
 		}
 
 		// Test on all supported ppc64 platforms
 		for _, platenv := range platformEnvs {
-			cmd := exec.Command(testenv.GoToolPath(t), "tool", "asm", "-S", "-o", filepath.Join(dir, "test.o"), tmpfile)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-S", "-o", filepath.Join(dir, "test.o"), tmpfile)
 			cmd.Env = append(os.Environ(), platenv...)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -336,22 +331,18 @@ func TestPCalign(t *testing.T) {
 
 	testenv.MustHaveGoBuild(t)
 
-	dir, err := os.MkdirTemp("", "testpcalign")
-	if err != nil {
-		t.Fatalf("could not create directory: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// generate a test with valid uses of PCALIGN
 
 	tmpfile := filepath.Join(dir, "x.s")
-	err = os.WriteFile(tmpfile, []byte(validPCAlignSrc), 0644)
+	err := os.WriteFile(tmpfile, []byte(validPCAlignSrc), 0644)
 	if err != nil {
 		t.Fatalf("can't write output: %v\n", err)
 	}
 
 	// build generated file without errors and assemble it
-	cmd := exec.Command(testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "x.o"), "-S", tmpfile)
+	cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "x.o"), "-S", tmpfile)
 	cmd.Env = append(os.Environ(), "GOARCH=ppc64le", "GOOS=linux")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -391,7 +382,7 @@ func TestPCalign(t *testing.T) {
 	}
 
 	// build test with errors and check for messages
-	cmd = exec.Command(testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "xi.o"), "-S", tmpfile)
+	cmd = testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "xi.o"), "-S", tmpfile)
 	cmd.Env = append(os.Environ(), "GOARCH=ppc64le", "GOOS=linux")
 	out, err = cmd.CombinedOutput()
 	if !strings.Contains(string(out), "Unexpected alignment") {
@@ -451,7 +442,7 @@ func TestAddrClassifier(t *testing.T) {
 	}
 	tsts := [...]struct {
 		arg    obj.Addr
-		output interface{}
+		output any
 	}{
 		// Supported register type args
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_R1}, C_REG},
@@ -465,7 +456,6 @@ func TestAddrClassifier(t *testing.T) {
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_CR1}, C_CREG},
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_CR1SO}, C_CRBIT},
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_SPR0}, C_SPR},
-		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_SPR0 + 1}, C_XER},
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_SPR0 + 8}, C_LR},
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_SPR0 + 9}, C_CTR},
 		{obj.Addr{Type: obj.TYPE_REG, Reg: REG_FPSCR}, C_FPSCR},
@@ -517,19 +507,19 @@ func TestAddrClassifier(t *testing.T) {
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 32}, C_U8CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 14}, C_U15CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 15}, C_U16CON},
-		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 16}, C_U3216CON},
-		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 + 1<<16}, C_U32CON},
+		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 + 1<<16}, C_U31CON},
+		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 31}, C_U32CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 32}, C_S34CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 1 << 33}, C_64CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: -1}, C_S16CON},
-		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: -0x10000}, C_S3216CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: -0x10001}, C_S32CON},
+		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: 0x10001}, C_U31CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: -(1 << 33)}, C_S34CON},
 		{obj.Addr{Type: obj.TYPE_CONST, Name: obj.NAME_NONE, Offset: -(1 << 34)}, C_64CON},
 
 		// Branch like arguments
-		{obj.Addr{Type: obj.TYPE_BRANCH, Sym: &obj.LSym{Type: objabi.SDATA}}, cmplx{C_SBRA, C_LBRAPIC, C_LBRAPIC, C_SBRA}},
-		{obj.Addr{Type: obj.TYPE_BRANCH}, C_SBRA},
+		{obj.Addr{Type: obj.TYPE_BRANCH, Sym: &obj.LSym{Type: objabi.SDATA}}, cmplx{C_BRA, C_BRAPIC, C_BRAPIC, C_BRA}},
+		{obj.Addr{Type: obj.TYPE_BRANCH}, C_BRA},
 	}
 
 	pic_ctxt9 := ctxt9{ctxt: &obj.Link{Flag_shared: true, Arch: &Linkppc64}, autosize: 0}
@@ -551,6 +541,127 @@ func TestAddrClassifier(t *testing.T) {
 			if output := ctxts[i].aclass(&tst.arg); output != expect[i] {
 				t.Errorf("%s.aclass(%v) = %v, expected %v\n", name[i], tst.arg, DRconv(output), DRconv(expect[i]))
 			}
+		}
+	}
+}
+
+// The optab size should remain constant when reinitializing the PPC64 assembler backend.
+func TestOptabReinit(t *testing.T) {
+	buildcfg.GOOS = "linux"
+	buildcfg.GOARCH = "ppc64le"
+	buildcfg.GOPPC64 = 8
+	buildop(nil)
+	optabLen := len(optab)
+	buildcfg.GOPPC64 = 9
+	buildop(nil)
+	reinitOptabLen := len(optab)
+	if reinitOptabLen != optabLen {
+		t.Errorf("rerunning buildop changes optab size from %d to %d", optabLen, reinitOptabLen)
+	}
+}
+
+// A tail call is lowered to "MOVD Rx, CTR; BR (CTR)". runtime.asyncPreempt
+// does not preserve CTR, and its resume sequence leaves CTR holding the resume
+// PC, so a goroutine preempted anywhere between the load of CTR and the branch
+// would resume by branching to the wrong place (for a preemption at the branch
+// itself, to that very instruction, spinning there forever). Check that the
+// whole sequence is marked as an unsafe point. See go.dev/issue/78576.
+const tailCallSrc = `
+// 4 = NOSPLIT, 512 = NOFRAME (see textflag.h).
+TEXT ·leafNoFrame(SB),4|512,$0-0
+	MOVD	$0, R3
+	RET	(R3)
+
+TEXT ·leafFrame(SB),4,$8-0
+	MOVD	$0, R3
+	RET	(R3)
+
+TEXT ·nonLeaf(SB),4,$8-0
+	CALL	·leafNoFrame(SB)
+	MOVD	$0, R3
+	RET	(R3)
+
+// A tail call that is not the last instruction in the function,
+// to check that the unsafe point ends at the branch and does not
+// swallow the rest of the function.
+TEXT ·leafNoFrameCond(SB),4|512,$0-0
+	CMP	R3, $0
+	BEQ	skip
+	RET	(R3)
+skip:
+	MOVD	$0, R3
+	RET
+`
+
+func TestTailCallUnsafePoint(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	dir := t.TempDir()
+	tmpfile := filepath.Join(dir, "x.s")
+	if err := os.WriteFile(tmpfile, []byte(tailCallSrc), 0644); err != nil {
+		t.Fatalf("can't write output: %v\n", err)
+	}
+
+	for _, goarch := range []string{"ppc64", "ppc64le"} {
+		cmd := testenv.Command(t, testenv.GoToolPath(t), "tool", "asm", "-o", filepath.Join(dir, "x.o"), "-S", tmpfile)
+		cmd.Env = append(os.Environ(), "GOARCH="+goarch, "GOOS=linux")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("GOARCH=%s: assembly failed: %v, output:\n%s", goarch, err, out)
+		}
+
+		// Walk the -S output tracking the current PCDATA_UnsafePoint value.
+		// Every branch through CTR must be an unsafe point, and the unsafe
+		// point must end at the branch: the next instruction, if any, must be
+		// a safe point again, and so must the end of the function.
+		branches := 0
+		sym := ""
+		unsafePoint := int64(abi.UnsafePointSafe)
+		atBranch := false
+		endFunc := func() {
+			if sym != "" && unsafePoint != abi.UnsafePointSafe {
+				t.Errorf("GOARCH=%s: %s: unsafe point %d at end of function, want %d",
+					goarch, sym, unsafePoint, abi.UnsafePointSafe)
+			}
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			// Lines look like:
+			//	sym STEXT ...
+			//	<tab>0x0014 00020 (x.s:14)<tab>PCDATA<tab>$0,<tab>$-2
+			// Other lines (hex dumps, relocations) have no (file:line) field.
+			switch {
+			case len(f) >= 2 && f[1] == "STEXT":
+				endFunc()
+				sym, unsafePoint, atBranch = f[0], abi.UnsafePointSafe, false
+			case len(f) < 4 || !strings.HasPrefix(f[2], "("):
+				// Not an instruction.
+			case len(f) >= 6 && f[3] == "PCDATA" && f[4] == fmt.Sprintf("$%d,", abi.PCDATA_UnsafePoint):
+				v, err := strconv.ParseInt(strings.TrimPrefix(f[5], "$"), 10, 64)
+				if err != nil {
+					t.Fatalf("GOARCH=%s: can't parse %q: %v", goarch, line, err)
+				}
+				unsafePoint = v
+			case f[3] == "PCDATA" || f[3] == "FUNCDATA" || f[3] == "TEXT":
+				// Not a real instruction.
+			case len(f) >= 5 && f[3] == "JMP" && f[4] == "CTR":
+				branches++
+				atBranch = true
+				if unsafePoint != abi.UnsafePointUnsafe {
+					t.Errorf("GOARCH=%s: %s\n\tbranch through CTR has unsafe point %d, want %d",
+						goarch, strings.TrimSpace(line), unsafePoint, abi.UnsafePointUnsafe)
+				}
+			case atBranch:
+				atBranch = false
+				if unsafePoint != abi.UnsafePointSafe {
+					t.Errorf("GOARCH=%s: %s\n\tinstruction after branch through CTR has unsafe point %d, want %d",
+						goarch, strings.TrimSpace(line), unsafePoint, abi.UnsafePointSafe)
+				}
+			}
+		}
+		endFunc()
+		if want := strings.Count(tailCallSrc, "RET\t(R3)"); branches != want {
+			t.Errorf("GOARCH=%s: found %d branches through CTR, want %d; output:\n%s", goarch, branches, want, out)
 		}
 	}
 }

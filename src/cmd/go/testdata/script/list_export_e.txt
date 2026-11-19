@@ -1,6 +1,21 @@
-go list -e -export ./...
+# This test depends on the -e flag, which is not yet supported for Go
+# 1.28's "go list -export".
+env GOEXPERIMENT=nogolistexportnewformat
+
+! go list -export ./...
+stderr '^# example.com/p2\np2'${/}'main\.go:7:.*'
+! stderr '^go build '
+
+go list -f '{{with .Error}}{{.}}{{end}}' -e -export ./...
 ! stderr '.'
-go list -e -export -json ...
+stdout '^# example.com/p2\np2'${/}'main\.go:7:.*'
+
+go list -export -e -f '{{.ImportPath}} -- {{.Incomplete}} -- {{.Error}}' ./...
+stdout 'example.com/p1 -- false -- <nil>'
+stdout 'example.com/p2 -- true -- # example.com/p2'
+
+go list -e -export -json=Error ./...
+stdout '"Err": "# example.com/p2'
 
 -- go.mod --
 module example.com
@@ -15,5 +30,5 @@ import "fmt"
 import "example.com/p1"
 
 func main() {
-        fmt.Println(p1.Name == 5)
+	fmt.Println(p1.Name == 5)
 }

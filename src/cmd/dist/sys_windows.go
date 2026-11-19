@@ -14,7 +14,7 @@ var (
 	procGetSystemInfo = modkernel32.NewProc("GetSystemInfo")
 )
 
-// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms724958(v=vs.85).aspx
+// see https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info
 type systeminfo struct {
 	wProcessorArchitecture      uint16
 	wReserved                   uint16
@@ -29,11 +29,10 @@ type systeminfo struct {
 	wProcessorRevision          uint16
 }
 
-// See https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info
+// See https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info
 const (
 	PROCESSOR_ARCHITECTURE_AMD64 = 9
 	PROCESSOR_ARCHITECTURE_INTEL = 0
-	PROCESSOR_ARCHITECTURE_ARM   = 5
 	PROCESSOR_ARCHITECTURE_ARM64 = 12
 	PROCESSOR_ARCHITECTURE_IA64  = 6
 )
@@ -41,14 +40,12 @@ const (
 var sysinfo systeminfo
 
 func sysinit() {
-	syscall.Syscall(procGetSystemInfo.Addr(), 1, uintptr(unsafe.Pointer(&sysinfo)), 0, 0)
+	syscall.SyscallN(procGetSystemInfo.Addr(), uintptr(unsafe.Pointer(&sysinfo)))
 	switch sysinfo.wProcessorArchitecture {
 	case PROCESSOR_ARCHITECTURE_AMD64:
 		gohostarch = "amd64"
 	case PROCESSOR_ARCHITECTURE_INTEL:
 		gohostarch = "386"
-	case PROCESSOR_ARCHITECTURE_ARM:
-		gohostarch = "arm"
 	case PROCESSOR_ARCHITECTURE_ARM64:
 		gohostarch = "arm64"
 	default:

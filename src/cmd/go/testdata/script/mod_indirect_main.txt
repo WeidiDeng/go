@@ -1,5 +1,3 @@
-env GO111MODULE=on
-
 # Regression test for golang.org/issue/29773: 'go list -m' was not following
 # dependencies through older versions of the main module.
 
@@ -60,6 +58,7 @@ golang.org/issue/root
 golang.org/issue/mirror v0.1.0 => ./mirror-v0.1.0
 golang.org/issue/pkg v0.1.0 => ./pkg-v0.1.0
 -- graph.txt --
+golang.org/issue/root go@1.12
 golang.org/issue/root golang.org/issue/mirror@v0.1.0
 golang.org/issue/mirror@v0.1.0 golang.org/issue/root@v0.1.0
 golang.org/issue/root@v0.1.0 golang.org/issue/pkg@v0.1.0
